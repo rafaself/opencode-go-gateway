@@ -22,6 +22,30 @@ Windows amd64, then verifies every archive contains the correctly named
 `opencode-gateway` and `ocgtw` binaries, `LICENSE`, and `README.txt`, and
 verifies `SHA256SUMS`.
 
+The repository installer is `scripts/install.sh`. It builds the current
+checkout when Go is available; otherwise it can download a published Unix
+archive and its `SHA256SUMS` manifest over HTTPS. It verifies the exact
+checksum before extracting, rejects unexpected archive paths, stages both
+binaries before replacement, and never requires root. A release must publish
+the expected archive names and `SHA256SUMS` for the no-Go path to work:
+
+```bash
+./scripts/install.sh --release --version v0.1.0 --prefix "$HOME/.local"
+```
+
+For a local artifact, pass both files explicitly when they are not siblings:
+
+```bash
+./scripts/install.sh \
+  --archive /path/to/opencode-gateway_v0.1.0_linux_amd64.tar.gz \
+  --checksums /path/to/SHA256SUMS \
+  --prefix "$HOME/.local"
+```
+
+The installer has no checksum bypass option. Its Bash release path supports
+Linux and macOS amd64/arm64; Windows users should download and verify the zip
+archive manually.
+
 The package script uses the tagged commit time as its default
 `SOURCE_DATE_EPOCH`. To reproduce an artifact exactly, provide the same
 version, commit, build date, source epoch, Go toolchain, and source tree:

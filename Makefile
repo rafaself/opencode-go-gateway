@@ -41,10 +41,8 @@ build:
 	mkdir -p bin
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/opencode-gateway
 
-install: build
-	install -d "$(INSTALL_DIR)"
-	install -m 0755 "$(BIN)" "$(INSTALL_DIR)/opencode-gateway"
-	install -m 0755 "$(BIN)" "$(INSTALL_DIR)/ocgtw"
+install:
+	GO="$(GO)" PREFIX="$(PREFIX)" INSTALL_DIR="$(INSTALL_DIR)" ./scripts/install.sh
 
 check: fmt vet test race build
 	git diff --check

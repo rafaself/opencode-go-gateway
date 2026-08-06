@@ -31,6 +31,8 @@ OpenCode Go credential is used only for the outbound provider request.
 - An OpenCode Go subscription and API key. The key can stay in the gateway
   process environment or be stored with `ocgtw config`.
 - For source builds: Go `1.22+`, GNU Make, and a POSIX shell.
+- For the no-Go installer path: Bash, `curl`, `tar`, `install`, and either
+  `sha256sum` or `shasum`.
 - For the existing text smoke: `curl`, `git`, `jq`, `rg`, Codex CLI, and
   network access.
 - For the opt-in scenario suite: Bash, `curl`, `git`, `jq` with
@@ -44,12 +46,35 @@ SHA-256 entry in `SHA256SUMS`, and extract it. Archives contain the binaries,
 `LICENSE`, and a minimal `README.txt`. The v0.1.0 release targets Linux
 amd64/arm64, macOS amd64/arm64, and Windows amd64.
 
-From source:
+From this checkout, the installer automatically builds from source when Go is
+available. If Go is not on `PATH`, it downloads the latest published Linux or
+macOS release over HTTPS and verifies the exact archive against `SHA256SUMS`:
 
 ```bash
-make build
 make install PREFIX="$HOME/.local"
+```
 
+The installer never requires root and installs both command names. Use an
+explicit mode when needed:
+
+```bash
+# Require a local Go source build.
+bash scripts/install.sh --source --prefix "$HOME/.local"
+
+# Install an exact published version without Go.
+bash scripts/install.sh --release --version v0.1.0 --prefix "$HOME/.local"
+
+# Install an already downloaded Unix archive after checksum verification.
+bash scripts/install.sh \
+  --archive /path/to/opencode-gateway_v0.1.0_linux_amd64.tar.gz \
+  --checksums /path/to/SHA256SUMS \
+  --prefix "$HOME/.local"
+```
+
+If a published release is not available yet, the no-Go path fails closed; use
+the source mode after installing Go or provide a verified local archive.
+
+```bash
 # Store the key without putting it in command history or an argument list.
 read -r -s key
 printf '%s\n' "$key" | ocgtw config set-key --stdin
