@@ -15,6 +15,7 @@ const (
 	ErrorUnsupportedResponseFormat ErrorCode = "unsupported_response_format"
 	ErrorNetwork                   ErrorCode = "network_error"
 	ErrorCanceled                  ErrorCode = "canceled"
+	ErrorTimeout                   ErrorCode = "timeout"
 	ErrorBadRequest                ErrorCode = "upstream_bad_request"
 	ErrorUnauthorized              ErrorCode = "upstream_unauthorized"
 	ErrorForbidden                 ErrorCode = "upstream_forbidden"
@@ -31,13 +32,11 @@ func (code ErrorCode) String() string { return string(code) }
 // upstream response failures. StatusCode and RetryAfter are safe response
 // metadata; provider response bodies are intentionally not retained.
 type ProviderError struct {
-	Code           ErrorCode
-	StatusCode     int
-	RetryAfter     string
-	BodyTruncated  bool
-	BodyReadFailed bool
-	ContentType    string
-	cause          error
+	Code        ErrorCode
+	StatusCode  int
+	RetryAfter  string
+	ContentType string
+	cause       error
 }
 
 func (err *ProviderError) Error() string {

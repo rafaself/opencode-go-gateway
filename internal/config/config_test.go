@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
 
 func TestLoadUsesTypedDefaultsAndDoesNotExposeAPIKey(t *testing.T) {
@@ -47,18 +49,38 @@ func TestLoadUsesTypedDefaultsAndDoesNotExposeAPIKey(t *testing.T) {
 
 func TestLoadParsesOperationalSettingsWithoutProcessEnvironment(t *testing.T) {
 	config, err := Load(lookupEnv(map[string]string{
-		"OPENCODE_GO_API_KEY":                  "test-key",
-		"OPENCODE_GO_BASE_URL":                 "https://provider.example/v1",
-		"OPENCODE_GATEWAY_HOST":                "127.0.0.1",
-		"OPENCODE_GATEWAY_PORT":                "9090",
-		"OPENCODE_GATEWAY_LOG_LEVEL":           "debug",
-		"OPENCODE_GATEWAY_SHUTDOWN_TIMEOUT":    "3s",
-		"OPENCODE_GATEWAY_READ_HEADER_TIMEOUT": "250ms",
-		"OPENCODE_GATEWAY_READ_TIMEOUT":        "4s",
-		"OPENCODE_GATEWAY_WRITE_TIMEOUT":       "5s",
-		"OPENCODE_GATEWAY_IDLE_TIMEOUT":        "6s",
-		"OPENCODE_GATEWAY_MAX_BODY_BYTES":      "4096",
-		"OPENCODE_GATEWAY_MAX_HEADER_BYTES":    "8192",
+		"OPENCODE_GO_API_KEY":                           "test-key",
+		"OPENCODE_GO_BASE_URL":                          "https://provider.example/v1",
+		"OPENCODE_GATEWAY_HOST":                         "127.0.0.1",
+		"OPENCODE_GATEWAY_PORT":                         "9090",
+		"OPENCODE_GATEWAY_LOG_LEVEL":                    "debug",
+		"OPENCODE_GATEWAY_SHUTDOWN_TIMEOUT":             "3s",
+		"OPENCODE_GATEWAY_READ_HEADER_TIMEOUT":          "250ms",
+		"OPENCODE_GATEWAY_IDLE_TIMEOUT":                 "6s",
+		"OPENCODE_GATEWAY_REQUEST_BODY_READ_TIMEOUT":    "7s",
+		"OPENCODE_GATEWAY_UPSTREAM_CONNECT_TIMEOUT":     "8s",
+		"OPENCODE_GATEWAY_TLS_HANDSHAKE_TIMEOUT":        "9s",
+		"OPENCODE_GATEWAY_RESPONSE_HEADER_TIMEOUT":      "10s",
+		"OPENCODE_GATEWAY_STREAM_IDLE_TIMEOUT":          "11s",
+		"OPENCODE_GATEWAY_DOWNSTREAM_WRITE_TIMEOUT":     "12s",
+		"OPENCODE_GATEWAY_MAX_BODY_BYTES":               "4096",
+		"OPENCODE_GATEWAY_MAX_HEADER_BYTES":             "8192",
+		"OPENCODE_GATEWAY_MAX_INPUT_ITEMS":              "3",
+		"OPENCODE_GATEWAY_MAX_COLLECTION_ITEMS":         "4",
+		"OPENCODE_GATEWAY_MAX_TOOLS":                    "4",
+		"OPENCODE_GATEWAY_MAX_SCHEMA_BYTES":             "5",
+		"OPENCODE_GATEWAY_MAX_SSE_LINE_BYTES":           "6",
+		"OPENCODE_GATEWAY_MAX_SSE_EVENT_BYTES":          "7",
+		"OPENCODE_GATEWAY_MAX_SSE_BUFFERED_BYTES":       "8",
+		"OPENCODE_GATEWAY_MAX_SSE_READ_BUFFER_BYTES":    "9",
+		"OPENCODE_GATEWAY_MAX_OUTPUT_BYTES":             "10",
+		"OPENCODE_GATEWAY_MAX_TEXT_BYTES":               "11",
+		"OPENCODE_GATEWAY_MAX_REASONING_BYTES":          "12",
+		"OPENCODE_GATEWAY_MAX_TOOL_CALL_ARGUMENT_BYTES": "13",
+		"OPENCODE_GATEWAY_MAX_PENDING_TURN_BYTES":       "14",
+		"OPENCODE_GATEWAY_MAX_PENDING_RECORDS":          "16",
+		"OPENCODE_GATEWAY_MAX_PENDING_AGGREGATE_BYTES":  "17",
+		"OPENCODE_GATEWAY_MAX_ACTIVE_REQUESTS":          "15",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -67,11 +89,90 @@ func TestLoadParsesOperationalSettingsWithoutProcessEnvironment(t *testing.T) {
 	if config.BaseURL != "https://provider.example/v1" || config.Port != 9090 || config.LogLevel.String() != "DEBUG" {
 		t.Fatalf("parsed config = %+v", config)
 	}
-	if config.ShutdownTimeout != 3*time.Second || config.ReadHeaderTimeout != 250*time.Millisecond || config.ReadTimeout != 4*time.Second || config.WriteTimeout != 5*time.Second || config.IdleTimeout != 6*time.Second {
+	if config.ShutdownTimeout != 3*time.Second || config.ReadHeaderTimeout != 250*time.Millisecond || config.IdleTimeout != 6*time.Second {
 		t.Fatalf("parsed timeouts = %+v", config)
+	}
+	if config.RequestBodyReadTimeout != 7*time.Second || config.UpstreamConnectTimeout != 8*time.Second || config.TLSHandshakeTimeout != 9*time.Second || config.ResponseHeaderTimeout != 10*time.Second || config.StreamIdleTimeout != 11*time.Second || config.DownstreamWriteTimeout != 12*time.Second {
+		t.Fatalf("parsed phase timeouts = %+v", config)
 	}
 	if config.MaxBodyBytes != 4096 || config.MaxHeaderBytes != 8192 {
 		t.Fatalf("parsed limits = %+v", config)
+	}
+	if config.MaxInputItems != 3 || config.MaxCollectionItems != 4 || config.MaxTools != 4 || config.MaxSchemaBytes != 5 || config.MaxSSELineBytes != 6 || config.MaxSSEEventBytes != 7 || config.MaxSSEBufferedBytes != 8 || config.MaxSSEReadBufferBytes != 9 || config.MaxOutputBytes != 10 || config.MaxTextBytes != 11 || config.MaxReasoningBytes != 12 || config.MaxToolCallArgumentBytes != 13 || config.MaxPendingTurnBytes != 14 || config.MaxPendingRecords != 16 || config.MaxPendingAggregateBytes != 17 || config.MaxActiveRequests != 15 {
+		t.Fatalf("parsed resource limits = %+v", config)
+	}
+}
+
+func TestLoadRejectsNonPositivePhaseAndResourceLimits(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{name: "stream timeout", key: "OPENCODE_GATEWAY_STREAM_IDLE_TIMEOUT"},
+		{name: "input limit", key: "OPENCODE_GATEWAY_MAX_INPUT_ITEMS"},
+		{name: "pending limit", key: "OPENCODE_GATEWAY_MAX_PENDING_TURN_BYTES"},
+		{name: "collection limit", key: "OPENCODE_GATEWAY_MAX_COLLECTION_ITEMS"},
+		{name: "pending record limit", key: "OPENCODE_GATEWAY_MAX_PENDING_RECORDS"},
+		{name: "pending aggregate limit", key: "OPENCODE_GATEWAY_MAX_PENDING_AGGREGATE_BYTES"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values := map[string]string{
+				"OPENCODE_GO_API_KEY": "test-key",
+				test.key:              "0",
+			}
+			_, err := Load(lookupEnv(values))
+			if err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Fatalf("error = %v, want validation for %s", err, test.key)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsProviderMapperBudgetOverflow(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		set  func(*Config)
+		want string
+	}{
+		{
+			name: "provider tool slots",
+			set: func(config *Config) {
+				config.MaxTools = bridge.DefaultMaxProviderTools + 1
+			},
+			want: "OPENCODE_GATEWAY_MAX_TOOLS",
+		},
+		{
+			name: "provider schema bytes",
+			set: func(config *Config) {
+				config.MaxSchemaBytes = int64(bridge.DefaultMaxFunctionSchemaBytes) + 1
+			},
+			want: "OPENCODE_GATEWAY_MAX_SCHEMA_BYTES",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := Defaults().WithAPIKey("test-key")
+			test.set(&config)
+			err := config.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want deterministic %s rejection", err, test.want)
+			}
+		})
+	}
+}
+
+func TestDefaultsUseSharedProviderBudgetAndKeep127ToolBoundary(t *testing.T) {
+	config := Defaults()
+	if config.MaxTools != bridge.DefaultMaxProviderTools {
+		t.Fatalf("default tool budget = %d, want %d", config.MaxTools, bridge.DefaultMaxProviderTools)
+	}
+	if config.MaxSchemaBytes != int64(bridge.DefaultMaxFunctionSchemaBytes) {
+		t.Fatalf("default schema budget = %d, want %d", config.MaxSchemaBytes, bridge.DefaultMaxFunctionSchemaBytes)
+	}
+	if config.MaxTools-1 != 127 {
+		t.Fatalf("implicit apply_patch boundary = %d, want 127 ordinary tools", config.MaxTools-1)
+	}
+	if err := config.WithAPIKey("test-key").Validate(); err != nil {
+		t.Fatalf("default configuration validation = %v", err)
 	}
 }
 
@@ -106,6 +207,26 @@ func TestLoadRejectsNonLoopbackUnlessExplicitlyAllowed(t *testing.T) {
 	}
 	if !config.AllowNonLoopback {
 		t.Fatal("explicit non-loopback opt-in was not retained")
+	}
+}
+
+func TestLoadRejectsBaseURLCredentialsQueriesAndTraversal(t *testing.T) {
+	for _, baseURL := range []string{
+		"https://user:secret@provider.example/v1",
+		"https://provider.example/v1?token=secret",
+		"https://provider.example/v1#secret",
+		"https://provider.example/v1/../private",
+	} {
+		_, err := Load(lookupEnv(map[string]string{
+			"OPENCODE_GO_API_KEY":  "test-key",
+			"OPENCODE_GO_BASE_URL": baseURL,
+		}))
+		if err == nil {
+			t.Fatalf("base URL %q was accepted", baseURL)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("base URL validation exposed a secret: %v", err)
+		}
 	}
 }
 

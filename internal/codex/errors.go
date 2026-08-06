@@ -22,6 +22,7 @@ type Error struct {
 	Code    ErrorCode `json:"code"`
 	Param   string    `json:"param"`
 	Message string    `json:"message"`
+	cause   error
 }
 
 func (err *Error) Error() string {
@@ -32,6 +33,13 @@ func (err *Error) Error() string {
 		return fmt.Sprintf("%s: %s", err.Code, err.Message)
 	}
 	return fmt.Sprintf("%s (%s): %s", err.Code, err.Param, err.Message)
+}
+
+func (err *Error) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
 }
 
 func newError(code ErrorCode, param, message string) *Error {

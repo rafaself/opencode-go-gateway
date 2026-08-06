@@ -1,10 +1,12 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -17,7 +19,12 @@ var (
 	ErrMalformedStream         = errors.New("malformed upstream stream")
 	ErrStreamAggregateLimit    = errors.New("stream aggregate limit exceeded")
 	ErrToolCallArgumentLimit   = errors.New("tool call argument limit exceeded")
+	ErrToolCallLimit           = errors.New("tool call limit exceeded")
+	ErrToolCallMetadataLimit   = errors.New("tool call metadata limit exceeded")
 	ErrUndeclaredToolCall      = errors.New("upstream tool call was not declared")
+	ErrStreamInterrupted       = errors.New("upstream stream was interrupted")
+	ErrStreamTimeout           = errors.New("upstream stream timed out")
+	ErrStreamCanceled          = errors.New("upstream stream was canceled")
 )
 
 // ChatCompletionStreamEvent is the provider-owned result of decoding one SSE
@@ -68,7 +75,7 @@ func (decoder *ChatCompletionStreamDecoder) Next() (ChatCompletionStreamEvent, e
 	}
 	event, err := decoder.sse.Next()
 	if err != nil {
-		return ChatCompletionStreamEvent{}, err
+		return ChatCompletionStreamEvent{}, classifyStreamReadError(err)
 	}
 	if strings.TrimSpace(event.Data) == "[DONE]" {
 		decoder.doneSeen = true
@@ -99,6 +106,42 @@ func (decoder *ChatCompletionStreamDecoder) Next() (ChatCompletionStreamEvent, e
 	return ChatCompletionStreamEvent{Chunk: &chunk}, nil
 }
 
+type streamTransportError struct {
+	kind  error
+	cause error
+}
+
+func (err *streamTransportError) Error() string {
+	if err == nil || err.kind == nil {
+		return ErrStreamInterrupted.Error()
+	}
+	return err.kind.Error()
+}
+
+func (err *streamTransportError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return errors.Join(err.kind, err.cause)
+}
+
+func classifyStreamReadError(err error) error {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, ErrSSELimitExceeded) || errors.Is(err, ErrSSEUnexpectedEOF) || errors.Is(err, ErrSSEInvalidUTF8) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) {
+		return &streamTransportError{kind: ErrStreamCanceled, cause: err}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &streamTransportError{kind: ErrStreamTimeout, cause: err}
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return &streamTransportError{kind: ErrStreamTimeout, cause: err}
+	}
+	return &streamTransportError{kind: ErrStreamInterrupted, cause: err}
+}
+
 func wrapStreamDecodeError(cause error) error {
 	return &streamDecodeError{cause: cause}
 }
@@ -113,12 +156,21 @@ func (err *streamDecodeError) Unwrap() error { return errors.Join(ErrMalformedSt
 
 // BridgeStreamDecoderOptions configures provider-to-bridge stream translation.
 // AllowedToolNames is copied when the decoder is constructed and is scoped to
-// one upstream request. Provider tool names are checked only after their full
-// fragmented name has been reconstructed; an empty allowlist rejects every
-// provider function tool call.
+// one upstream request. Provider tool names are validated before any tool
+// event is emitted. A fragmented name remains private until the provider's
+// terminal boundary, and may remain buffered only while it is a prefix of a
+// declared function or registered synthetic tool name; an empty allowlist
+// rejects every provider function tool call.
 type BridgeStreamDecoderOptions struct {
-	SSE              SSEDecoderOptions
-	AllowedToolNames []string
+	SSE                    SSEDecoderOptions
+	AllowedToolNames       []string
+	MaxToolCalls           int
+	MaxChoices             int
+	MaxToolNameBytes       int
+	MaxProviderCallIDBytes int
+	MaxOutputBytes         int
+	MaxTextBytes           int
+	MaxReasoningBytes      int
 	// ToolRegistry is scoped to the request/continuation chain. Synthetic
 	// provider names are translated only while this decoder is alive.
 	ToolRegistry *bridge.ToolRegistry
@@ -140,7 +192,17 @@ type BridgeStreamDecoder struct {
 	allowedToolNames         map[string]struct{}
 	aggregateBytes           int
 	maxAggregateBytes        int
+	maxToolCalls             int
+	maxChoices               int
+	maxToolNameBytes         int
+	maxProviderCallIDBytes   int
 	maxToolCallArgumentBytes int
+	maxOutputBytes           int
+	maxTextBytes             int
+	maxReasoningBytes        int
+	outputBytes              int
+	textBytes                int
+	reasoningBytes           int
 	toolRegistry             *bridge.ToolRegistry
 	providerModel            string
 	createdAt                time.Time
@@ -151,21 +213,41 @@ type BridgeStreamDecoder struct {
 }
 
 type providerToolCall struct {
-	key              bridge.ToolCallKey
-	callID           []byte // immutable downstream Responses call_id
-	providerCallID   []byte // private provider ID/fragments for continuation
-	name             []byte
-	arguments        []byte
-	argumentsEmitted int
-	kind             bridge.ToolKind
-	registration     bridge.ToolRegistration
-	started          bool
-	customCandidate  bool
-	completed        bool
+	key             bridge.ToolCallKey
+	callID          []byte // immutable downstream Responses call_id
+	providerCallID  []byte // private provider ID/fragments for continuation
+	name            []byte
+	arguments       []byte
+	kind            bridge.ToolKind
+	registration    bridge.ToolRegistration
+	started         bool
+	customCandidate bool
+	completed       bool
 }
 
 func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions) *BridgeStreamDecoder {
 	options.SSE = options.SSE.withDefaults()
+	if options.MaxOutputBytes <= 0 {
+		options.MaxOutputBytes = bridge.DefaultMaxOutputBytes
+	}
+	if options.MaxTextBytes <= 0 {
+		options.MaxTextBytes = bridge.DefaultMaxTextBytes
+	}
+	if options.MaxReasoningBytes <= 0 {
+		options.MaxReasoningBytes = bridge.DefaultMaxReasoningBytes
+	}
+	if options.MaxToolCalls <= 0 {
+		options.MaxToolCalls = bridge.DefaultMaxStreamToolCalls
+	}
+	if options.MaxChoices <= 0 {
+		options.MaxChoices = bridge.DefaultMaxStreamChoices
+	}
+	if options.MaxToolNameBytes <= 0 {
+		options.MaxToolNameBytes = bridge.DefaultMaxToolNameBytes
+	}
+	if options.MaxProviderCallIDBytes <= 0 {
+		options.MaxProviderCallIDBytes = bridge.DefaultMaxProviderCallIDBytes
+	}
 	allowedToolNames := make(map[string]struct{}, len(options.AllowedToolNames))
 	for _, name := range options.AllowedToolNames {
 		if name != "" {
@@ -185,7 +267,14 @@ func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions
 		choiceFinishReasons:      make(map[int]string),
 		allowedToolNames:         allowedToolNames,
 		maxAggregateBytes:        options.SSE.MaxAggregateBytes,
+		maxToolCalls:             options.MaxToolCalls,
+		maxChoices:               options.MaxChoices,
+		maxToolNameBytes:         options.MaxToolNameBytes,
+		maxProviderCallIDBytes:   options.MaxProviderCallIDBytes,
 		maxToolCallArgumentBytes: options.SSE.MaxToolCallArgumentBytes,
+		maxOutputBytes:           options.MaxOutputBytes,
+		maxTextBytes:             options.MaxTextBytes,
+		maxReasoningBytes:        options.MaxReasoningBytes,
 		toolRegistry:             options.ToolRegistry,
 	}
 }
@@ -206,64 +295,79 @@ func (decoder *BridgeStreamDecoder) ProviderCallID(callID string) (string, bool)
 	return "", false
 }
 
+// Next returns semantic events until the first provider terminal marker has
+// been translated. The bridge uses an explicit fail-closed, no-read-ahead
+// policy: once that terminal event is queued, later provider bytes are not
+// inspected and subsequent calls return io.EOF. Callers that need duplicate
+// terminal detection must drain ChatCompletionStreamDecoder directly; the HTTP
+// boundary must not block waiting for bytes that cannot change its response.
 func (decoder *BridgeStreamDecoder) Next() (bridge.StreamEvent, error) {
 	if decoder == nil || decoder.provider == nil {
 		return nil, io.EOF
 	}
-	if len(decoder.pending) > 0 {
-		event := decoder.pending[0]
-		decoder.pending = decoder.pending[1:]
-		return event, nil
-	}
-	if decoder.terminal {
-		return nil, io.EOF
-	}
+	for {
+		if len(decoder.pending) > 0 {
+			event := decoder.pending[0]
+			decoder.pending = decoder.pending[1:]
+			return event, nil
+		}
+		if decoder.terminal {
+			return nil, io.EOF
+		}
 
-	providerEvent, err := decoder.provider.Next()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
+		providerEvent, err := decoder.provider.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				decoder.terminal = true
+				return bridge.Failed{Code: "upstream_eof", Message: "upstream stream ended before a terminal event"}, nil
+			}
 			decoder.terminal = true
-			return bridge.Failed{Code: "upstream_eof", Message: "upstream stream ended before a terminal event"}, nil
+			if errors.Is(err, ErrSSELimitExceeded) {
+				return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}, nil
+			}
+			return decoder.bridgeFailure(err), nil
 		}
-		decoder.terminal = true
-		if errors.Is(err, ErrSSELimitExceeded) {
-			return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}, nil
+		if providerEvent.Error != nil {
+			decoder.terminal = true
+			return bridge.Failed{Code: "upstream_error", Message: "upstream provider returned a stream error"}, nil
 		}
-		return bridge.Failed{Code: "upstream_stream_error", Message: "upstream stream could not be decoded"}, nil
-	}
-	if providerEvent.Error != nil {
-		decoder.terminal = true
-		return bridge.Failed{Code: "upstream_error", Message: "upstream provider returned a stream error"}, nil
-	}
-	if providerEvent.Done {
-		if err := decoder.finish(); err != nil {
+		if providerEvent.Done {
+			if err := decoder.finish(); err != nil {
+				decoder.terminal = true
+				decoder.pending = nil
+				return decoder.bridgeFailure(err), nil
+			}
+			decoder.terminal = true
+			if len(decoder.pending) == 0 {
+				return bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream did not report a terminal reason"}, nil
+			}
+			event := decoder.pending[0]
+			decoder.pending = decoder.pending[1:]
+			return event, nil
+		}
+		if providerEvent.Chunk == nil {
+			decoder.terminal = true
+			return bridge.Failed{Code: "upstream_stream_error", Message: "upstream stream contained no response chunk"}, nil
+		}
+		if err := decoder.consumeChunk(*providerEvent.Chunk); err != nil {
 			decoder.terminal = true
 			decoder.pending = nil
 			return decoder.bridgeFailure(err), nil
 		}
-		decoder.terminal = true
-		if len(decoder.pending) == 0 {
-			return bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream did not report a terminal reason"}, nil
+		if len(decoder.pending) > 0 {
+			event := decoder.pending[0]
+			decoder.pending = decoder.pending[1:]
+			return event, nil
 		}
-		event := decoder.pending[0]
-		decoder.pending = decoder.pending[1:]
-		return event, nil
+		// A syntactically valid provider chunk can contain no choices, usage, or
+		// bridge events. Charge that work against the same aggregate budget as
+		// retained stream state so an endless no-op stream terminates
+		// deterministically without relying on call-stack depth.
+		if err := decoder.reserveAggregateBytes(bridgeStreamEventOverhead); err != nil {
+			decoder.terminal = true
+			return decoder.bridgeFailure(err), nil
+		}
 	}
-	if providerEvent.Chunk == nil {
-		decoder.terminal = true
-		return bridge.Failed{Code: "upstream_stream_error", Message: "upstream stream contained no response chunk"}, nil
-	}
-	if err := decoder.consumeChunk(*providerEvent.Chunk); err != nil {
-		decoder.terminal = true
-		decoder.pending = nil
-		return decoder.bridgeFailure(err), nil
-	}
-	if len(decoder.pending) == 0 {
-		return decoder.Next()
-	}
-	event := decoder.pending[0]
-	decoder.pending = decoder.pending[1:]
-	return event, nil
 }
 
 func (decoder *BridgeStreamDecoder) bridgeFailure(err error) bridge.Failed {
@@ -272,6 +376,18 @@ func (decoder *BridgeStreamDecoder) bridgeFailure(err error) bridge.Failed {
 	}
 	if errors.Is(err, ErrToolCallArgumentLimit) {
 		return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}
+	}
+	if errors.Is(err, ErrToolCallLimit) || errors.Is(err, ErrToolCallMetadataLimit) {
+		return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}
+	}
+	if errors.Is(err, ErrStreamCanceled) {
+		return bridge.Failed{Code: "canceled", Message: "The upstream response stream was canceled."}
+	}
+	if errors.Is(err, ErrStreamTimeout) {
+		return bridge.Failed{Code: "timeout", Message: "The upstream response stream timed out."}
+	}
+	if errors.Is(err, ErrStreamInterrupted) {
+		return bridge.Failed{Code: "stream_interrupted", Message: "The upstream response stream was interrupted."}
 	}
 	if errors.Is(err, ErrUndeclaredToolCall) {
 		return bridge.Failed{Code: "upstream_tool_not_declared", Message: "The upstream provider returned an undeclared function tool."}
@@ -283,6 +399,9 @@ func (decoder *BridgeStreamDecoder) bridgeFailure(err error) bridge.Failed {
 }
 
 func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) error {
+	if err := decoder.validateChunkToolBounds(chunk); err != nil {
+		return err
+	}
 	if !decoder.started {
 		decoder.started = true
 		createdAt := time.Time{}
@@ -305,10 +424,18 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 	if decoder.createdAt.IsZero() && chunk.Created != 0 {
 		decoder.createdAt = time.Unix(chunk.Created, 0).UTC()
 	}
+	seenChoiceIndexes := make(map[int]struct{}, minInt(len(chunk.Choices), decoder.maxChoices))
 	for _, choice := range chunk.Choices {
 		if choice.Index < 0 {
 			return ErrMalformedStream
 		}
+		if choice.Index >= decoder.maxChoices {
+			return ErrToolCallLimit
+		}
+		if _, exists := seenChoiceIndexes[choice.Index]; exists {
+			return ErrMalformedStream
+		}
+		seenChoiceIndexes[choice.Index] = struct{}{}
 		finishReason := ""
 		if choice.FinishReason != nil {
 			finishReason = *choice.FinishReason
@@ -341,18 +468,27 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 			decoder.recordFinishReason(finishReason)
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
+			if len(*choice.Delta.Content) > decoder.maxTextBytes-decoder.textBytes || len(*choice.Delta.Content) > decoder.maxOutputBytes-decoder.outputBytes {
+				return ErrStreamAggregateLimit
+			}
 			if err := decoder.queue(bridge.TextDelta{ChoiceIndex: choice.Index, Text: *choice.Delta.Content}, len(*choice.Delta.Content)); err != nil {
 				return err
 			}
 			decoder.assistantContent = append(decoder.assistantContent, (*choice.Delta.Content)...)
+			decoder.textBytes += len(*choice.Delta.Content)
+			decoder.outputBytes += len(*choice.Delta.Content)
 		}
 		if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
+			if len(*choice.Delta.ReasoningContent) > decoder.maxReasoningBytes-decoder.reasoningBytes {
+				return ErrStreamAggregateLimit
+			}
 			if err := decoder.queue(bridge.ReasoningDelta{ChoiceIndex: choice.Index, Text: *choice.Delta.ReasoningContent}, len(*choice.Delta.ReasoningContent)); err != nil {
 				return err
 			}
 			decoder.reasoningContent = append(decoder.reasoningContent, (*choice.Delta.ReasoningContent)...)
+			decoder.reasoningBytes += len(*choice.Delta.ReasoningContent)
 		}
-		seenToolIndexes := make(map[int]struct{}, len(choice.Delta.ToolCalls))
+		seenToolIndexes := make(map[int]struct{}, minInt(len(choice.Delta.ToolCalls), decoder.maxToolCalls))
 		for _, tool := range choice.Delta.ToolCalls {
 			if tool.Index == nil || *tool.Index < 0 {
 				return ErrMalformedStream
@@ -390,6 +526,75 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 	return nil
 }
 
+// validateChunkToolBounds performs the state-free part of provider tool
+// reconstruction before consumeChunk can queue response state or append any
+// call metadata. A provider can send many sparse/empty indexes or fragment a
+// name over many chunks, so downstream event and queue limits are too late for
+// this boundary.
+func (decoder *BridgeStreamDecoder) validateChunkToolBounds(chunk ChatCompletionChunk) error {
+	if len(chunk.Choices) > decoder.maxChoices {
+		return ErrToolCallLimit
+	}
+	seenChoices := make(map[int]struct{}, len(chunk.Choices))
+	newCalls := 0
+	for _, choice := range chunk.Choices {
+		if choice.Index < 0 {
+			return ErrMalformedStream
+		}
+		if choice.Index >= decoder.maxChoices {
+			return ErrToolCallLimit
+		}
+		if _, exists := seenChoices[choice.Index]; exists {
+			return ErrMalformedStream
+		}
+		seenChoices[choice.Index] = struct{}{}
+		if len(choice.Delta.ToolCalls) > decoder.maxToolCalls {
+			return ErrToolCallLimit
+		}
+		seenTools := make(map[int]struct{}, len(choice.Delta.ToolCalls))
+		for _, tool := range choice.Delta.ToolCalls {
+			if tool.Index == nil || *tool.Index < 0 {
+				return ErrMalformedStream
+			}
+			if tool.Type != "" && tool.Type != "function" {
+				return ErrMalformedStream
+			}
+			toolIndex := *tool.Index
+			if toolIndex >= decoder.maxToolCalls {
+				return ErrToolCallLimit
+			}
+			if _, exists := seenTools[toolIndex]; exists {
+				return ErrMalformedStream
+			}
+			seenTools[toolIndex] = struct{}{}
+			key := bridge.ToolCallKey{ChoiceIndex: choice.Index, ToolIndex: toolIndex}
+			state, exists := decoder.calls[key]
+			if exists {
+				if len(tool.Function.Name) > decoder.maxToolNameBytes-len(state.name) {
+					return ErrToolCallMetadataLimit
+				}
+				growth := providerCallIDGrowth(state.providerCallID, tool.ID)
+				if growth > decoder.maxProviderCallIDBytes-len(state.providerCallID) {
+					return ErrToolCallMetadataLimit
+				}
+				continue
+			}
+			newCalls++
+			callID := tool.ID
+			if callID == "" {
+				callID = syntheticToolCallID(key)
+			}
+			if len(callID) > decoder.maxProviderCallIDBytes || len(tool.ID) > decoder.maxProviderCallIDBytes || len(tool.Function.Name) > decoder.maxToolNameBytes {
+				return ErrToolCallMetadataLimit
+			}
+		}
+	}
+	if newCalls > decoder.maxToolCalls-len(decoder.calls) {
+		return ErrToolCallLimit
+	}
+	return nil
+}
+
 func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCall) error {
 	if tool.Index == nil || *tool.Index < 0 {
 		return ErrMalformedStream
@@ -398,9 +603,18 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 		return ErrMalformedStream
 	}
 	toolIndex := *tool.Index
+	if toolIndex >= decoder.maxToolCalls {
+		return ErrToolCallLimit
+	}
 	key := bridge.ToolCallKey{ChoiceIndex: choiceIndex, ToolIndex: toolIndex}
 	state, exists := decoder.calls[key]
 	if !exists {
+		if len(decoder.calls) >= decoder.maxToolCalls {
+			return ErrToolCallLimit
+		}
+		if len(tool.ID) > decoder.maxProviderCallIDBytes || len(tool.Function.Name) > decoder.maxToolNameBytes {
+			return ErrToolCallMetadataLimit
+		}
 		state = &providerToolCall{key: key}
 		callID := tool.ID
 		if callID == "" {
@@ -409,8 +623,19 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 		state.callID = append(state.callID, callID...)
 		decoder.calls[key] = state
 	}
+	if len(tool.Function.Name) > decoder.maxToolNameBytes-len(state.name) {
+		return ErrToolCallMetadataLimit
+	}
+	nextName := string(state.name) + tool.Function.Name
+	if err := decoder.validateToolNamePrefix(nextName); err != nil {
+		return err
+	}
 	if tool.ID != "" {
-		if err := decoder.reserveAggregateBytes(providerCallIDGrowth(state.providerCallID, tool.ID)); err != nil {
+		growth := providerCallIDGrowth(state.providerCallID, tool.ID)
+		if growth > decoder.maxProviderCallIDBytes-len(state.providerCallID) {
+			return ErrToolCallMetadataLimit
+		}
+		if err := decoder.reserveAggregateBytes(growth); err != nil {
 			return err
 		}
 		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
@@ -419,38 +644,17 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 	if decoder.customNameCandidate(string(state.name)) {
 		state.customCandidate = true
 	}
-	if err := decoder.ensureToolStarted(state); err != nil {
-		return err
-	}
-	if exists && tool.Function.Name != "" && state.kind != bridge.ToolCustom && state.started {
-		if err := decoder.queue(bridge.ToolCallMetadataDelta{
-			Key: key,
-			// Provider IDs may be fragmented or delayed. The downstream call
-			// ID was fixed in ToolCallStarted; later provider fragments remain
-			// private continuation state and never mutate Responses identity.
-			CallID: "",
-			Name:   tool.Function.Name,
-		}, len(tool.ID)+len(tool.Function.Name)); err != nil {
-			return err
-		}
-	}
 	if len(tool.Function.Arguments) > decoder.maxToolCallArgumentBytes-len(state.arguments) {
 		return ErrToolCallArgumentLimit
 	}
+	if len(tool.Function.Arguments) > decoder.maxOutputBytes-decoder.outputBytes {
+		return ErrStreamAggregateLimit
+	}
+	if err := decoder.reserveAggregateBytes(len(tool.Function.Arguments)); err != nil {
+		return err
+	}
 	state.arguments = append(state.arguments, tool.Function.Arguments...)
-	if state.kind == bridge.ToolCustom || state.customCandidate {
-		if err := decoder.reserveAggregateBytes(len(tool.Function.Arguments)); err != nil {
-			return err
-		}
-		return nil
-	}
-	if state.started && state.argumentsEmitted < len(state.arguments) {
-		delta := string(state.arguments[state.argumentsEmitted:])
-		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: key, Arguments: delta}, len(delta)); err != nil {
-			return err
-		}
-		state.argumentsEmitted = len(state.arguments)
-	}
+	decoder.outputBytes += len(tool.Function.Arguments)
 	return nil
 }
 
@@ -469,12 +673,30 @@ func (decoder *BridgeStreamDecoder) customNameCandidate(name string) bool {
 	return false
 }
 
+func (decoder *BridgeStreamDecoder) validateToolNamePrefix(name string) error {
+	if name == "" {
+		return nil
+	}
+	if _, allowed := decoder.allowedToolNames[name]; allowed {
+		return nil
+	}
+	for allowedName := range decoder.allowedToolNames {
+		if strings.HasPrefix(allowedName, name) {
+			return nil
+		}
+	}
+	return ErrUndeclaredToolCall
+}
+
 func (decoder *BridgeStreamDecoder) ensureToolStarted(state *providerToolCall) error {
 	if state.started {
 		return nil
 	}
 	name := string(state.name)
-	if name == "" || (state.customCandidate && name != ApplyPatchUpstreamName) {
+	if name == "" {
+		return nil
+	}
+	if _, allowed := decoder.allowedToolNames[name]; !allowed {
 		return nil
 	}
 	kind := bridge.ToolFunction
@@ -494,12 +716,12 @@ func (decoder *BridgeStreamDecoder) ensureToolStarted(state *providerToolCall) e
 		return err
 	}
 	state.started = true
-	if kind != bridge.ToolCustom && state.argumentsEmitted < len(state.arguments) {
-		delta := string(state.arguments[state.argumentsEmitted:])
-		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: delta}, len(delta)); err != nil {
+	if kind != bridge.ToolCustom && len(state.arguments) > 0 {
+		// Argument fragments were charged when retained in state. Do not charge
+		// their semantic replay payload a second time at the terminal boundary.
+		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: string(state.arguments)}, 0); err != nil {
 			return err
 		}
-		state.argumentsEmitted = len(state.arguments)
 	}
 	return nil
 }
@@ -575,6 +797,29 @@ func (decoder *BridgeStreamDecoder) finish() error {
 	if decoder.finishConflict || decoder.finishReason == "" {
 		return decoder.queue(bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream reported inconsistent terminal state"}, 0)
 	}
+	switch decoder.finishReason {
+	case "tool_calls":
+		return decoder.finishToolCalls()
+	case "stop":
+		if len(decoder.calls) > 0 {
+			return decoder.queue(bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream ended before tool calls were complete"}, 0)
+		}
+		decoder.finalized = true
+		return decoder.queue(bridge.Completed{Reason: decoder.finishReason}, 0)
+	case "length":
+		// Tool-call state is deliberately left incomplete. A length-limited
+		// provider turn must never be presented as an executable tool call.
+		return decoder.queue(bridge.Incomplete{Reason: "max_output_tokens"}, 0)
+	case "content_filter", "refusal":
+		// Tool-call state is deliberately left incomplete. A filtered or
+		// refused turn has no valid executable tool-call boundary.
+		return decoder.queue(bridge.Incomplete{Reason: "other"}, 0)
+	default:
+		return decoder.queue(bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream reported an unsupported terminal reason"}, 0)
+	}
+}
+
+func (decoder *BridgeStreamDecoder) finishToolCalls() error {
 	for _, key := range sortedToolKeys(decoder.calls) {
 		state := decoder.calls[key]
 		if state.completed {
@@ -610,7 +855,9 @@ func (decoder *BridgeStreamDecoder) finish() error {
 			if err != nil {
 				return err
 			}
-			if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: input}, len(input)); err != nil {
+			// The raw wrapper was charged as it was retained. The unwrapped
+			// semantic payload is therefore intentionally not charged again.
+			if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: input}, 0); err != nil {
 				return err
 			}
 			if err := decoder.queue(bridge.ToolCallCompleted{
@@ -619,7 +866,7 @@ func (decoder *BridgeStreamDecoder) finish() error {
 				CallID:    string(state.callID),
 				Name:      state.registration.InboundName,
 				Arguments: input,
-			}, len(state.callID)+len(state.registration.InboundName)+len(input)); err != nil {
+			}, len(state.callID)+len(state.registration.InboundName)); err != nil {
 				return err
 			}
 			continue
@@ -630,22 +877,13 @@ func (decoder *BridgeStreamDecoder) finish() error {
 			CallID:    callID,
 			Name:      string(state.name),
 			Arguments: string(state.arguments),
-		}, len(state.callID)+len(state.name)+len(state.arguments)); err != nil {
+		}, len(state.callID)+len(state.name)); err != nil {
 			return err
 		}
 	}
-	switch decoder.finishReason {
-	case "stop", "tool_calls":
-		decoder.finalized = true
-		decoder.toolTurn = decoder.finishReason == "tool_calls" && len(decoder.calls) > 0
-		return decoder.queue(bridge.Completed{Reason: decoder.finishReason}, 0)
-	case "length":
-		return decoder.queue(bridge.Incomplete{Reason: "max_output_tokens"}, 0)
-	case "content_filter", "refusal":
-		return decoder.queue(bridge.Incomplete{Reason: "other"}, 0)
-	default:
-		return decoder.queue(bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream reported an unsupported terminal reason"}, 0)
-	}
+	decoder.finalized = true
+	decoder.toolTurn = len(decoder.calls) > 0
+	return decoder.queue(bridge.Completed{Reason: decoder.finishReason}, 0)
 }
 
 // PendingTurn returns the finalized provider-side assistant turn when this

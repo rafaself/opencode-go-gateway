@@ -9,7 +9,6 @@ import (
 
 var (
 	ErrToolResultInvalid      = errors.New("tool result is invalid")
-	ErrToolResultUnknownCall  = errors.New("tool result does not correlate to a tool call")
 	ErrToolResultDuplicate    = errors.New("tool result is duplicated")
 	ErrToolResultKindMismatch = errors.New("tool result kind does not match the tool call")
 )
@@ -28,6 +27,7 @@ func TranslateToolResults(items []bridge.InputItem) ([]bridge.ToolResult, error)
 	calls := make(map[string]toolCallResultMetadata)
 	seenResults := make(map[string]struct{})
 	results := make([]bridge.ToolResult, 0)
+	resultIndexes := make(map[string]int)
 	for _, item := range items {
 		switch value := item.(type) {
 		case bridge.FunctionCall:
@@ -37,7 +37,14 @@ func TranslateToolResults(items []bridge.InputItem) ([]bridge.ToolResult, error)
 			if _, exists := calls[value.CallID]; exists {
 				return nil, ErrToolResultInvalid
 			}
-			calls[value.CallID] = toolCallResultMetadata{kind: bridge.ToolFunction, error: toolResultStatusIsError(value.Status)}
+			metadata := toolCallResultMetadata{kind: bridge.ToolFunction, error: toolResultStatusIsError(value.Status)}
+			if index, exists := resultIndexes[value.CallID]; exists {
+				if results[index].Kind != metadata.kind {
+					return nil, ErrToolResultKindMismatch
+				}
+				results[index].Error = results[index].Error || metadata.error
+			}
+			calls[value.CallID] = metadata
 		case bridge.CustomToolCall:
 			if value.CallID == "" || value.Name == "" {
 				return nil, ErrToolResultInvalid
@@ -45,18 +52,27 @@ func TranslateToolResults(items []bridge.InputItem) ([]bridge.ToolResult, error)
 			if _, exists := calls[value.CallID]; exists {
 				return nil, ErrToolResultInvalid
 			}
-			calls[value.CallID] = toolCallResultMetadata{kind: bridge.ToolCustom, error: toolResultStatusIsError(value.Status)}
+			metadata := toolCallResultMetadata{kind: bridge.ToolCustom, error: toolResultStatusIsError(value.Status)}
+			if index, exists := resultIndexes[value.CallID]; exists {
+				if results[index].Kind != metadata.kind {
+					return nil, ErrToolResultKindMismatch
+				}
+				results[index].Error = results[index].Error || metadata.error
+			}
+			calls[value.CallID] = metadata
 		case bridge.FunctionCallOutput:
 			result, err := toolResult(value.CallID, bridge.ToolFunction, value.Output, value.Status, value.Error, calls, seenResults)
 			if err != nil {
 				return nil, err
 			}
+			resultIndexes[result.CallID] = len(results)
 			results = append(results, result)
 		case bridge.CustomToolCallOutput:
 			result, err := toolResult(value.CallID, bridge.ToolCustom, value.Output, value.Status, value.Error, calls, seenResults)
 			if err != nil {
 				return nil, err
 			}
+			resultIndexes[result.CallID] = len(results)
 			results = append(results, result)
 		}
 	}
@@ -67,11 +83,8 @@ func toolResult(callID string, kind bridge.ToolKind, output, status string, erro
 	if callID == "" {
 		return bridge.ToolResult{}, ErrToolResultInvalid
 	}
-	callMetadata, exists := calls[callID]
-	if !exists {
-		return bridge.ToolResult{}, ErrToolResultUnknownCall
-	}
-	if callMetadata.kind != kind {
+	callMetadata, declared := calls[callID]
+	if declared && callMetadata.kind != kind {
 		return bridge.ToolResult{}, ErrToolResultKindMismatch
 	}
 	if _, exists := seenResults[callID]; exists {
@@ -83,7 +96,7 @@ func toolResult(callID string, kind bridge.ToolKind, output, status string, erro
 		Kind:   kind,
 		Output: output,
 		Status: status,
-		Error:  errorMarker || callMetadata.error || toolResultStatusIsError(status),
+		Error:  errorMarker || (declared && callMetadata.error) || toolResultStatusIsError(status),
 	}, nil
 }
 

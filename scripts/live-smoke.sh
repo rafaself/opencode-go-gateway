@@ -130,7 +130,7 @@ reader_pid=$!
 		--color never \
 		--json \
 		-c 'model_provider="gateway"' \
-		-c "model_providers.gateway={name=\"Local Gateway\", base_url=\"$gateway_url/v1\", wire_api=\"responses\"}" \
+		-c "model_providers.gateway={name=\"Local Gateway\", base_url=\"$gateway_url/v1\", wire_api=\"responses\", request_max_retries=0, stream_max_retries=0}" \
 		"Reply with exactly one short sentence. Smoke marker: $prompt_marker" \
 		>"$codex_fifo" 2>"$codex_error"
 ) &

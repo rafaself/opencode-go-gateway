@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -90,6 +91,7 @@ type CustomToolHook struct {
 }
 
 type StreamSessionOptions struct {
+	Context    context.Context
 	ResponseID string
 	CreatedAt  time.Time
 	Model      string
@@ -101,8 +103,17 @@ type StreamSessionOptions struct {
 	// MaxToolCallArgumentBytes bounds one function/custom tool argument string
 	// independently of the total retained stream state.
 	MaxToolCallArgumentBytes int
-	IDGenerator              IDGenerator
-	CustomTools              map[bridge.ToolKind]CustomToolHook
+	// MaxOutputBytes bounds visible text and tool arguments emitted by one
+	// Responses stream. The narrower text and reasoning limits protect their
+	// respective model-owned fields independently.
+	MaxOutputBytes    int
+	MaxTextBytes      int
+	MaxReasoningBytes int
+	// WriteTimeout applies independently to each downstream write/flush. It
+	// is not a total generation timeout.
+	WriteTimeout time.Duration
+	IDGenerator  IDGenerator
+	CustomTools  map[bridge.ToolKind]CustomToolHook
 }
 
 // StreamSession owns all Responses-specific stream state for one request. It
@@ -131,7 +142,14 @@ type StreamSession struct {
 	aggregateBytes           int
 	maxAggregateBytes        int
 	maxToolCallArgumentBytes int
+	maxOutputBytes           int
+	maxTextBytes             int
+	maxReasoningBytes        int
+	writeTimeout             time.Duration
+	context                  context.Context
 	reasoning                []byte
+	textBytes                int
+	outputBytes              int
 	items                    map[streamItemKey]*streamItem
 	itemOrder                []*streamItem
 	usage                    *bridge.Usage
@@ -204,6 +222,21 @@ func NewStreamSession(writer http.ResponseWriter, options StreamSessionOptions) 
 	if maxToolCallArgumentBytes <= 0 {
 		maxToolCallArgumentBytes = DefaultMaxToolCallArgumentBytes
 	}
+	maxOutputBytes := options.MaxOutputBytes
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = bridge.DefaultMaxOutputBytes
+	}
+	maxTextBytes := options.MaxTextBytes
+	if maxTextBytes <= 0 {
+		maxTextBytes = bridge.DefaultMaxTextBytes
+	}
+	maxReasoningBytes := options.MaxReasoningBytes
+	if maxReasoningBytes <= 0 {
+		maxReasoningBytes = bridge.DefaultMaxReasoningBytes
+	}
+	if options.Context == nil {
+		options.Context = context.Background()
+	}
 	return &StreamSession{
 		ResponseID:               responseID,
 		CreatedAt:                createdAt,
@@ -215,6 +248,11 @@ func NewStreamSession(writer http.ResponseWriter, options StreamSessionOptions) 
 		clock:                    clock,
 		maxAggregateBytes:        maxAggregateBytes,
 		maxToolCallArgumentBytes: maxToolCallArgumentBytes,
+		maxOutputBytes:           maxOutputBytes,
+		maxTextBytes:             maxTextBytes,
+		maxReasoningBytes:        maxReasoningBytes,
+		writeTimeout:             options.WriteTimeout,
+		context:                  options.Context,
 		downstreamDone:           make(chan struct{}),
 		items:                    make(map[streamItemKey]*streamItem),
 	}, nil
@@ -493,10 +531,15 @@ func (session *StreamSession) textDeltaLocked(event bridge.TextDelta) error {
 	if event.Text == "" {
 		return nil
 	}
+	if len(event.Text) > session.maxTextBytes-session.textBytes || len(event.Text) > session.maxOutputBytes-session.outputBytes {
+		return session.limitLocked()
+	}
 	if err := session.reserveAggregateLocked(len(event.Text)); err != nil {
 		return session.limitLocked()
 	}
 	item.text = append(item.text, event.Text...)
+	session.textBytes += len(event.Text)
+	session.outputBytes += len(event.Text)
 	return session.writeEventLocked("response.output_text.delta", map[string]any{
 		"item_id":       item.id,
 		"output_index":  item.outputIndex,
@@ -604,6 +647,9 @@ func (session *StreamSession) toolCallArgumentsLocked(event bridge.ToolCallArgum
 	if event.Arguments == "" {
 		return nil
 	}
+	if len(event.Arguments) > session.maxOutputBytes-session.outputBytes {
+		return session.limitLocked()
+	}
 	if len(event.Arguments) > session.maxToolCallArgumentBytes-len(item.arguments) {
 		return session.limitLocked()
 	}
@@ -611,6 +657,7 @@ func (session *StreamSession) toolCallArgumentsLocked(event bridge.ToolCallArgum
 		return session.limitLocked()
 	}
 	item.arguments = append(item.arguments, event.Arguments...)
+	session.outputBytes += len(event.Arguments)
 	eventType := "response.function_call_arguments.delta"
 	if item.toolKind != bridge.ToolFunction {
 		eventType = item.hook.DeltaType
@@ -636,6 +683,12 @@ func (session *StreamSession) toolCallCompletedLocked(event bridge.ToolCallCompl
 	if len(event.Arguments) > session.maxToolCallArgumentBytes {
 		return session.limitLocked()
 	}
+	if event.Arguments != "" {
+		retainedOutputBytes := session.outputBytes - len(item.arguments)
+		if len(event.Arguments) > session.maxOutputBytes-retainedOutputBytes {
+			return session.limitLocked()
+		}
+	}
 	if err := session.reserveAggregateLocked(len(event.CallID) + len(event.Name) + len(event.Arguments)); err != nil {
 		return session.limitLocked()
 	}
@@ -646,7 +699,11 @@ func (session *StreamSession) toolCallCompletedLocked(event bridge.ToolCallCompl
 		item.name = append(item.name[:0], event.Name...)
 	}
 	if event.Arguments != "" || len(item.arguments) == 0 {
+		previousArgumentBytes := len(item.arguments)
 		item.arguments = append(item.arguments[:0], event.Arguments...)
+		if event.Arguments != "" {
+			session.outputBytes += len(item.arguments) - previousArgumentBytes
+		}
 	}
 	if len(item.callID) == 0 || len(item.name) == 0 {
 		return session.invalidTransitionLocked("tool call is missing identity")
@@ -663,6 +720,9 @@ func (session *StreamSession) reasoningDeltaLocked(event bridge.ReasoningDelta) 
 	}
 	if event.Text == "" {
 		return nil
+	}
+	if len(event.Text) > session.maxReasoningBytes-len(session.reasoning) {
+		return session.limitLocked()
 	}
 	if err := session.reserveAggregateLocked(len(event.Text)); err != nil {
 		return session.limitLocked()
@@ -713,7 +773,7 @@ func (session *StreamSession) failedLocked(event bridge.Failed) error {
 	session.TerminalEmitted = true
 	code := safeFailureCode(event.Code)
 	message := safeFailureMessage(event.Message)
-	return session.writeTerminalLocked("failed", map[string]any{"code": code, "message": message}, "")
+	return session.writeTerminalLocked("failed", map[string]any{"type": safeFailureType(code), "code": code, "message": message}, "")
 }
 
 func (session *StreamSession) finishItemsLocked(status string, requireIdentity bool) error {
@@ -970,6 +1030,7 @@ func (session *StreamSession) limitLocked() error {
 	session.TerminalEmitted = true
 	if err := session.writeTerminalLocked("failed", map[string]any{
 		"code":    "stream_limit_exceeded",
+		"type":    "request_too_large",
 		"message": "The response stream exceeded its limit.",
 	}, ""); err != nil {
 		return err
@@ -992,6 +1053,7 @@ func (session *StreamSession) invalidTransitionLocked(_ string) error {
 	session.TerminalEmitted = true
 	if err := session.writeTerminalLocked("failed", map[string]any{
 		"code":    "stream_invalid_transition",
+		"type":    "provider_protocol_error",
 		"message": "The response stream entered an invalid state.",
 	}, ""); err != nil {
 		return err
@@ -1002,6 +1064,11 @@ func (session *StreamSession) invalidTransitionLocked(_ string) error {
 func (session *StreamSession) writeEventLocked(eventType string, fields map[string]any) error {
 	if session.writeFailure != nil {
 		return session.writeFailure
+	}
+	if session.context != nil {
+		if err := session.context.Err(); err != nil {
+			return session.recordWriteFailureLocked(err)
+		}
 	}
 	payload := make(map[string]any, len(fields)+2)
 	for key, value := range fields {
@@ -1017,6 +1084,11 @@ func (session *StreamSession) writeEventLocked(eventType string, fields map[stri
 	frame = append(frame, "data: "...)
 	frame = append(frame, data...)
 	frame = append(frame, '\n', '\n')
+	if session.writeTimeout > 0 {
+		if err := session.controller.SetWriteDeadline(time.Now().Add(session.writeTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return session.recordWriteFailureLocked(err)
+		}
+	}
 	written, writeErr := session.writer.Write(frame)
 	if writeErr != nil || written != len(frame) {
 		if writeErr == nil {
@@ -1026,6 +1098,9 @@ func (session *StreamSession) writeEventLocked(eventType string, fields map[stri
 	}
 	if flushErr := session.controller.Flush(); flushErr != nil {
 		return session.recordWriteFailureLocked(flushErr)
+	}
+	if session.writeTimeout > 0 {
+		_ = session.controller.SetWriteDeadline(time.Time{})
 	}
 	session.SequenceNumber++
 	return nil
@@ -1068,4 +1143,21 @@ func safeFailureMessage(message string) string {
 		return "The response stream failed."
 	}
 	return message
+}
+
+func safeFailureType(code string) string {
+	switch code {
+	case "stream_limit_exceeded":
+		return "request_too_large"
+	case "timeout":
+		return "timeout"
+	case "canceled":
+		return "canceled"
+	case "stream_interrupted":
+		return "stream_interrupted"
+	case "upstream_stream_error", "upstream_eof", "upstream_terminal_error", "upstream_error", "upstream_tool_not_declared", "upstream_custom_tool_invalid":
+		return "provider_protocol_error"
+	default:
+		return "internal_error"
+	}
 }

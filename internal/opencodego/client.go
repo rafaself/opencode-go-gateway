@@ -3,8 +3,7 @@ package opencodego
 import (
 	"bytes"
 	"context"
-	"io"
-	"math"
+	"errors"
 	"mime"
 	"net"
 	"net/http"
@@ -20,14 +19,14 @@ import (
 )
 
 const (
-	defaultDialTimeout           = 10 * time.Second
-	defaultKeepAlive             = 30 * time.Second
-	defaultTLSHandshakeTimeout   = 10 * time.Second
-	defaultResponseHeaderTimeout = 30 * time.Second
-	defaultExpectContinueTimeout = 1 * time.Second
-	defaultMaxIdleConnections    = 100
-	defaultMaxIdlePerHost        = 10
-	defaultIdleConnectionTimeout = 90 * time.Second
+	DefaultDialTimeout           = 10 * time.Second
+	DefaultKeepAlive             = 30 * time.Second
+	DefaultTLSHandshakeTimeout   = 10 * time.Second
+	DefaultResponseHeaderTimeout = 30 * time.Second
+	DefaultExpectContinueTimeout = 1 * time.Second
+	DefaultMaxIdleConnections    = 100
+	DefaultMaxIdlePerHost        = 10
+	DefaultIdleConnectionTimeout = 90 * time.Second
 )
 
 // HTTPDoer is the narrow dependency required by Client. *http.Client is the
@@ -39,14 +38,16 @@ type HTTPDoer interface {
 
 // ClientConfig configures one independent OpenCode Go client.
 type ClientConfig struct {
-	APIKey              string
-	BaseURL             string
-	Model               string
-	UserAgent           string
-	HTTPClient          HTTPDoer
-	ThinkingMode        ThinkingMode
-	MaxRequestBodyBytes int64
-	MaxErrorBodyBytes   int64
+	APIKey                string
+	BaseURL               string
+	Model                 string
+	UserAgent             string
+	HTTPClient            HTTPDoer
+	ThinkingMode          ThinkingMode
+	MaxRequestBodyBytes   int64
+	DialTimeout           time.Duration
+	TLSHandshakeTimeout   time.Duration
+	ResponseHeaderTimeout time.Duration
 }
 
 // Client owns no mutable global state. Its HTTP request uses request context
@@ -60,7 +61,6 @@ type Client struct {
 	userAgent           string
 	thinkingMode        ThinkingMode
 	maxRequestBodyBytes int64
-	maxErrorBodyBytes   int64
 }
 
 // NewClient constructs an independent provider client. An empty BaseURL,
@@ -98,17 +98,25 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if maxRequestBodyBytes <= 0 {
 		return nil, providerError(ErrorInvalidConfiguration, nil)
 	}
-	maxErrorBodyBytes := config.MaxErrorBodyBytes
-	if maxErrorBodyBytes == 0 {
-		maxErrorBodyBytes = DefaultMaxErrorBodyBytes
+	dialTimeout := config.DialTimeout
+	if dialTimeout == 0 {
+		dialTimeout = DefaultDialTimeout
 	}
-	if maxErrorBodyBytes <= 0 {
+	tlsHandshakeTimeout := config.TLSHandshakeTimeout
+	if tlsHandshakeTimeout == 0 {
+		tlsHandshakeTimeout = DefaultTLSHandshakeTimeout
+	}
+	responseHeaderTimeout := config.ResponseHeaderTimeout
+	if responseHeaderTimeout == 0 {
+		responseHeaderTimeout = DefaultResponseHeaderTimeout
+	}
+	if dialTimeout <= 0 || tlsHandshakeTimeout <= 0 || responseHeaderTimeout <= 0 {
 		return nil, providerError(ErrorInvalidConfiguration, nil)
 	}
 
 	httpClient := config.HTTPClient
 	if httpClient == nil {
-		httpClient = newDefaultHTTPClient()
+		httpClient = newDefaultHTTPClient(dialTimeout, tlsHandshakeTimeout, responseHeaderTimeout)
 	}
 	mode := config.ThinkingMode
 	if mode != ThinkingDefault && mode != ThinkingEnabled && mode != ThinkingDisabled {
@@ -125,7 +133,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 		userAgent:           userAgent,
 		thinkingMode:        mode,
 		maxRequestBodyBytes: maxRequestBodyBytes,
-		maxErrorBodyBytes:   maxErrorBodyBytes,
 	}, nil
 }
 
@@ -180,7 +187,14 @@ func (client *Client) Do(ctx context.Context, request bridge.Request) (*Response
 			_ = response.Body.Close()
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				return nil, &ProviderError{Code: ErrorTimeout, cause: ctxErr}
+			}
 			return nil, &ProviderError{Code: ErrorCanceled, cause: ctxErr}
+		}
+		var networkErr net.Error
+		if errors.As(err, &networkErr) && networkErr.Timeout() {
+			return nil, &ProviderError{Code: ErrorTimeout, cause: err}
 		}
 		return nil, &ProviderError{Code: ErrorNetwork, cause: err}
 	}
@@ -219,12 +233,16 @@ func (client *Client) classifyUpstreamError(response *http.Response) error {
 		code = ErrorForbidden
 	case response.StatusCode == http.StatusTooManyRequests:
 		code = ErrorRateLimited
+	case response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusGatewayTimeout:
+		code = ErrorTimeout
 	case response.StatusCode >= 500 && response.StatusCode <= 599:
 		code = ErrorServer
 	}
 	err := &ProviderError{Code: code, StatusCode: response.StatusCode, RetryAfter: safeRetryAfter(response.Header.Get("Retry-After"))}
+	// Error payloads are not part of the gateway contract and are never needed
+	// to classify status or Retry-After. Close without reading so an upstream
+	// that leaves an error body open cannot hold the request indefinitely.
 	if response.Body != nil {
-		err.BodyTruncated, err.BodyReadFailed = readBoundedErrorBody(response.Body, client.maxErrorBodyBytes)
 		_ = response.Body.Close()
 	}
 	return err
@@ -235,21 +253,6 @@ func (client *Client) closeWithError(response *http.Response, err error) error {
 		_ = response.Body.Close()
 	}
 	return err
-}
-
-func readBoundedErrorBody(body io.Reader, limit int64) (truncated, failed bool) {
-	if body == nil || limit <= 0 {
-		return false, false
-	}
-	readLimit := limit
-	if limit < math.MaxInt64 {
-		readLimit++
-	}
-	data, err := io.ReadAll(io.LimitReader(body, readLimit))
-	if err != nil {
-		return false, true
-	}
-	return int64(len(data)) > limit, false
 }
 
 func endpointURL(raw string) (*url.URL, error) {
@@ -343,20 +346,22 @@ func safeMediaType(value string) string {
 	return mediaType
 }
 
-func newDefaultHTTPClient() *http.Client {
+func newDefaultHTTPClient(dialTimeout, tlsHandshakeTimeout, responseHeaderTimeout time.Duration) *http.Client {
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// Provider credentials must not be sent through an ambient or
+		// user-controlled proxy. The gateway has no proxy configuration surface.
+		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
 		DialContext: (&net.Dialer{
-			Timeout:   defaultDialTimeout,
-			KeepAlive: defaultKeepAlive,
+			Timeout:   dialTimeout,
+			KeepAlive: DefaultKeepAlive,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          defaultMaxIdleConnections,
-		MaxIdleConnsPerHost:   defaultMaxIdlePerHost,
-		IdleConnTimeout:       defaultIdleConnectionTimeout,
-		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
-		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
-		ExpectContinueTimeout: defaultExpectContinueTimeout,
+		MaxIdleConns:          DefaultMaxIdleConnections,
+		MaxIdleConnsPerHost:   DefaultMaxIdlePerHost,
+		IdleConnTimeout:       DefaultIdleConnectionTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: DefaultExpectContinueTimeout,
 		DisableCompression:    true,
 	}
 	return &http.Client{

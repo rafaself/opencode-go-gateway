@@ -8,9 +8,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -93,6 +95,21 @@ func TestResponsesStreamsTextIncrementallyThroughTheGateway(t *testing.T) {
 	}
 	if len(gotRequest.Input) != 2 {
 		t.Fatalf("bridge input count = %d", len(gotRequest.Input))
+	}
+}
+
+func TestResponsesTreatsFirstProviderTerminalAsAuthoritative(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"provider-terminal","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	gateway := newIntegrationGateway(t, staticUpstream(stream), nil)
+	response := postTextRequest(t, gateway)
+	defer response.Body.Close()
+	events := readResponseEvents(t, response.Body)
+	if countResponseTerminals(events) != 1 || events[len(events)-1]["type"] != "response.completed" {
+		t.Fatalf("events = %#v, want one completed response without read-ahead", events)
 	}
 }
 
@@ -277,10 +294,9 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 	if got := responseEventTypes(events); !equalStrings(got, []string{
 		"response.created", "response.in_progress",
 		"response.output_item.added", "response.content_part.added", "response.output_text.delta",
+		"response.output_text.delta",
 		"response.output_item.added", "response.function_call_arguments.delta",
 		"response.output_item.added", "response.function_call_arguments.delta",
-		"response.output_text.delta", "response.function_call_arguments.delta",
-		"response.function_call_arguments.delta",
 		"response.function_call_arguments.done", "response.output_item.done",
 		"response.function_call_arguments.done", "response.output_item.done",
 		"response.output_text.done", "response.content_part.done", "response.output_item.done",
@@ -518,6 +534,74 @@ func TestResponsesPreservesContinuationErrorsForDeferredResultCorrelation(t *tes
 	}
 }
 
+func TestResponsesRejectsOutputOnlyContinuationKindMismatch(t *testing.T) {
+	called := 0
+	server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		called++
+		return &UpstreamResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(providerToolStream(t, "lookup", "stored-function-call", `{}`))),
+		}, nil
+	}), nil)
+	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	first := httptest.NewRecorder()
+	firstRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(initial))
+	firstRequest.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(first, firstRequest)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"response.completed"`) {
+		t.Fatalf("initial response = %d %s", first.Code, first.Body.String())
+	}
+
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"custom_tool_call_output","call_id":"stored-function-call","output":"wrong kind"}],"tools":[],"stream":true}`
+	second := httptest.NewRecorder()
+	secondRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
+	secondRequest.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(second, secondRequest)
+	if second.Code != http.StatusBadRequest || !strings.Contains(second.Body.String(), `"code":"continuation_kind_mismatch"`) {
+		t.Fatalf("output-only mismatch = %d %s", second.Code, second.Body.String())
+	}
+	if called != 1 {
+		t.Fatalf("upstream calls = %d, want only initial capture", called)
+	}
+}
+
+func TestResponsesRejectsOutputOnlyContinuationDuplicate(t *testing.T) {
+	called := false
+	gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		called = true
+		return nil, errors.New("upstream must not be called")
+	}), nil)
+	body := `{"model":"gpt-5.3-codex","input":[{"type":"function_call_output","call_id":"stored-call","output":"one"},{"type":"function_call_output","call_id":"stored-call","output":"two"}],"tools":[],"stream":true}`
+	response := postRequest(t, gateway, body)
+	defer response.Body.Close()
+	responseBody := readBody(t, response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(responseBody, `"code":"continuation_duplicate"`) {
+		t.Fatalf("output-only duplicate = %d %s", response.StatusCode, responseBody)
+	}
+	if called {
+		t.Fatal("upstream was called for a duplicate output-only result")
+	}
+}
+
+func TestResponsesRejectsUnknownOutputOnlyContinuation(t *testing.T) {
+	called := false
+	gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		called = true
+		return nil, errors.New("upstream must not be called")
+	}), nil)
+	body := `{"model":"gpt-5.3-codex","input":[{"type":"custom_tool_call_output","call_id":"missing-call","output":"result"}],"tools":[],"stream":true}`
+	response := postRequest(t, gateway, body)
+	defer response.Body.Close()
+	responseBody := readBody(t, response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(responseBody, `"code":"continuation_unknown"`) {
+		t.Fatalf("output-only unknown = %d %s", response.StatusCode, responseBody)
+	}
+	if called {
+		t.Fatal("upstream was called for an unknown output-only result")
+	}
+}
+
 func TestResponsesReplaysDeepSeekReasoningAndToolResultsEndToEnd(t *testing.T) {
 	var providerRequests []map[string]any
 	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -591,7 +675,7 @@ func TestResponsesReplaysDeepSeekReasoningAndToolResultsEndToEnd(t *testing.T) {
 	if strings.Contains(string(mustJSON(t, firstEvents)), "deep reasoning") {
 		t.Fatal("reasoning content leaked to Responses")
 	}
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"provider-call","name":"lookup","arguments":"{\"query\":\"x\"}","status":"completed"},{"type":"function_call_output","call_id":"provider-call","output":"exact tool output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call_output","call_id":"provider-call","output":"exact tool output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
 	secondResponse := postRequest(t, gateway, continuation)
 	secondEvents := readResponseEvents(t, secondResponse.Body)
 	secondResponse.Body.Close()
@@ -732,7 +816,11 @@ func TestResponsesReleasesContinuationBeforeFirstAcceptedUpstreamEvent(t *testin
 			} else {
 				server.ServeHTTP(firstRecorder, firstRequest)
 			}
-			if !strings.Contains(firstRecorder.Body.String(), `"response.failed"`) {
+			if test.cancel {
+				if strings.Contains(firstRecorder.Body.String(), `"response.failed"`) {
+					t.Fatalf("canceled response emitted a terminal failure: %s", firstRecorder.Body.String())
+				}
+			} else if !strings.Contains(firstRecorder.Body.String(), `"response.failed"`) {
 				t.Fatalf("pre-acceptance response = %s", firstRecorder.Body.String())
 			}
 
@@ -841,7 +929,7 @@ func TestResponsesReplaysCustomApplyPatchContinuationThroughProvider(t *testing.
 	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
 		t.Fatalf("custom initial response = %#v", firstEvents)
 	}
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"},{"type":"custom_tool_call","call_id":"custom-retry-call","name":"apply_patch","input":"patch","status":"completed"},{"type":"custom_tool_call_output","call_id":"custom-retry-call","output":"applied exactly"}],"tools":[],"stream":true}`
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"},{"type":"custom_tool_call_output","call_id":"custom-retry-call","output":"applied exactly"}],"tools":[],"stream":true}`
 	second := postRequest(t, gateway, continuation)
 	secondEvents := readResponseEvents(t, second.Body)
 	second.Body.Close()
@@ -997,27 +1085,43 @@ func TestResponsesRejectsForcedAndNamedToolChoicesExplicitly(t *testing.T) {
 
 func TestResponsesMapsPreStreamProviderFailuresToJSON(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		status     int
-		wantStatus int
-		wantCode   string
+		name           string
+		status         int
+		wantStatus     int
+		wantType       string
+		wantCode       string
+		retryAfter     string
+		wantRetryAfter string
 	}{
-		{name: "unauthorized", status: http.StatusUnauthorized, wantStatus: http.StatusBadGateway, wantCode: "upstream_unauthorized"},
-		{name: "rate limited", status: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantCode: "upstream_rate_limited"},
-		{name: "server", status: http.StatusInternalServerError, wantStatus: http.StatusBadGateway, wantCode: "upstream_server_error"},
+		{name: "bad request", status: http.StatusBadRequest, wantStatus: http.StatusBadRequest, wantType: "provider_bad_request", wantCode: "upstream_bad_request"},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantStatus: http.StatusBadGateway, wantType: "authentication_error", wantCode: "upstream_unauthorized"},
+		{name: "forbidden", status: http.StatusForbidden, wantStatus: http.StatusBadGateway, wantType: "permission_error", wantCode: "upstream_forbidden"},
+		{name: "rate limited", status: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantType: "rate_limit_error", wantCode: "upstream_rate_limited", retryAfter: "17", wantRetryAfter: "17"},
+		{name: "unsafe retry after", status: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantType: "rate_limit_error", wantCode: "upstream_rate_limited", retryAfter: "provider-secret\n", wantRetryAfter: ""},
+		{name: "timeout", status: http.StatusGatewayTimeout, wantStatus: http.StatusGatewayTimeout, wantType: "timeout", wantCode: "upstream_timeout"},
+		{name: "server", status: http.StatusInternalServerError, wantStatus: http.StatusBadGateway, wantType: "provider_unavailable", wantCode: "upstream_server_error"},
+		{name: "unexpected", status: http.StatusTeapot, wantStatus: http.StatusBadGateway, wantType: "provider_protocol_error", wantCode: "upstream_unexpected_status"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := &trackedBody{Reader: strings.NewReader(`{"provider":"secret payload"}`)}
 			gateway := newIntegrationGateway(t, UpstreamClientFunc(func(_ context.Context, _ bridge.Request) (*UpstreamResponse, error) {
-				return &UpstreamResponse{StatusCode: test.status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
+				header := http.Header{"Content-Type": []string{"application/json"}}
+				if test.retryAfter != "" {
+					header.Set("Retry-After", test.retryAfter)
+				}
+				return &UpstreamResponse{StatusCode: test.status, Header: header, Body: body}, nil
 			}), nil)
 			response := postTextRequest(t, gateway)
 			defer response.Body.Close()
 			if response.StatusCode != test.wantStatus {
 				t.Fatalf("status = %d, want %d", response.StatusCode, test.wantStatus)
 			}
-			if got := readBody(t, response.Body); !strings.Contains(got, `"`+test.wantCode+`"`) || strings.Contains(got, "secret payload") {
+			got := readBody(t, response.Body)
+			if !strings.Contains(got, `"type":"`+test.wantType+`"`) || !strings.Contains(got, `"code":"`+test.wantCode+`"`) || strings.Contains(got, "secret payload") {
 				t.Fatalf("provider error body = %s", got)
+			}
+			if gotRetryAfter := response.Header.Get("Retry-After"); gotRetryAfter != test.wantRetryAfter {
+				t.Fatalf("Retry-After = %q, want %q", gotRetryAfter, test.wantRetryAfter)
 			}
 			if !body.wasClosed() {
 				t.Fatal("pre-stream provider body was not closed")
@@ -1042,6 +1146,359 @@ func TestResponsesMapsPreStreamProviderFailuresToJSON(t *testing.T) {
 			t.Fatal("unsupported content-type body was not closed")
 		}
 	})
+}
+
+func TestResponsesMapsPreStreamTimeoutAndNetworkErrorsToSafeTaxonomy(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantType string
+		wantCode string
+	}{
+		{name: "timeout", err: context.DeadlineExceeded, wantType: "timeout", wantCode: "upstream_timeout"},
+		{name: "network", err: errors.New("private transport detail"), wantType: "provider_unavailable", wantCode: "upstream_network_error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+				return nil, test.err
+			}), nil)
+			response := postTextRequest(t, gateway)
+			defer response.Body.Close()
+			body := readBody(t, response.Body)
+			if !strings.Contains(body, `"type":"`+test.wantType+`"`) || !strings.Contains(body, `"code":"`+test.wantCode+`"`) || strings.Contains(body, "private transport detail") {
+				t.Fatalf("safe upstream error = %s", body)
+			}
+		})
+	}
+}
+
+func TestResponsesEmitsOneTimeoutFailureAfterSSEStarts(t *testing.T) {
+	body := &blockingBody{closed: make(chan struct{})}
+	gateway := newIntegrationGatewayWithConfig(t, Config{ListenAddr: "127.0.0.1:0", StreamIdleTimeout: 100 * time.Millisecond}, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+	}), nil)
+	response := postTextRequest(t, gateway)
+	defer response.Body.Close()
+	events := readResponseEvents(t, response.Body)
+	if countResponseTerminals(events) != 1 || events[len(events)-1]["type"] != "response.failed" {
+		t.Fatalf("timeout events = %#v", events)
+	}
+	errorObject := events[len(events)-1]["response"].(map[string]any)["error"].(map[string]any)
+	if errorObject["type"] != "timeout" || errorObject["code"] != "timeout" {
+		t.Fatalf("timeout error = %#v", errorObject)
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("stream idle timeout did not close the upstream body")
+	}
+}
+
+func TestResponsesCancellationBeforeHeadersClosesBodyWithoutFallbackJSON(t *testing.T) {
+	started := make(chan struct{})
+	body := &trackedBody{Reader: strings.NewReader("private provider body")}
+	server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, UpstreamClientFunc(func(ctx context.Context, _ bridge.Request) (*UpstreamResponse, error) {
+		close(started)
+		<-ctx.Done()
+		return &UpstreamResponse{Body: body}, ctx.Err()
+	}), nil)
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(textRequestBody())).WithContext(requestContext)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.ServeHTTP(recorder, request)
+		close(done)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled pre-header handler did not finish")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("canceled pre-header response wrote fallback bytes: %s", recorder.Body.String())
+	}
+	if !body.wasClosed() {
+		t.Fatal("canceled pre-header response body was not closed")
+	}
+}
+
+func TestServerShutdownBeforeHeadersDoesNotWriteFallbackJSON(t *testing.T) {
+	started := make(chan struct{})
+	upstream := UpstreamClientFunc(func(ctx context.Context, _ bridge.Request) (*UpstreamResponse, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	server, err := New(Config{ListenAddr: "127.0.0.1:0", Upstream: upstream}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve() }()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	request, err := http.NewRequest(http.MethodPost, "http://"+server.Addr()+"/v1/responses", strings.NewReader(textRequestBody()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	type requestOutcome struct {
+		err  error
+		body []byte
+	}
+	requestResult := make(chan requestOutcome, 1)
+	go func() {
+		response, requestErr := client.Do(request)
+		if response != nil {
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if requestErr == nil {
+				requestErr = readErr
+			}
+			requestResult <- requestOutcome{err: requestErr, body: body}
+			return
+		}
+		requestResult <- requestOutcome{err: requestErr}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	shutdownErr := server.Shutdown(shutdownContext)
+	cancel()
+	if shutdownErr != nil {
+		t.Fatalf("shutdown error = %v, want graceful completion after immediate cancellation", shutdownErr)
+	}
+	select {
+	case outcome := <-requestResult:
+		if outcome.err == nil && len(outcome.body) != 0 {
+			// net/http may synthesize an empty 200 when a handler returns without
+			// writing headers; the application must still never emit fallback JSON.
+			t.Fatalf("pre-header shutdown returned fallback bytes: %s", outcome.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pre-header client request did not finish")
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve error after shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve loop did not exit after shutdown")
+	}
+}
+
+func TestServerShutdownMidstreamDoesNotWriteFallbackOrTerminalEvents(t *testing.T) {
+	first := `data: {"id":"provider","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}` + "\n\n"
+	body := &blockingBody{first: []byte(first), closed: make(chan struct{}), contextCanceledC: make(chan struct{})}
+	upstream := UpstreamClientFunc(func(ctx context.Context, _ bridge.Request) (*UpstreamResponse, error) {
+		go func() {
+			<-ctx.Done()
+			body.contextCanceled()
+		}()
+		return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+	})
+	server, err := New(Config{ListenAddr: "127.0.0.1:0", Upstream: upstream}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve() }()
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Post("http://"+server.Addr()+"/v1/responses", "application/json", strings.NewReader(textRequestBody()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	shutdownErr := server.Shutdown(shutdownContext)
+	cancel()
+	if shutdownErr != nil {
+		t.Fatalf("shutdown error = %v, want graceful completion after immediate cancellation", shutdownErr)
+	}
+	remaining, readErr := io.ReadAll(response.Body)
+	if readErr != nil && !errors.Is(readErr, io.ErrUnexpectedEOF) && !errors.Is(readErr, net.ErrClosed) {
+		t.Fatal(readErr)
+	}
+	events := readResponseEvents(t, bytes.NewReader(remaining))
+	if countResponseTerminals(events) != 0 {
+		t.Fatalf("shutdown emitted a terminal event: %#v", events)
+	}
+	for _, event := range events {
+		if event["type"] == "response.failed" {
+			t.Fatalf("shutdown emitted response.failed: %#v", event)
+		}
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not close the upstream body")
+	}
+	select {
+	case <-body.contextCanceledC:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel the upstream context")
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve error after shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve loop did not exit after shutdown")
+	}
+}
+
+func TestServerRejectsActiveRequestOverflowWithRetryAfter(t *testing.T) {
+	entered := make(chan struct{})
+	body := &blockingBody{closed: make(chan struct{})}
+	server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0", MaxActiveRequests: 1}, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		close(entered)
+		return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+	}), nil)
+
+	firstRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(textRequestBody()))
+	firstRequest.Header.Set("Content-Type", "application/json")
+	firstRecorder := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		server.ServeHTTP(firstRecorder, firstRequest)
+		close(firstDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first active request did not reach upstream")
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(textRequestBody()))
+	secondRequest.Header.Set("Content-Type", "application/json")
+	secondRecorder := httptest.NewRecorder()
+	server.ServeHTTP(secondRecorder, secondRequest)
+	if secondRecorder.Code != http.StatusTooManyRequests || secondRecorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("active limit response = %d headers=%v body=%s", secondRecorder.Code, secondRecorder.Header(), secondRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"type":"rate_limit_error"`) || !strings.Contains(secondRecorder.Body.String(), `"code":"active_request_limit"`) {
+		t.Fatalf("active limit error = %s", secondRecorder.Body.String())
+	}
+	body.Close()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first active request did not release after body close")
+	}
+	server.activeRequestsMu.Lock()
+	active := len(server.activeRequests)
+	server.activeRequestsMu.Unlock()
+	if active != 0 {
+		t.Fatalf("active request registry = %d, want 0", active)
+	}
+}
+
+func TestServerRejectsNonLoopbackHostAndOriginWithoutCORS(t *testing.T) {
+	server := newTestServer(t, nil)
+	tests := []struct {
+		name   string
+		host   string
+		origin string
+	}{
+		{name: "host", host: "attacker.example"},
+		{name: "origin", host: "127.0.0.1", origin: "https://attacker.example"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/health/live", nil)
+			request.Host = test.host
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusForbidden || recorder.Header().Get("Access-Control-Allow-Origin") != "" {
+				t.Fatalf("security response = %d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), `"type":"permission_error"`) || !strings.Contains(recorder.Body.String(), `"code":"permission_error"`) {
+				t.Fatalf("security error = %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesRepeatedCancellationReleasesBodiesAndRegistry(t *testing.T) {
+	const iterations = 5
+	entered := make(chan struct{}, iterations)
+	bodies := make([]*blockingBody, 0, iterations)
+	var bodyMu sync.Mutex
+	upstream := UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		body := &blockingBody{closed: make(chan struct{})}
+		bodyMu.Lock()
+		bodies = append(bodies, body)
+		bodyMu.Unlock()
+		entered <- struct{}{}
+		return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+	})
+	server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, upstream, nil)
+	for index := 0; index < iterations; index++ {
+		requestContext, cancel := context.WithCancel(context.Background())
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(textRequestBody())).WithContext(requestContext)
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			server.ServeHTTP(recorder, request)
+			close(done)
+		}()
+		select {
+		case <-entered:
+			cancel()
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d did not reach upstream", index)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d did not finish after cancellation", index)
+		}
+		cancel()
+	}
+	bodyMu.Lock()
+	completedBodies := append([]*blockingBody(nil), bodies...)
+	bodyMu.Unlock()
+	if len(completedBodies) != iterations {
+		t.Fatalf("upstream body count = %d, want %d", len(completedBodies), iterations)
+	}
+	for index, body := range completedBodies {
+		select {
+		case <-body.closed:
+		default:
+			t.Fatalf("iteration %d body remained open", index)
+		}
+	}
+	server.activeRequestsMu.Lock()
+	active := len(server.activeRequests)
+	server.activeRequestsMu.Unlock()
+	if active != 0 {
+		t.Fatalf("active request registry = %d, want 0", active)
+	}
 }
 
 func TestResponsesAppliesCodexBoundaryBeforeCallingUpstream(t *testing.T) {
@@ -1079,6 +1536,84 @@ func TestResponsesAppliesCodexBoundaryBeforeCallingUpstream(t *testing.T) {
 	}
 	if called {
 		t.Fatal("upstream was called before request boundary validation")
+	}
+}
+
+func TestResponsesRejectsImplicitProviderToolOverflowBeforeUpstream(t *testing.T) {
+	called := false
+	gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		called = true
+		return nil, &UpstreamError{Code: upstreamErrorServer}
+	}), nil)
+
+	tools := make([]map[string]any, bridge.DefaultMaxFunctionTools)
+	for index := range tools {
+		tools[index] = map[string]any{
+			"type":       "function",
+			"name":       "tool_" + strconv.Itoa(index),
+			"parameters": map[string]any{"type": "object"},
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":  "gpt-5.3-codex",
+		"input":  []map[string]any{{"type": "message", "role": "user", "content": "hello"}},
+		"tools":  tools,
+		"stream": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := postRequest(t, gateway, string(body))
+	defer response.Body.Close()
+	responseBody := readBody(t, response.Body)
+	if response.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(responseBody, `"code":"request_too_large"`) {
+		t.Fatalf("provider tool overflow response = %d %s", response.StatusCode, responseBody)
+	}
+	if called {
+		t.Fatal("upstream was called after the implicit provider-tool budget was exceeded")
+	}
+}
+
+func TestResponsesChargesImplicitApplyPatchSchemaAtExactAggregateBoundary(t *testing.T) {
+	const wrapperName = "lookup"
+	wrapperBytes := int(opencodego.ApplyPatchWrapperSchemaBytes())
+	for _, test := range []struct {
+		name       string
+		schemaSize int
+		wantStatus int
+		wantCalled bool
+	}{
+		{name: "exact total", schemaSize: bridge.DefaultMaxFunctionSchemaBytes - wrapperBytes, wantStatus: http.StatusBadGateway, wantCalled: true},
+		{name: "one byte over", schemaSize: bridge.DefaultMaxFunctionSchemaBytes - wrapperBytes + 1, wantStatus: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+				called = true
+				return nil, &UpstreamError{Code: upstreamErrorServer}
+			}), nil)
+			const prefix = `{"type":"object","description":"`
+			const suffix = `"}`
+			schema := prefix + strings.Repeat("x", test.schemaSize-len(prefix)-len(suffix)) + suffix
+			body, err := json.Marshal(map[string]any{
+				"model":  "gpt-5.3-codex",
+				"input":  []map[string]any{{"type": "message", "role": "user", "content": "hello"}},
+				"tools":  []map[string]any{{"type": "function", "name": wrapperName, "parameters": json.RawMessage(schema)}},
+				"stream": true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := postRequest(t, gateway, string(body))
+			defer response.Body.Close()
+			responseBody := readBody(t, response.Body)
+			if response.StatusCode != test.wantStatus {
+				t.Fatalf("schema boundary response = %d want %d body=%s", response.StatusCode, test.wantStatus, responseBody)
+			}
+			if called != test.wantCalled {
+				t.Fatalf("upstream called = %t want %t", called, test.wantCalled)
+			}
+		})
 	}
 }
 
@@ -1281,7 +1816,7 @@ func TestResponsesClosesUpstreamBodyOnClientCancellation(t *testing.T) {
 	}
 }
 
-func TestServerShutdownCancelsBlockedResponseWithinGracePeriod(t *testing.T) {
+func TestServerShutdownCancelsBlockedResponseImmediately(t *testing.T) {
 	body := &blockingBody{
 		closed:           make(chan struct{}),
 		contextCanceledC: make(chan struct{}),
@@ -1322,10 +1857,10 @@ func TestServerShutdownCancelsBlockedResponseWithinGracePeriod(t *testing.T) {
 		}
 	}
 
-	shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownContext); err != nil {
-		t.Fatalf("shutdown did not complete within its grace period: %v", err)
+		t.Fatalf("shutdown error = %v, want graceful completion after immediate cancellation", err)
 	}
 	select {
 	case <-body.closed:
@@ -1363,7 +1898,13 @@ func TestResponsesDoesNotLogSecretsOnFailure(t *testing.T) {
 
 func newIntegrationGateway(t *testing.T, client UpstreamClient, logger *slog.Logger) *httptest.Server {
 	t.Helper()
-	server, err := New(Config{ListenAddr: "127.0.0.1:0", Upstream: client}, logger)
+	return newIntegrationGatewayWithConfig(t, Config{ListenAddr: "127.0.0.1:0"}, client, logger)
+}
+
+func newIntegrationGatewayWithConfig(t *testing.T, config Config, client UpstreamClient, logger *slog.Logger) *httptest.Server {
+	t.Helper()
+	config.Upstream = client
+	server, err := New(config, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -358,7 +358,6 @@ func TestDecodeRequestBoundaryAndPolicyErrors(t *testing.T) {
 		{name: "unknown input type", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"computer_call"}]}`, contentType: "application/json", code: ErrorUnsupportedItemType, param: "input[0].type", messagePart: "not supported"},
 		{name: "unknown tool type", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"hosted_tool"}]}`, contentType: "application/json", code: ErrorUnsupportedToolType, param: "tools[0].type", messagePart: "not supported"},
 		{name: "missing function call id", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","name":"exec_command","arguments":"{}"}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[0].call_id", messagePart: "required"},
-		{name: "missing output correlation", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call_output","call_id":"call_missing","output":""}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[0].call_id", messagePart: "does not correlate"},
 		{name: "duplicate tool name", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":{}},{"type":"function","name":"exec","parameters":{}}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[1].name", messagePart: "duplicate"},
 		{name: "invalid schema root", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":[]}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[0].parameters", messagePart: "JSON Schema"},
 		{name: "invalid nested schema", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":{"type":"object","properties":{"arg":"bad"}}}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[0].parameters", messagePart: "JSON Schema"},
@@ -404,6 +403,14 @@ func TestDecodeDefersContinuationResultCorrelation(t *testing.T) {
 			name: "duplicate output correlation",
 			body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"one"},{"type":"function_call_output","call_id":"call_1","output":"two"}]}`,
 		},
+		{
+			name: "function output only",
+			body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call_output","call_id":"stored-function-call","output":"one"}]}`,
+		},
+		{
+			name: "custom output only",
+			body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"custom_tool_call_output","call_id":"stored-custom-call","output":"one"}]}`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -412,7 +419,7 @@ func TestDecodeDefersContinuationResultCorrelation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Decode returned an unrelated request error: %v", err)
 			}
-			if len(request.Input) < 2 {
+			if len(request.Input) == 0 {
 				t.Fatalf("decoded input items = %#v", request.Input)
 			}
 		})
@@ -467,12 +474,87 @@ func TestDecodeEnforcesFunctionToolCountAndSchemaLimits(t *testing.T) {
 	}
 	body := `{"model":"gpt-5.3-codex","stream":true,"tools":[` + strings.Join(tooMany, ",") + `]}`
 	_, err := mustDecoder(t, 2<<20).Decode(strings.NewReader(body), "application/json")
-	assertDecodeError(t, err, ErrorInvalidRequest, "tools")
+	assertDecodeError(t, err, ErrorRequestTooLarge, "tools")
 
 	largeSchema := `{"type":"object","description":"` + strings.Repeat("x", bridge.DefaultMaxFunctionSchemaBytes) + `"}`
 	body = `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"large","parameters":` + largeSchema + `}]}`
 	_, err = mustDecoder(t, 2<<20).Decode(strings.NewReader(body), "application/json")
-	assertDecodeError(t, err, ErrorInvalidRequest, "tools")
+	assertDecodeError(t, err, ErrorRequestTooLarge, "tools")
+
+	decoder, err := NewDecoderWithLimits(DecoderLimits{
+		MaxBodyBytes:   1 << 20,
+		MaxInputItems:  bridge.DefaultMaxInputItems,
+		MaxTools:       bridge.DefaultMaxFunctionTools,
+		MaxSchemaBytes: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"tool","parameters":{"type":"object","description":"tool"}}],"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object","description":"text"}}}}`
+	_, err = decoder.Decode(strings.NewReader(body), "application/json")
+	assertDecodeError(t, err, ErrorRequestTooLarge, "text.format.schema")
+}
+
+func TestDecodeEnforcesStructuralAndCollectionLimitsBeforeSemanticValidation(t *testing.T) {
+	baseLimits := DecoderLimits{
+		MaxBodyBytes:       1 << 20,
+		MaxInputItems:      8,
+		MaxCollectionItems: 8,
+		MaxTools:           8,
+		MaxSchemaBytes:     128,
+		MaxJSONDepth:       8,
+		MaxJSONTokens:      128,
+	}
+
+	t.Run("deep JSON is rejected by the structural scanner", func(t *testing.T) {
+		nested := strings.Repeat("[", baseLimits.MaxJSONDepth+1) + "0" + strings.Repeat("]", baseLimits.MaxJSONDepth+1)
+		body := `{"model":"gpt-5.3-codex","stream":true,"metadata":` + nested + `}`
+		decoder, err := NewDecoderWithLimits(baseLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = decoder.Decode(strings.NewReader(body), "application/json")
+		assertDecodeError(t, err, ErrorRequestTooLarge, "body")
+	})
+
+	t.Run("token budget is enforced before request map decoding", func(t *testing.T) {
+		limits := baseLimits
+		limits.MaxJSONTokens = 8
+		decoder, err := NewDecoderWithLimits(limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = decoder.Decode(strings.NewReader(`{"model":"gpt-5.3-codex","stream":true,"include":["x"]}`), "application/json")
+		assertDecodeError(t, err, ErrorRequestTooLarge, "body")
+	})
+
+	t.Run("collection boundary is accepted and the next item is rejected", func(t *testing.T) {
+		limits := baseLimits
+		limits.MaxCollectionItems = 3
+		decoder, err := NewDecoderWithLimits(limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		valid := `{"model":"gpt-5.3-codex","stream":true,"include":["a","b"]}`
+		if _, err := decoder.Decode(strings.NewReader(valid), "application/json"); err != nil {
+			t.Fatalf("collection boundary request failed: %v", err)
+		}
+		tooMany := `{"model":"gpt-5.3-codex","stream":true,"include":["a","b","c","d"]}`
+		_, err = decoder.Decode(strings.NewReader(tooMany), "application/json")
+		assertDecodeError(t, err, ErrorRequestTooLarge, "body")
+	})
+
+	t.Run("oversized schema is rejected before schema validation", func(t *testing.T) {
+		limits := baseLimits
+		limits.MaxSchemaBytes = 16
+		decoder, err := NewDecoderWithLimits(limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"tool","parameters":"` + strings.Repeat("x", 32) + `"}]}`
+		_, err = decoder.Decode(strings.NewReader(body), "application/json")
+		assertDecodeError(t, err, ErrorRequestTooLarge, "tools")
+	})
 }
 
 func TestDecodeRejectsUnknownFieldsInsideKnownObjects(t *testing.T) {

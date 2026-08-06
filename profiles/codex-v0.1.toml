@@ -1,0 +1,11 @@
+# Generated Codex v0.1 local profile for the loopback gateway.
+# Start the gateway before using this provider configuration.
+model = "gpt-5.3-codex"
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "OpenCode Go Gateway"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0

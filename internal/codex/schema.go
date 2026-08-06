@@ -15,12 +15,18 @@ import (
 // The returned errors deliberately contain no schema paths or values. Schema
 // keys and values are request-controlled, and this function is called while
 // constructing client-facing boundary errors.
-func validateJSONSchema(raw json.RawMessage) error {
+func validateJSONSchema(raw json.RawMessage, limits DecoderLimits) error {
+	if int64(len(raw)) > limits.MaxSchemaBytes {
+		return errors.New("schema exceeds the configured byte limit")
+	}
+	if err := validateJSONDocument(raw, limits.MaxJSONDepth, limits.MaxJSONTokens, limits.MaxCollectionItems); err != nil {
+		return errors.New("schema structure exceeds the configured limit")
+	}
 	fields, err := schemaObject(raw)
 	if err != nil {
 		return err
 	}
-	return validateSchemaObject(fields)
+	return validateSchemaObject(fields, limits.MaxCollectionItems)
 }
 
 func schemaObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
@@ -31,9 +37,9 @@ func schemaObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	return fields, nil
 }
 
-func validateSchemaObject(fields map[string]json.RawMessage) error {
+func validateSchemaObject(fields map[string]json.RawMessage, maxCollectionItems int) error {
 	if raw, ok := fields["type"]; ok {
-		if err := validateSchemaType(raw); err != nil {
+		if err := validateSchemaType(raw, maxCollectionItems); err != nil {
 			return err
 		}
 	}
@@ -47,26 +53,26 @@ func validateSchemaObject(fields map[string]json.RawMessage) error {
 			return errors.New("schema properties must be an object")
 		}
 		for _, name := range sortedSchemaKeys(properties) {
-			if err := validateSchemaValue(properties[name]); err != nil {
+			if err := validateSchemaValue(properties[name], maxCollectionItems); err != nil {
 				return err
 			}
 		}
 	}
 	if raw, ok := fields["required"]; ok {
-		if err := validateStringArray(raw, false); err != nil {
+		if err := validateStringArray(raw, false, maxCollectionItems); err != nil {
 			return err
 		}
 	}
 	for _, keyword := range []string{"additionalProperties", "additionalItems", "unevaluatedProperties", "unevaluatedItems", "contains", "propertyNames", "not", "if", "then", "else", "contentSchema"} {
 		if raw, ok := fields[keyword]; ok {
-			if err := validateSchemaValue(raw); err != nil {
+			if err := validateSchemaValue(raw, maxCollectionItems); err != nil {
 				return err
 			}
 		}
 	}
 	for _, keyword := range []string{"items", "prefixItems", "allOf", "anyOf", "oneOf"} {
 		if raw, ok := fields[keyword]; ok {
-			if err := validateSchemaOrArray(raw); err != nil {
+			if err := validateSchemaOrArray(raw, maxCollectionItems); err != nil {
 				return err
 			}
 		}
@@ -79,12 +85,12 @@ func validateSchemaObject(fields map[string]json.RawMessage) error {
 		for _, name := range sortedSchemaKeys(dependencies) {
 			value := bytes.TrimSpace(dependencies[name])
 			if len(value) > 0 && value[0] == '[' {
-				if err := validateStringArray(value, false); err != nil {
+				if err := validateStringArray(value, false, maxCollectionItems); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := validateSchemaValue(value); err != nil {
+			if err := validateSchemaValue(value, maxCollectionItems); err != nil {
 				return err
 			}
 		}
@@ -95,7 +101,7 @@ func validateSchemaObject(fields map[string]json.RawMessage) error {
 			return errors.New("schema dependentRequired must be an object")
 		}
 		for _, name := range sortedSchemaKeys(dependentRequired) {
-			if err := validateStringArray(dependentRequired[name], false); err != nil {
+			if err := validateStringArray(dependentRequired[name], false, maxCollectionItems); err != nil {
 				return err
 			}
 		}
@@ -103,7 +109,7 @@ func validateSchemaObject(fields map[string]json.RawMessage) error {
 	return nil
 }
 
-func validateSchemaValue(raw json.RawMessage) error {
+func validateSchemaValue(raw json.RawMessage, maxCollectionItems int) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return errors.New("schema value is empty")
@@ -115,27 +121,27 @@ func validateSchemaValue(raw json.RawMessage) error {
 	if err != nil {
 		return errors.New("schema value must be an object or boolean")
 	}
-	return validateSchemaObject(fields)
+	return validateSchemaObject(fields, maxCollectionItems)
 }
 
-func validateSchemaOrArray(raw json.RawMessage) error {
+func validateSchemaOrArray(raw json.RawMessage, maxCollectionItems int) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var values []json.RawMessage
-		if err := json.Unmarshal(trimmed, &values); err != nil {
+		values, err := rawArray(trimmed, "schema", maxCollectionItems)
+		if err != nil {
 			return errors.New("schema value must be an object, boolean, or array")
 		}
 		for _, value := range values {
-			if err := validateSchemaValue(value); err != nil {
+			if err := validateSchemaValue(value, maxCollectionItems); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return validateSchemaValue(trimmed)
+	return validateSchemaValue(trimmed, maxCollectionItems)
 }
 
-func validateSchemaType(raw json.RawMessage) error {
+func validateSchemaType(raw json.RawMessage, maxCollectionItems int) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '"' {
 		var value string
@@ -147,8 +153,8 @@ func validateSchemaType(raw json.RawMessage) error {
 		}
 		return nil
 	}
-	var values []json.RawMessage
-	if err := json.Unmarshal(raw, &values); err != nil || len(values) == 0 {
+	values, err := rawArray(raw, "schema.type", maxCollectionItems)
+	if err != nil || len(values) == 0 {
 		return errors.New("schema type must be a string or non-empty array of strings")
 	}
 	seen := make(map[string]struct{}, len(values))
@@ -174,9 +180,9 @@ func validSchemaTypeName(value string) bool {
 	}
 }
 
-func validateStringArray(raw json.RawMessage, requireNonEmpty bool) error {
-	var values []json.RawMessage
-	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
+func validateStringArray(raw json.RawMessage, requireNonEmpty bool, maxCollectionItems int) error {
+	values, err := rawArray(raw, "schema", maxCollectionItems)
+	if err != nil {
 		return errors.New("schema value must be an array of strings")
 	}
 	seen := make(map[string]struct{}, len(values))

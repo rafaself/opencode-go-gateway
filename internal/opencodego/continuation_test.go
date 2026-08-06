@@ -1,6 +1,7 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -258,6 +259,48 @@ func TestContinuationStoreEnforcesPerRecordAndAggregateByteLimits(t *testing.T) 
 	})
 	if err := aggregateStore.Save(probe); !errors.Is(err, ErrContinuationCapacity) {
 		t.Fatalf("aggregate capacity error = %v", err)
+	}
+}
+
+func TestContinuationStoreRejectsOversizedPendingStateBeforeCloning(t *testing.T) {
+	clock := &continuationTestClock{now: time.Unix(1700000000, 0).UTC()}
+	store := newTestContinuationStore(t, clock, func(config *ContinuationStoreConfig) {
+		config.MaxBytesPerRecord = 64
+		config.MaxAggregateBytes = 64
+	})
+	turn := testPendingTurn("oversized")
+	turn.ToolCalls[0].Arguments = string(make([]byte, 1<<20))
+	if err := store.Save(turn); !errors.Is(err, ErrContinuationCapacity) {
+		t.Fatalf("oversized pending state error = %v, want %v", err, ErrContinuationCapacity)
+	}
+	if store.RecordCount() != 0 || store.Bytes() != 0 {
+		t.Fatalf("oversized state changed retained metrics: records=%d bytes=%d", store.RecordCount(), store.Bytes())
+	}
+}
+
+func TestContinuationStoreContextGatesRetentionAndCommit(t *testing.T) {
+	clock := &continuationTestClock{now: time.Unix(1700000000, 0).UTC()}
+	store := newTestContinuationStore(t, clock, nil)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.SaveContext(canceled, testPendingTurn("canceled")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled save error = %v, want %v", err, context.Canceled)
+	}
+	if store.RecordCount() != 0 {
+		t.Fatalf("canceled save retained %d records", store.RecordCount())
+	}
+	if err := store.Save(testPendingTurn("commit")); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Begin([]bridge.ToolResult{{CallID: "commit", Kind: bridge.ToolFunction}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.CommitContext(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled commit error = %v, want %v", err, context.Canceled)
+	}
+	if err := lease.Abort(); err != nil {
+		t.Fatalf("aborting gated lease: %v", err)
 	}
 }
 

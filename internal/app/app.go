@@ -47,25 +47,45 @@ func RunWithBuildMetadata(ctx context.Context, settings config.Config, logger *s
 		logger = NewLogger(io.Discard, settings.LogLevel)
 	}
 	upstreamClient, err := opencodego.NewClient(opencodego.ClientConfig{
-		APIKey:    settings.APIKey(),
-		BaseURL:   settings.BaseURL,
-		Model:     opencodego.DefaultModel,
-		UserAgent: buildUserAgent(metadata),
+		APIKey:                settings.APIKey(),
+		BaseURL:               settings.BaseURL,
+		Model:                 opencodego.DefaultModel,
+		UserAgent:             buildUserAgent(metadata),
+		DialTimeout:           settings.UpstreamConnectTimeout,
+		TLSHandshakeTimeout:   settings.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: settings.ResponseHeaderTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("configure upstream client: %w", err)
 	}
 
 	runtimeServer, err := server.New(server.Config{
-		ListenAddr:        settings.ListenAddr(),
-		AllowNonLoopback:  settings.AllowNonLoopback,
-		Upstream:          server.NewOpenCodeUpstreamClient(upstreamClient),
-		ReadHeaderTimeout: settings.ReadHeaderTimeout,
-		ReadTimeout:       settings.ReadTimeout,
-		WriteTimeout:      settings.WriteTimeout,
-		IdleTimeout:       settings.IdleTimeout,
-		MaxBodyBytes:      settings.MaxBodyBytes,
-		MaxHeaderBytes:    settings.MaxHeaderBytes,
+		ListenAddr:               settings.ListenAddr(),
+		AllowNonLoopback:         settings.AllowNonLoopback,
+		Upstream:                 server.NewOpenCodeUpstreamClient(upstreamClient),
+		ReadHeaderTimeout:        settings.ReadHeaderTimeout,
+		IdleTimeout:              settings.IdleTimeout,
+		RequestBodyReadTimeout:   settings.RequestBodyReadTimeout,
+		StreamIdleTimeout:        settings.StreamIdleTimeout,
+		DownstreamWriteTimeout:   settings.DownstreamWriteTimeout,
+		MaxBodyBytes:             settings.MaxBodyBytes,
+		MaxHeaderBytes:           settings.MaxHeaderBytes,
+		MaxInputItems:            settings.MaxInputItems,
+		MaxCollectionItems:       settings.MaxCollectionItems,
+		MaxTools:                 settings.MaxTools,
+		MaxSchemaBytes:           settings.MaxSchemaBytes,
+		MaxSSELineBytes:          settings.MaxSSELineBytes,
+		MaxSSEEventBytes:         settings.MaxSSEEventBytes,
+		MaxSSEBufferedBytes:      settings.MaxSSEBufferedBytes,
+		MaxSSEReadBufferBytes:    settings.MaxSSEReadBufferBytes,
+		MaxOutputBytes:           settings.MaxOutputBytes,
+		MaxTextBytes:             settings.MaxTextBytes,
+		MaxReasoningBytes:        settings.MaxReasoningBytes,
+		MaxToolCallArgumentBytes: settings.MaxToolCallArgumentBytes,
+		MaxPendingTurnBytes:      settings.MaxPendingTurnBytes,
+		MaxPendingRecords:        settings.MaxPendingRecords,
+		MaxPendingAggregateBytes: settings.MaxPendingAggregateBytes,
+		MaxActiveRequests:        settings.MaxActiveRequests,
 	}, logger)
 	if err != nil {
 		return err

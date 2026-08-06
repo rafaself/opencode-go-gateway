@@ -18,7 +18,6 @@ const (
 	DefaultUserAgent                 = "opencode-go-gateway/dev"
 	DefaultAccept                    = "text/event-stream"
 	DefaultMaxRequestBodyBytes int64 = 16 << 20
-	DefaultMaxErrorBodyBytes   int64 = 64 << 10
 )
 
 // ThinkingMode controls the provider extension used by DeepSeek-compatible

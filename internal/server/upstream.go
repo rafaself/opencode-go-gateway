@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
@@ -21,6 +22,7 @@ const (
 	upstreamErrorContentType     = "upstream_unsupported_content_type"
 	upstreamErrorMalformed       = "upstream_malformed_response"
 	upstreamErrorCanceled        = "upstream_canceled"
+	upstreamErrorTimeout         = "upstream_timeout"
 	upstreamErrorNotConfigured   = "upstream_not_configured"
 	upstreamErrorNetwork         = "upstream_network_error"
 	upstreamErrorInvalidRequest  = "upstream_invalid_request"
@@ -87,6 +89,9 @@ func (client openCodeUpstreamClient) Do(ctx context.Context, request bridge.Requ
 	}
 	response, err := client.client.Do(ctx, request)
 	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
 		return nil, normalizeProviderError(err)
 	}
 	if response == nil {
@@ -100,6 +105,16 @@ func (client openCodeUpstreamClient) Do(ctx context.Context, request bridge.Requ
 }
 
 func normalizeProviderError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &UpstreamError{Code: upstreamErrorTimeout}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &UpstreamError{Code: upstreamErrorCanceled}
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return &UpstreamError{Code: upstreamErrorTimeout}
+	}
 	var providerErr *opencodego.ProviderError
 	if !errors.As(err, &providerErr) {
 		return &UpstreamError{Code: upstreamErrorNetwork}
@@ -114,6 +129,8 @@ func normalizeProviderError(err error) error {
 		code = upstreamErrorUnsupportedTool
 	case opencodego.ErrorCanceled:
 		code = upstreamErrorCanceled
+	case opencodego.ErrorTimeout:
+		code = upstreamErrorTimeout
 	case opencodego.ErrorBadRequest:
 		code = upstreamErrorBadRequest
 	case opencodego.ErrorUnauthorized:

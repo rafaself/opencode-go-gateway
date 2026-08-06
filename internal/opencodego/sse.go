@@ -20,7 +20,7 @@ const (
 	DefaultSSEMaxBufferedBytes      = 8 << 20
 	DefaultStreamMaxAggregateBytes  = 16 << 20
 	DefaultMaxToolCallArgumentBytes = bridge.DefaultMaxToolCallArgumentBytes
-	defaultSSEReadBufferBytes       = 32 << 10
+	DefaultSSEReadBufferBytes       = 32 << 10
 )
 
 var (
@@ -64,7 +64,7 @@ func (options SSEDecoderOptions) withDefaults() SSEDecoderOptions {
 		options.MaxToolCallArgumentBytes = DefaultMaxToolCallArgumentBytes
 	}
 	if options.ReadBufferBytes <= 0 {
-		options.ReadBufferBytes = defaultSSEReadBufferBytes
+		options.ReadBufferBytes = DefaultSSEReadBufferBytes
 	}
 	return options
 }

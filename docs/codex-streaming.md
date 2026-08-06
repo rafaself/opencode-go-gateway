@@ -10,8 +10,8 @@ terminal state.
 `internal/opencodego.NewBridgeStreamDecoder(reader, options)` returns a
 per-response decoder. The HTTP adapter passes the request's declared
 function names in `BridgeStreamDecoderOptions.AllowedToolNames`; that
-per-request allowlist is copied and checked only after fragmented names have
-been reconstructed. Call `Next()` until it returns `io.EOF`:
+per-request allowlist is copied and checked against the complete provider
+name at the terminal boundary. Call `Next()` until it returns `io.EOF`:
 
 ```go
 decoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.BridgeStreamDecoderOptions{
@@ -35,16 +35,33 @@ for {
 ```
 
 `Next` emits `bridge.ResponseStarted`, text/reasoning deltas, indexed tool
-call lifecycle events, usage updates, and one terminal semantic event. The
-provider `[DONE]` marker is consumed internally and is never a bridge event.
+call lifecycle events, usage updates, and one terminal semantic event. Tool
+call semantic events are buffered until the provider name is final, because
+Chat Completions has no earlier name-finalization marker: an allowlisted
+`lookup` fragment may still be extended to undeclared `lookupEvil`. This
+preserves the security boundary at the cost of emitting valid tool calls at
+the terminal boundary rather than speculatively. The provider `[DONE]` marker
+is consumed internally and is never a bridge event. After the first marker has
+produced a semantic terminal event, the bridge uses a fail-closed no-read-ahead
+policy: `Next` returns `io.EOF` without inspecting later provider bytes. This
+keeps the HTTP boundary from blocking on an irrelevant post-terminal event. A
+caller that owns the lower-level provider decoder can continue draining
+`ChatCompletionStreamDecoder` and receive `ErrDuplicateStreamTerminal` for a
+later terminal marker; the gateway server intentionally does not perform that
+read-ahead.
 Provider response IDs, creation time, model, choice indexes, tool indexes,
 fragmented IDs/names/arguments, finish reasons, usage, and typed provider
 errors remain available at the provider boundary without importing Codex wire
 types. The bridge rejects a truncated SSE event, missing/negative tool index,
 and incoherent deltas after a choice has reported a finish reason. Provider
-reconstruction is bounded by `SSEDecoderOptions.MaxAggregateBytes`.
+reconstruction is bounded by `SSEDecoderOptions.MaxAggregateBytes`. Argument
+fragments for both ordinary functions and the synthetic `apply_patch` function
+are charged when retained, before state mutation; their later semantic
+lifecycle events do not charge the same argument bytes twice.
 
-Provider reconstruction also enforces `MaxToolCallArgumentBytes`. A missing
+Provider reconstruction also enforces bounded choice/tool-call counts,
+tool indexes, fragmented tool names, and private provider call IDs before
+retaining provider state. It also enforces `MaxToolCallArgumentBytes`. A missing
 provider tool-call ID receives the deterministic `call_<choice>_<tool>`
 mapping. The downstream `call_id` is fixed before its output item is emitted;
 later provider ID fragments are retained privately through `ProviderCallID`
@@ -55,7 +72,9 @@ same index remains valid across argument fragments. A `tool_calls` finish
 reason may precede trailing fragments for already-started calls, but trailing
 text, reasoning, new indexes, or contradictory terminal reasons are rejected.
 
-For tests or specialized adapters, `NewChatCompletionStreamDecoder` exposes
+Transport read failures retain their typed cancellation, timeout, and network
+interruption causes; malformed SSE remains a provider protocol error. For
+tests or specialized adapters, `NewChatCompletionStreamDecoder` exposes
 typed `ChatCompletionChunk` and `ProviderStreamError` values directly. The
 underlying `NewSSEDecoder` accepts explicit line, event, buffered-byte, and
 reader-buffer limits and is safe under arbitrary reader chunk boundaries.
@@ -144,6 +163,14 @@ close the provider body.
    custom-tool wrappers become one terminal `response.failed` event when
    downstream delivery is still possible; `finish_reason=length` becomes
    `response.incomplete`.
+
+The request context remains the authority for client and shutdown cancellation.
+The provider child context can additionally be canceled by the stream-idle
+watchdog or a downstream write failure. That separation lets the gateway stop
+the provider body promptly while still emitting one safe timeout
+`response.failed` event when the client is able to receive it. A canceled
+client receives no fallback JSON and the pending continuation lease is aborted
+so the tool turn can be retried.
 
 The application constructs the OpenCode Go client from `OPENCODE_GO_API_KEY`
 and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or included in

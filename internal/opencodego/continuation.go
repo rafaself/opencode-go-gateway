@@ -1,6 +1,7 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -13,12 +14,16 @@ const (
 	// ProviderName identifies the adapter that owns the retained state. It is
 	// metadata only and is never sent to the Codex-facing Responses stream.
 	ProviderName = "opencodego"
+	// DefaultContinuationMaxRecordBytes is the safe upper bound for one
+	// retained reasoning/tool turn. The server exposes it as a configurable
+	// pending-turn limit without exposing the store's private implementation.
+	DefaultContinuationMaxRecordBytes = int64(16 << 20)
 
 	defaultContinuationTTL            = 5 * time.Minute
 	defaultContinuationConsumingTTL   = 10 * time.Minute
 	defaultContinuationGrace          = 30 * time.Second
 	defaultContinuationMaxRecords     = 128
-	defaultContinuationMaxRecordBytes = 16 << 20
+	defaultContinuationMaxRecordBytes = DefaultContinuationMaxRecordBytes
 	defaultContinuationMaxBytes       = 128 << 20
 	defaultContinuationCleanup        = 30 * time.Second
 )
@@ -235,18 +240,41 @@ func (store *ContinuationStore) Close() error {
 // configured TTL and status; caller-supplied expiry/status values cannot
 // bypass those policies.
 func (store *ContinuationStore) Save(turn PendingTurn) error {
+	return store.SaveContext(context.Background(), turn)
+}
+
+// SaveContext is Save with a cancellation gate owned by the request that
+// produced the turn. The gate is checked before copying, after normalization,
+// and immediately before the record becomes visible, so shutdown/client
+// cancellation cannot retain a turn after the handler has stopped owning it.
+func (store *ContinuationStore) SaveContext(ctx context.Context, turn PendingTurn) error {
 	if store == nil {
 		return ErrContinuationClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
 		return ErrContinuationClosed
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	now := store.config.Now().UTC()
 	store.cleanupLocked(now)
+	if !pendingTurnFitsBounds(turn, store.config.MaxBytesPerRecord, store.config.MaxAggregateBytes-store.totalBytes) {
+		return ErrContinuationCapacity
+	}
 	turn, size, err := normalizePendingTurn(turn, now, store.config.TTL)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if size > store.config.MaxBytesPerRecord {
@@ -254,6 +282,9 @@ func (store *ContinuationStore) Save(turn PendingTurn) error {
 	}
 	if len(store.records) >= store.config.MaxRecords || size > store.config.MaxAggregateBytes-store.totalBytes {
 		return ErrContinuationCapacity
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	key := turn.ToolCalls[0].CallID
 	for _, call := range turn.ToolCalls {
@@ -276,6 +307,46 @@ func (store *ContinuationStore) Save(turn PendingTurn) error {
 	}
 	store.totalBytes += size
 	return nil
+}
+
+// pendingTurnFitsBounds is a cheap lower-bound check performed before cloning
+// or marshaling caller-owned state. The exact JSON size is still checked by
+// normalizePendingTurn, but this pass prevents an oversized pending turn from
+// forcing a large temporary copy merely to discover that it cannot be kept.
+func pendingTurnFitsBounds(turn PendingTurn, maxRecordBytes, availableAggregateBytes int64) bool {
+	if maxRecordBytes <= 0 || availableAggregateBytes <= 0 || len(turn.ToolCalls) == 0 {
+		return false
+	}
+	if int64(len(turn.ToolCalls)) > maxRecordBytes || int64(len(turn.ToolRegistrations)) > maxRecordBytes || int64(len(turn.CallIDs)) > maxRecordBytes {
+		return false
+	}
+	lowerBound := int64(0)
+	add := func(size int) bool {
+		if size < 0 || int64(size) > maxRecordBytes-lowerBound {
+			return false
+		}
+		lowerBound += int64(size)
+		return lowerBound <= availableAggregateBytes
+	}
+	if !add(len(turn.Provider)) || !add(len(turn.Model)) || !add(len(turn.ReasoningContent)) || !add(len(turn.AssistantContent)) {
+		return false
+	}
+	for _, call := range turn.ToolCalls {
+		if !add(len(call.CallID)) || !add(len(call.ProviderCallID)) || !add(len(call.Name)) || !add(len(call.Arguments)) || !add(len(call.Registration.InboundName)) || !add(len(call.Registration.UpstreamName)) || !add(len(call.Registration.WrapperField)) {
+			return false
+		}
+	}
+	for _, registration := range turn.ToolRegistrations {
+		if !add(len(registration.InboundName)) || !add(len(registration.UpstreamName)) || !add(len(registration.WrapperField)) {
+			return false
+		}
+	}
+	for _, callID := range turn.CallIDs {
+		if !add(len(callID)) {
+			return false
+		}
+	}
+	return true
 }
 
 // Lookup returns a safe copy of a pending turn for diagnostics and tests. It
@@ -484,6 +555,20 @@ func (store *ContinuationStore) Bytes() int64 {
 	return store.totalBytes
 }
 
+// CapacityLimits returns the configured record and aggregate bounds without
+// exposing any retained continuation content.
+func (store *ContinuationStore) CapacityLimits() (maxRecords int, maxRecordBytes, maxAggregateBytes int64) {
+	if store == nil {
+		return 0, 0, 0
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return 0, 0, 0
+	}
+	return store.config.MaxRecords, store.config.MaxBytesPerRecord, store.config.MaxAggregateBytes
+}
+
 // ContinuationLease is the only mutable handle returned to an orchestrator.
 // Turn and Results are immutable copies. Commit/Abort are idempotent for the
 // first terminal action and reject a conflicting second action.
@@ -525,16 +610,28 @@ func (lease *ContinuationLease) Results() []bridge.ToolResult {
 }
 
 func (lease *ContinuationLease) Commit() error {
-	return lease.finish(true)
+	return lease.CommitContext(context.Background())
+}
+
+// CommitContext prevents a request that has lost its effective ownership from
+// finalizing a continuation after client or shutdown cancellation.
+func (lease *ContinuationLease) CommitContext(ctx context.Context) error {
+	return lease.finishContext(ctx, true)
 }
 
 func (lease *ContinuationLease) Abort() error {
-	return lease.finish(false)
+	return lease.finishContext(context.Background(), false)
 }
 
-func (lease *ContinuationLease) finish(commit bool) error {
+func (lease *ContinuationLease) finishContext(ctx context.Context, commit bool) error {
 	if lease == nil || lease.store == nil || lease.record == nil {
 		return ErrContinuationInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	lease.mu.Lock()
 	defer lease.mu.Unlock()
@@ -547,6 +644,9 @@ func (lease *ContinuationLease) finish(commit bool) error {
 	if store.closed {
 		lease.done = true
 		return ErrContinuationClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if lease.record.turn.Status == PendingStatusExpired {
 		lease.done = true

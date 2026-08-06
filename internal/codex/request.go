@@ -19,10 +19,46 @@ import (
 // representation for it.
 const DefaultMaxBodyBytes int64 = 16 << 20
 
+const (
+	// DefaultMaxCollectionItems bounds object members and array elements while
+	// the request structure is being scanned. It applies before any decoded
+	// collection is materialized.
+	DefaultMaxCollectionItems = bridge.DefaultMaxCollectionItems
+	// DefaultMaxJSONDepth and DefaultMaxJSONTokens keep the structural scan
+	// bounded independently of the body byte limit.
+	DefaultMaxJSONDepth  = bridge.DefaultMaxJSONDepth
+	DefaultMaxJSONTokens = bridge.DefaultMaxJSONTokens
+)
+
+// DecoderLimits bounds every request-controlled collection that is expanded
+// after the body has been read. The body bound alone is not sufficient because
+// a small JSON document can still contain many input items or schemas.
+type DecoderLimits struct {
+	MaxBodyBytes       int64
+	MaxInputItems      int
+	MaxCollectionItems int
+	MaxTools           int
+	MaxSchemaBytes     int64
+	MaxJSONDepth       int
+	MaxJSONTokens      int
+}
+
+func defaultDecoderLimits(maxBodyBytes int64) DecoderLimits {
+	return DecoderLimits{
+		MaxBodyBytes:       maxBodyBytes,
+		MaxInputItems:      bridge.DefaultMaxInputItems,
+		MaxCollectionItems: DefaultMaxCollectionItems,
+		MaxTools:           bridge.DefaultMaxFunctionTools,
+		MaxSchemaBytes:     bridge.DefaultMaxFunctionSchemaBytes,
+		MaxJSONDepth:       DefaultMaxJSONDepth,
+		MaxJSONTokens:      DefaultMaxJSONTokens,
+	}
+}
+
 // Decoder validates the supported Codex Responses request subset and returns
 // only protocol-neutral bridge values.
 type Decoder struct {
-	maxBodyBytes int64
+	limits DecoderLimits
 }
 
 // NewDecoder constructs a bounded request decoder. A non-positive limit is a
@@ -32,30 +68,62 @@ func NewDecoder(maxBodyBytes int64) (*Decoder, error) {
 	if maxBodyBytes <= 0 {
 		return nil, fmt.Errorf("max body bytes must be positive")
 	}
-	return &Decoder{maxBodyBytes: maxBodyBytes}, nil
+	return NewDecoderWithLimits(defaultDecoderLimits(maxBodyBytes))
+}
+
+// NewDecoderWithLimits constructs a decoder with explicit resource limits.
+// Zero values select the documented safe defaults; negative values are
+// configuration errors rather than an accidental unlimited mode.
+func NewDecoderWithLimits(limits DecoderLimits) (*Decoder, error) {
+	defaults := defaultDecoderLimits(DefaultMaxBodyBytes)
+	if limits.MaxBodyBytes == 0 {
+		limits.MaxBodyBytes = defaults.MaxBodyBytes
+	}
+	if limits.MaxInputItems == 0 {
+		limits.MaxInputItems = defaults.MaxInputItems
+	}
+	if limits.MaxCollectionItems == 0 {
+		limits.MaxCollectionItems = defaults.MaxCollectionItems
+	}
+	if limits.MaxTools == 0 {
+		limits.MaxTools = defaults.MaxTools
+	}
+	if limits.MaxSchemaBytes == 0 {
+		limits.MaxSchemaBytes = defaults.MaxSchemaBytes
+	}
+	if limits.MaxJSONDepth == 0 {
+		limits.MaxJSONDepth = defaults.MaxJSONDepth
+	}
+	if limits.MaxJSONTokens == 0 {
+		limits.MaxJSONTokens = defaults.MaxJSONTokens
+	}
+	if limits.MaxBodyBytes <= 0 || limits.MaxInputItems <= 0 || limits.MaxCollectionItems <= 0 || limits.MaxTools <= 0 || limits.MaxSchemaBytes <= 0 || limits.MaxJSONDepth <= 0 || limits.MaxJSONTokens <= 0 {
+		return nil, fmt.Errorf("decoder limits must be positive")
+	}
+	return &Decoder{limits: limits}, nil
 }
 
 // Decode validates contentType, reads at most the configured body limit, and
 // translates one JSON Responses request into the bridge model.
 func (decoder *Decoder) Decode(body io.Reader, contentType string) (bridge.Request, error) {
-	if decoder == nil || decoder.maxBodyBytes <= 0 {
+	if decoder == nil || decoder.limits.MaxBodyBytes <= 0 {
 		return bridge.Request{}, fmt.Errorf("decoder is not configured")
 	}
 	if err := validateContentType(contentType); err != nil {
 		return bridge.Request{}, err
 	}
-	data, err := readBounded(body, decoder.maxBodyBytes)
+	data, err := readBounded(body, decoder.limits.MaxBodyBytes)
 	if err != nil {
 		return bridge.Request{}, err
 	}
 	if !utf8.Valid(data) {
 		return bridge.Request{}, newError(ErrorMalformedJSON, "body", "request body is not valid UTF-8")
 	}
-	fields, err := decodeJSONObject(data)
+	fields, err := decodeJSONObject(data, decoder.limits)
 	if err != nil {
 		return bridge.Request{}, err
 	}
-	wire, err := decodeRequestWire(fields)
+	wire, err := decodeRequestWire(fields, decoder.limits)
 	if err != nil {
 		return bridge.Request{}, err
 	}
@@ -75,10 +143,10 @@ func (decoder *Decoder) DecodeRequest(r *http.Request) (bridge.Request, error) {
 	if r.Body == nil {
 		return bridge.Request{}, invalidRequest("body", "request body is required")
 	}
-	if decoder == nil || decoder.maxBodyBytes <= 0 {
+	if decoder == nil || decoder.limits.MaxBodyBytes <= 0 {
 		return bridge.Request{}, fmt.Errorf("decoder is not configured")
 	}
-	if r.ContentLength > decoder.maxBodyBytes {
+	if r.ContentLength > decoder.limits.MaxBodyBytes {
 		return bridge.Request{}, newError(ErrorRequestTooLarge, "body", "request body exceeds the configured limit")
 	}
 	return decoder.Decode(r.Body, r.Header.Get("Content-Type"))
@@ -122,7 +190,9 @@ func readBounded(body io.Reader, maxBodyBytes int64) ([]byte, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(body, limit))
 	if err != nil {
-		return nil, invalidRequest("body", "request body could not be read")
+		readError := invalidRequest("body", "request body could not be read")
+		readError.cause = err
+		return nil, readError
 	}
 	if int64(len(data)) > maxBodyBytes {
 		return nil, newError(ErrorRequestTooLarge, "body", "request body exceeds the configured limit")
@@ -130,8 +200,20 @@ func readBounded(body io.Reader, maxBodyBytes int64) ([]byte, error) {
 	return data, nil
 }
 
-func decodeJSONObject(data []byte) (map[string]json.RawMessage, error) {
+func decodeJSONObject(data []byte, limits DecoderLimits) (map[string]json.RawMessage, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, newError(ErrorMalformedJSON, "body", "request body contains malformed JSON")
+	}
+	if err := validateJSONDocument(data, limits.MaxJSONDepth, limits.MaxJSONTokens, limits.MaxCollectionItems); err != nil {
+		if _, limited := err.(jsonStructureLimitError); limited {
+			return nil, newError(ErrorRequestTooLarge, "body", "request JSON structure exceeds the configured limit")
+		}
+		if _, duplicate := err.(jsonDuplicateKeyError); duplicate {
+			return nil, newError(ErrorMalformedJSON, "body", "request body contains duplicate JSON object keys")
+		}
+		if _, trailing := err.(jsonTrailingValueError); trailing {
+			return nil, newError(ErrorMalformedJSON, "body", "request body must contain one JSON object without trailing values")
+		}
 		return nil, newError(ErrorMalformedJSON, "body", "request body contains malformed JSON")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -139,70 +221,140 @@ func decodeJSONObject(data []byte) (map[string]json.RawMessage, error) {
 	if err := decoder.Decode(&fields); err != nil || fields == nil {
 		return nil, newError(ErrorMalformedJSON, "body", "request body contains malformed JSON")
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, newError(ErrorMalformedJSON, "body", "request body must contain one JSON object without trailing values")
-	}
-	if err := rejectDuplicateJSONKeys(data); err != nil {
-		return nil, newError(ErrorMalformedJSON, "body", "request body contains duplicate JSON object keys")
-	}
 	return fields, nil
 }
 
-// rejectDuplicateJSONKeys closes the ambiguity that encoding/json otherwise
-// resolves by silently keeping the last value for a duplicate object key.
-// The check is recursive so a schema or nested item cannot smuggle an
-// ambiguous value through the same request boundary.
-func rejectDuplicateJSONKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := walkJSONTokens(decoder); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return fmt.Errorf("trailing JSON value")
-	}
-	return nil
+type jsonStructureLimitError struct {
+	detail string
 }
 
-func walkJSONTokens(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
+func (err jsonStructureLimitError) Error() string { return err.detail }
+
+type jsonDuplicateKeyError struct{}
+
+func (jsonDuplicateKeyError) Error() string { return "duplicate object key" }
+
+type jsonTrailingValueError struct{}
+
+func (jsonTrailingValueError) Error() string { return "trailing JSON value" }
+
+// validateJSONDocument performs the request-wide structural pass before any
+// map or array is materialized. It rejects duplicate object keys, bounds
+// nesting and tokens, and counts each collection while scanning it.
+func validateJSONDocument(data []byte, maxDepth, maxTokens, maxCollectionItems int) error {
+	type frame struct {
+		kind         json.Delim
+		expectingKey bool
+		memberCount  int
+		seenKeys     map[string]struct{}
 	}
-	switch delimiter := token.(type) {
-	case json.Delim:
-		switch delimiter {
-		case '{':
-			keys := make(map[string]struct{})
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return fmt.Errorf("object key is not a string")
-				}
-				if _, exists := keys[key]; exists {
-					return fmt.Errorf("duplicate object key")
-				}
-				keys[key] = struct{}{}
-				if err := walkJSONTokens(decoder); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
-			return err
-		case '[':
-			for decoder.More() {
-				if err := walkJSONTokens(decoder); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
+	if maxDepth <= 0 || maxTokens <= 0 || maxCollectionItems <= 0 {
+		return jsonStructureLimitError{detail: "JSON structure limits are not positive"}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	stack := make([]frame, 0, 8)
+	rootComplete := false
+	tokens := 0
+	completeValue := func() {
+		if len(stack) == 0 {
+			rootComplete = true
+			return
+		}
+		parent := &stack[len(stack)-1]
+		if parent.kind == '{' {
+			parent.expectingKey = true
+		}
+	}
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
 			return err
 		}
+		tokens++
+		if tokens > maxTokens {
+			return jsonStructureLimitError{detail: "JSON token count exceeds the configured limit"}
+		}
+
+		if len(stack) == 0 {
+			if rootComplete {
+				return jsonTrailingValueError{}
+			}
+			delimiter, isDelimiter := token.(json.Delim)
+			if !isDelimiter {
+				rootComplete = true
+				continue
+			}
+			if delimiter != '{' && delimiter != '[' {
+				return fmt.Errorf("unexpected JSON delimiter")
+			}
+			if 1 > maxDepth {
+				return jsonStructureLimitError{detail: "JSON nesting exceeds the configured limit"}
+			}
+			stack = append(stack, frame{
+				kind:         delimiter,
+				expectingKey: delimiter == '{',
+				seenKeys:     map[string]struct{}{},
+			})
+			continue
+		}
+
+		current := &stack[len(stack)-1]
+		if current.kind == '{' && current.expectingKey {
+			if delimiter, isDelimiter := token.(json.Delim); isDelimiter && delimiter == '}' {
+				stack = stack[:len(stack)-1]
+				completeValue()
+				continue
+			}
+			key, isString := token.(string)
+			if !isString {
+				return fmt.Errorf("object key is not a string")
+			}
+			if _, duplicate := current.seenKeys[key]; duplicate {
+				return jsonDuplicateKeyError{}
+			}
+			current.seenKeys[key] = struct{}{}
+			current.memberCount++
+			if current.memberCount > maxCollectionItems {
+				return jsonStructureLimitError{detail: "JSON object member count exceeds the configured limit"}
+			}
+			current.expectingKey = false
+			continue
+		}
+		if current.kind == '[' {
+			if delimiter, isDelimiter := token.(json.Delim); isDelimiter && delimiter == ']' {
+				stack = stack[:len(stack)-1]
+				completeValue()
+				continue
+			}
+			current.memberCount++
+			if current.memberCount > maxCollectionItems {
+				return jsonStructureLimitError{detail: "JSON array element count exceeds the configured limit"}
+			}
+		} else if delimiter, isDelimiter := token.(json.Delim); isDelimiter && delimiter == '}' {
+			return fmt.Errorf("object value is missing")
+		}
+
+		if delimiter, isDelimiter := token.(json.Delim); isDelimiter {
+			if delimiter != '{' && delimiter != '[' {
+				return fmt.Errorf("unexpected JSON delimiter")
+			}
+			if len(stack)+1 > maxDepth {
+				return jsonStructureLimitError{detail: "JSON nesting exceeds the configured limit"}
+			}
+			stack = append(stack, frame{
+				kind:         delimiter,
+				expectingKey: delimiter == '{',
+				seenKeys:     map[string]struct{}{},
+			})
+			continue
+		}
+		completeValue()
+	}
+	if !rootComplete || len(stack) != 0 {
+		return fmt.Errorf("incomplete JSON value")
 	}
 	return nil
 }
@@ -366,7 +518,7 @@ type deferredToolWire struct {
 func (tool deferredToolWire) isToolWire()      {}
 func (tool deferredToolWire) toolName() string { return tool.Name }
 
-func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire, error) {
+func decodeRequestWire(fields map[string]json.RawMessage, limits DecoderLimits) (responsesRequestWire, error) {
 	for _, field := range sortedKeys(fields) {
 		policy, ok := topLevelPolicy[field]
 		if !ok {
@@ -409,21 +561,21 @@ func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire,
 		}
 	}
 	if raw, ok := fields["input"]; ok {
-		items, decodeErr := rawArray(raw, "input")
+		items, decodeErr := rawArray(raw, "input", limits.MaxInputItems)
 		if decodeErr != nil {
 			return responsesRequestWire{}, decodeErr
 		}
-		wire.Input, err = decodeInputItems(items)
+		wire.Input, err = decodeInputItems(items, limits.MaxInputItems, limits.MaxCollectionItems)
 		if err != nil {
 			return responsesRequestWire{}, err
 		}
 	}
 	if raw, ok := fields["tools"]; ok {
-		tools, decodeErr := rawArray(raw, "tools")
+		tools, decodeErr := rawArray(raw, "tools", limits.MaxTools)
 		if decodeErr != nil {
 			return responsesRequestWire{}, decodeErr
 		}
-		wire.Tools, err = decodeTools(tools)
+		wire.Tools, err = decodeTools(tools, limits.MaxTools, limits.MaxSchemaBytes, limits)
 		if err != nil {
 			return responsesRequestWire{}, err
 		}
@@ -447,7 +599,15 @@ func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire,
 		}
 	}
 	if raw, ok := fields["text"]; ok {
-		wire.Generation.Text, err = decodeText(raw)
+		remainingSchemaBytes := limits.MaxSchemaBytes
+		for _, tool := range wire.Tools {
+			function, ok := tool.(functionToolWire)
+			if !ok {
+				continue
+			}
+			remainingSchemaBytes -= int64(len(function.Parameters))
+		}
+		wire.Generation.Text, err = decodeText(raw, remainingSchemaBytes, limits)
 		if err != nil {
 			return responsesRequestWire{}, err
 		}
@@ -464,7 +624,7 @@ func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire,
 		return responsesRequestWire{}, unsupportedField("stream", "stream must be true for the streaming milestone")
 	}
 	if raw, ok := fields["include"]; ok {
-		wire.Generation.Include, err = stringArray(raw, "include")
+		wire.Generation.Include, err = stringArray(raw, "include", limits.MaxCollectionItems)
 		if err != nil {
 			return responsesRequestWire{}, err
 		}
@@ -506,16 +666,21 @@ func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire,
 	return wire, nil
 }
 
-func decodeInputItems(items []json.RawMessage) ([]inputWire, error) {
-	// Validate item shapes and local call identity here, but defer result
-	// duplicate/kind correlation to the continuation owner. The provider
-	// adapter owns retained state and can therefore return stable continuation
-	// taxonomy instead of collapsing these cases into invalid_request.
+func decodeInputItems(items []json.RawMessage, maxItems, maxCollectionItems int) ([]inputWire, error) {
+	if maxItems <= 0 || len(items) > maxItems {
+		return nil, newError(ErrorRequestTooLarge, "input", "input item count exceeds the configured limit")
+	}
+	// Validate item shapes here, but defer result correlation to the
+	// continuation owner. A standard continuation may contain only output
+	// items, so an output call_id is not required to have a local declaration.
+	// The provider adapter owns retained state and can therefore return stable
+	// continuation taxonomy instead of collapsing these cases into
+	// invalid_request.
 	result := make([]inputWire, 0, len(items))
 	callKinds := make(map[string]bridge.InputKind)
 	for index, raw := range items {
 		path := fmt.Sprintf("input[%d]", index)
-		item, err := decodeInputItem(raw, path)
+		item, err := decodeInputItem(raw, path, maxCollectionItems)
 		if err != nil {
 			return nil, err
 		}
@@ -531,20 +696,16 @@ func decodeInputItems(items []json.RawMessage) ([]inputWire, error) {
 				return nil, invalidRequest(path+".call_id", "call_id must be unique within the request")
 			}
 			callKinds[item.CallID] = bridge.InputCustomToolCall
-		case functionCallOutputWire:
-			if _, exists := callKinds[item.CallID]; !exists {
-				return nil, invalidRequest(path+".call_id", "call_id does not correlate to a prior tool call")
-			}
-		case customToolCallOutputWire:
-			if _, exists := callKinds[item.CallID]; !exists {
-				return nil, invalidRequest(path+".call_id", "call_id does not correlate to a prior tool call")
-			}
+		case functionCallOutputWire, customToolCallOutputWire:
+			// Syntactically valid output-only items are intentionally accepted.
+			// ContinuationStore.Begin validates unknown, mixed, duplicate, and
+			// stored-kind correlations after the request reaches the adapter.
 		}
 	}
 	return result, nil
 }
 
-func decodeInputItem(raw json.RawMessage, path string) (inputWire, error) {
+func decodeInputItem(raw json.RawMessage, path string, maxCollectionItems int) (inputWire, error) {
 	fields, err := rawObject(raw, path)
 	if err != nil {
 		return nil, err
@@ -559,7 +720,7 @@ func decodeInputItem(raw json.RawMessage, path string) (inputWire, error) {
 	}
 	switch itemType {
 	case string(bridge.InputMessage):
-		return decodeMessage(fields, path)
+		return decodeMessage(fields, path, maxCollectionItems)
 	case string(bridge.InputFunctionCall):
 		return decodeFunctionCall(fields, path)
 	case string(bridge.InputFunctionCallOutput):
@@ -573,7 +734,7 @@ func decodeInputItem(raw json.RawMessage, path string) (inputWire, error) {
 	}
 }
 
-func decodeMessage(fields map[string]json.RawMessage, path string) (messageWire, error) {
+func decodeMessage(fields map[string]json.RawMessage, path string, maxCollectionItems int) (messageWire, error) {
 	if err := rejectUnknown(fields, path, "type", "id", "role", "content"); err != nil {
 		return messageWire{}, err
 	}
@@ -597,14 +758,14 @@ func decodeMessage(fields map[string]json.RawMessage, path string) (messageWire,
 	if !ok {
 		return messageWire{}, invalidRequest(path+".content", "content is required")
 	}
-	content, err := decodeContent(contentRaw, path+".content")
+	content, err := decodeContent(contentRaw, path+".content", maxCollectionItems)
 	if err != nil {
 		return messageWire{}, err
 	}
 	return messageWire{ID: id, Role: role, Content: content}, nil
 }
 
-func decodeContent(raw json.RawMessage, path string) ([]textContentWire, error) {
+func decodeContent(raw json.RawMessage, path string, maxItems int) ([]textContentWire, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '"' {
 		text, err := stringValue(raw, path)
@@ -613,7 +774,7 @@ func decodeContent(raw json.RawMessage, path string) ([]textContentWire, error) 
 		}
 		return []textContentWire{{Text: text}}, nil
 	}
-	parts, err := rawArray(raw, path)
+	parts, err := rawArray(raw, path, maxItems)
 	if err != nil {
 		return nil, err
 	}
@@ -751,13 +912,13 @@ func decodeCustomToolCallOutput(fields map[string]json.RawMessage, path string) 
 	return customToolCallOutputWire{CallID: callID, Output: output, Status: status, Error: errorMarker || resultStatusIsError(status)}, nil
 }
 
-func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
-	if len(tools) > bridge.DefaultMaxFunctionTools {
-		return nil, invalidRequest("tools", "too many tools")
+func decodeTools(tools []json.RawMessage, maxTools int, maxSchemaBytes int64, limits DecoderLimits) ([]toolWire, error) {
+	if maxTools <= 0 || len(tools) > maxTools {
+		return nil, newError(ErrorRequestTooLarge, "tools", "tool count exceeds the configured limit")
 	}
 	result := make([]toolWire, 0, len(tools))
 	names := make(map[string]struct{})
-	schemaBytes := 0
+	schemaBytes := int64(0)
 	for index, raw := range tools {
 		path := fmt.Sprintf("tools[%d]", index)
 		fields, err := rawObject(raw, path)
@@ -775,14 +936,11 @@ func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
 		var tool toolWire
 		switch toolType {
 		case string(bridge.ToolFunction):
-			parsed, parseErr := decodeFunctionTool(fields, path)
+			parsed, parseErr := decodeFunctionTool(fields, path, maxSchemaBytes-schemaBytes, limits)
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			if len(parsed.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
-				return nil, invalidRequest("tools", "aggregate function schema bytes exceed the configured limit")
-			}
-			schemaBytes += len(parsed.Parameters)
+			schemaBytes += int64(len(parsed.Parameters))
 			tool = parsed
 		case string(bridge.ToolCustom):
 			parsed, parseErr := decodeCustomTool(fields, path)
@@ -791,7 +949,7 @@ func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
 			}
 			tool = parsed
 		case string(bridge.ToolNamespace):
-			parsed, parseErr := decodeNamespaceTool(fields, path)
+			parsed, parseErr := decodeNamespaceTool(fields, path, limits.MaxCollectionItems)
 			if parseErr != nil {
 				return nil, parseErr
 			}
@@ -848,7 +1006,7 @@ func decodeCustomTool(fields map[string]json.RawMessage, path string) (customToo
 	return customToolWire{Name: name, Description: description, Format: formatKind}, nil
 }
 
-func decodeFunctionTool(fields map[string]json.RawMessage, path string) (functionToolWire, error) {
+func decodeFunctionTool(fields map[string]json.RawMessage, path string, remainingSchemaBytes int64, limits DecoderLimits) (functionToolWire, error) {
 	if err := rejectUnknown(fields, path, "type", "name", "description", "parameters", "strict"); err != nil {
 		return functionToolWire{}, err
 	}
@@ -864,7 +1022,10 @@ func decodeFunctionTool(fields map[string]json.RawMessage, path string) (functio
 	if !ok {
 		return functionToolWire{}, invalidRequest(path+".parameters", "parameters JSON Schema is required")
 	}
-	if err := validateJSONSchema(parameters); err != nil {
+	if int64(len(parameters)) > remainingSchemaBytes {
+		return functionToolWire{}, newError(ErrorRequestTooLarge, "tools", "aggregate function schema bytes exceed the configured limit")
+	}
+	if err := validateJSONSchema(parameters, limits); err != nil {
 		return functionToolWire{}, invalidRequest(path+".parameters", "parameters must be a valid JSON Schema object")
 	}
 	strict, err := optionalBoolPointer(fields, "strict", path+".strict")
@@ -874,7 +1035,7 @@ func decodeFunctionTool(fields map[string]json.RawMessage, path string) (functio
 	return functionToolWire{Name: name, Description: description, Parameters: bytes.Clone(parameters), Strict: strict}, nil
 }
 
-func decodeNamespaceTool(fields map[string]json.RawMessage, path string) (deferredToolWire, error) {
+func decodeNamespaceTool(fields map[string]json.RawMessage, path string, maxCollectionItems int) (deferredToolWire, error) {
 	if err := rejectUnknown(fields, path, "type", "name", "description", "tools"); err != nil {
 		return deferredToolWire{}, err
 	}
@@ -888,7 +1049,7 @@ func decodeNamespaceTool(fields map[string]json.RawMessage, path string) (deferr
 		}
 	}
 	if raw, exists := fields["tools"]; exists {
-		if _, err := rawArray(raw, path+".tools"); err != nil {
+		if _, err := rawArray(raw, path+".tools", maxCollectionItems); err != nil {
 			return deferredToolWire{}, err
 		}
 	}
@@ -982,7 +1143,7 @@ func decodeReasoning(raw json.RawMessage) (reasoningWire, error) {
 	return reasoningWire{Effort: effort}, nil
 }
 
-func decodeText(raw json.RawMessage) (textWire, error) {
+func decodeText(raw json.RawMessage, remainingSchemaBytes int64, limits DecoderLimits) (textWire, error) {
 	fields, err := rawObject(raw, "text")
 	if err != nil {
 		return textWire{}, err
@@ -1040,7 +1201,10 @@ func decodeText(raw json.RawMessage) (textWire, error) {
 		if !exists {
 			return textWire{}, invalidRequest("text.format.schema", "schema is required for json_schema format")
 		}
-		if err := validateJSONSchema(format.Schema); err != nil {
+		if int64(len(format.Schema)) > remainingSchemaBytes {
+			return textWire{}, newError(ErrorRequestTooLarge, "text.format.schema", "aggregate schema bytes exceed the configured limit")
+		}
+		if err := validateJSONSchema(format.Schema, limits); err != nil {
 			return textWire{}, invalidRequest("text.format.schema", "schema must be a valid JSON Schema object")
 		}
 		format.Strict, err = optionalBoolPointer(formatFields, "strict", "text.format.strict")
@@ -1164,20 +1328,41 @@ func deferredFieldParam(field string) string {
 	return "request.<deferred_field>"
 }
 
-func rawArray(raw json.RawMessage, param string) ([]json.RawMessage, error) {
+func rawArray(raw json.RawMessage, param string, maxItems int) ([]json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(raw)
-	var values []json.RawMessage
 	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return nil, invalidRequest(param, "value must be a JSON array")
 	}
-	if err := json.Unmarshal(trimmed, &values); err != nil {
+	if maxItems <= 0 {
+		return nil, newError(ErrorRequestTooLarge, param, "array item count exceeds the configured limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+		return nil, invalidRequest(param, "value must be a JSON array")
+	}
+	values := make([]json.RawMessage, 0, minInt(maxItems, 8))
+	for decoder.More() {
+		if len(values) >= maxItems {
+			return nil, newError(ErrorRequestTooLarge, param, "array item count exceeds the configured limit")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, invalidRequest(param, "value must be a JSON array")
+		}
+		values = append(values, value)
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+		return nil, invalidRequest(param, "value must be a JSON array")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, invalidRequest(param, "value must be a JSON array")
 	}
 	return values, nil
 }
 
-func stringArray(raw json.RawMessage, param string) ([]string, error) {
-	values, err := rawArray(raw, param)
+func stringArray(raw json.RawMessage, param string, maxItems int) ([]string, error) {
+	values, err := rawArray(raw, param, maxItems)
 	if err != nil {
 		return nil, err
 	}
@@ -1190,6 +1375,13 @@ func stringArray(raw json.RawMessage, param string) ([]string, error) {
 		result = append(result, item)
 	}
 	return result, nil
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func stringValue(raw json.RawMessage, param string) (string, error) {

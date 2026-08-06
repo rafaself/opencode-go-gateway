@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -417,6 +418,7 @@ func TestClientClosesErrorBodiesAndClassifiesStatusesWithoutPayloadLeak(t *testi
 		{status: httpStatus{Code: http.StatusUnauthorized}, code: ErrorUnauthorized},
 		{status: httpStatus{Code: http.StatusForbidden}, code: ErrorForbidden},
 		{status: httpStatus{Code: http.StatusTooManyRequests, RetryAfter: "17"}, code: ErrorRateLimited},
+		{status: httpStatus{Code: http.StatusGatewayTimeout}, code: ErrorTimeout},
 		{status: httpStatus{Code: http.StatusInternalServerError}, code: ErrorServer},
 	} {
 		t.Run(test.code.String(), func(t *testing.T) {
@@ -517,25 +519,6 @@ func TestDefaultHTTPClientDoesNotFollowRedirectsOrReplayCredentials(t *testing.T
 	}
 }
 
-func TestClientBoundsOversizedErrorBodies(t *testing.T) {
-	const limit int64 = 32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = io.WriteString(w, strings.Repeat("x", int(limit)+1000))
-	}))
-	defer server.Close()
-	client, err := NewClient(ClientConfig{APIKey: "key", BaseURL: server.URL, MaxErrorBodyBytes: limit})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Do(context.Background(), minimalRequest())
-	assertProviderCode(t, err, ErrorServer)
-	var providerErr *ProviderError
-	if !errors.As(err, &providerErr) || !providerErr.BodyTruncated {
-		t.Fatalf("oversized body classification = %#v", providerErr)
-	}
-}
-
 func TestClientDoesNotParseOrExposeMalformedHTTPErrorBodies(t *testing.T) {
 	const marker = "malformed-provider-marker"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -555,8 +538,8 @@ func TestClientDoesNotParseOrExposeMalformedHTTPErrorBodies(t *testing.T) {
 	}
 }
 
-func TestClientClassifiesMalformedErrorBodyAndClosesIt(t *testing.T) {
-	body := &failingBody{}
+func TestClientClosesOpenProviderErrorBodyWithoutReading(t *testing.T) {
+	body := newOpenErrorBody()
 	client, err := NewClient(ClientConfig{
 		APIKey:  "key",
 		BaseURL: "https://example.com",
@@ -567,14 +550,33 @@ func TestClientClassifiesMalformedErrorBodyAndClosesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.Do(context.Background(), minimalRequest())
-	assertProviderCode(t, err, ErrorBadRequest)
-	var providerErr *ProviderError
-	if !errors.As(err, &providerErr) || !providerErr.BodyReadFailed {
-		t.Fatalf("malformed error body classification = %#v", providerErr)
+	done := make(chan error, 1)
+	go func() {
+		_, requestErr := client.Do(context.Background(), minimalRequest())
+		done <- requestErr
+	}()
+	select {
+	case err = <-done:
+		assertProviderCode(t, err, ErrorBadRequest)
+	case <-time.After(500 * time.Millisecond):
+		select {
+		case <-body.readStarted:
+			close(body.release)
+			<-done
+			t.Fatal("provider error classification read an open body")
+		default:
+			t.Fatal("provider error classification blocked without reading the body")
+		}
 	}
-	if !body.closed {
-		t.Fatal("malformed error body was not closed")
+	select {
+	case <-body.readStarted:
+		t.Fatal("provider error body was read despite not being part of the contract")
+	default:
+	}
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("provider error body was not closed")
 	}
 }
 
@@ -845,8 +847,28 @@ func TestClientClassifiesNetworkFailureWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestClientClassifiesTransportTimeoutWithoutRetry(t *testing.T) {
+	calls := 0
+	client, err := NewClient(ClientConfig{
+		APIKey:  "key",
+		BaseURL: "https://example.com",
+		HTTPClient: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, timeoutNetError{}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Do(context.Background(), minimalRequest())
+	assertProviderCode(t, err, ErrorTimeout)
+	if calls != 1 {
+		t.Fatalf("HTTP client calls = %d, want exactly one", calls)
+	}
+}
+
 func TestDefaultHTTPClientUsesStreamingSafeTransportSettings(t *testing.T) {
-	httpClient := newDefaultHTTPClient()
+	httpClient := newDefaultHTTPClient(DefaultDialTimeout, DefaultTLSHandshakeTimeout, DefaultResponseHeaderTimeout)
 	if httpClient.Timeout != 0 {
 		t.Fatalf("default HTTP client timeout = %s, want zero", httpClient.Timeout)
 	}
@@ -859,6 +881,10 @@ func TestDefaultHTTPClientUsesStreamingSafeTransportSettings(t *testing.T) {
 	}
 	if transport.Proxy == nil || transport.ResponseHeaderTimeout <= 0 || transport.TLSHandshakeTimeout <= 0 {
 		t.Fatalf("transport phase settings are incomplete: %#v", transport)
+	}
+	proxy, err := transport.Proxy(&http.Request{})
+	if err != nil || proxy != nil {
+		t.Fatalf("ambient proxy was enabled: proxy=%v err=%v", proxy, err)
 	}
 }
 
@@ -930,6 +956,14 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+var _ net.Error = timeoutNetError{}
+
 type trackingBody struct {
 	mu     sync.Mutex
 	closed bool
@@ -944,13 +978,32 @@ func (body *trackingBody) Close() error {
 	return nil
 }
 
-type failingBody struct {
-	closed bool
+type openErrorBody struct {
+	readStarted chan struct{}
+	release     chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
 }
 
-func (body *failingBody) Read([]byte) (int, error) { return 0, errors.New("malformed body marker") }
+func newOpenErrorBody() *openErrorBody {
+	return &openErrorBody{
+		readStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
 
-func (body *failingBody) Close() error {
-	body.closed = true
+func (body *openErrorBody) Read([]byte) (int, error) {
+	select {
+	case <-body.readStarted:
+	default:
+		close(body.readStarted)
+	}
+	<-body.release
+	return 0, errors.New("open provider body read")
+}
+
+func (body *openErrorBody) Close() error {
+	body.closeOnce.Do(func() { close(body.closed) })
 	return nil
 }

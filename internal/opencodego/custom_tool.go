@@ -22,6 +22,8 @@ const (
 	ApplyPatchUpstreamName = ReservedToolNamePrefix + ApplyPatchToolName
 	ApplyPatchWrapperField = "input"
 
+	applyPatchWrapperSchema = `{"type":"object","properties":{"input":{"type":"string","description":"The exact freeform apply_patch text, including all newlines and markers."}},"required":["input"],"additionalProperties":false}`
+
 	// DefaultMaxApplyPatchInputBytes is an exclusive upper bound, independent
 	// from generic function-call argument limits. Inputs of this size or larger
 	// are rejected, so the largest accepted input is one byte smaller.
@@ -108,10 +110,17 @@ func applyPatchTool() ChatCompletionTool {
 		Function: FunctionDefinition{
 			Name:        ApplyPatchUpstreamName,
 			Description: "Apply the exact patch text supplied by Codex to the current workspace.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"input":{"type":"string","description":"The exact freeform apply_patch text, including all newlines and markers."}},"required":["input"],"additionalProperties":false}`),
+			Parameters:  json.RawMessage(applyPatchWrapperSchema),
 			Strict:      &strict,
 		},
 	}
+}
+
+// ApplyPatchWrapperSchemaBytes returns the exact provider schema size reserved
+// by the synthetic apply_patch function. The provider-tool budget counts this
+// registration once, whether the Codex declaration is implicit or explicit.
+func ApplyPatchWrapperSchemaBytes() int64 {
+	return int64(len(applyPatchWrapperSchema))
 }
 
 func wrapApplyPatchInput(input string) (string, error) {

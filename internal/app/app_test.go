@@ -1,9 +1,9 @@
 package app
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -59,10 +59,11 @@ func TestRunStopsTheHTTPServerOnContextCancellation(t *testing.T) {
 	}
 }
 
-func TestRunWaitsForActiveRequestDuringGracefulShutdown(t *testing.T) {
+func TestRunBoundsShutdownForUncooperativeRequest(t *testing.T) {
 	settings := config.Defaults().WithAPIKey("test-api-key")
 	settings.Port = 0
-	settings.ShutdownTimeout = time.Second
+	settings.MaxActiveRequests = 1
+	settings.ShutdownTimeout = 250 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -88,32 +89,35 @@ func TestRunWaitsForActiveRequestDuringGracefulShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The active-request limit is the deterministic dispatch boundary: once
+	// this second request receives 429, the partial-body request is tracked and
+	// can be observed being canceled by shutdown.
+	probe := &http.Client{Timeout: 100 * time.Millisecond}
+	active := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		response, probeErr := probe.Get("http://" + address + "/health/live")
+		if probeErr == nil {
+			active = response.StatusCode == http.StatusTooManyRequests
+			_ = response.Body.Close()
+			if active {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !active {
+		t.Fatal("partial-body request was not admitted before shutdown")
+	}
+
 	cancel()
 	select {
 	case err := <-runErr:
-		t.Fatalf("server stopped before the active request completed: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	if _, err := connection.Write([]byte("}")); err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.ReadResponse(bufio.NewReader(connection), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusBadRequest)
-	}
-
-	select {
-	case err := <-runErr:
-		if err != nil {
-			t.Fatalf("server shutdown failed: %v", err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown error = %v, want bounded context deadline", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("server did not shut down after the active request completed")
+		t.Fatal("server did not bound shutdown for the uncooperative request")
 	}
 }
 

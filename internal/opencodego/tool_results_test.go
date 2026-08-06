@@ -39,7 +39,7 @@ func TestTranslateToolResultsRejectsCorrelationViolations(t *testing.T) {
 		{
 			name: "unknown",
 			item: []bridge.InputItem{bridge.FunctionCallOutput{CallID: "missing", Output: "x"}},
-			want: ErrToolResultUnknownCall,
+			want: nil,
 		},
 		{
 			name: "duplicate",
@@ -55,15 +55,44 @@ func TestTranslateToolResultsRejectsCorrelationViolations(t *testing.T) {
 			item: []bridge.InputItem{
 				bridge.CustomToolCallOutput{CallID: "call", Output: "x"},
 			},
-			want: ErrToolResultUnknownCall,
+			want: nil,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := TranslateToolResults(test.item)
+			results, err := TranslateToolResults(test.item)
+			if test.want == nil {
+				if err != nil || len(results) != 1 || results[0].CallID == "" {
+					t.Fatalf("output-only translation = %#v, error = %v", results, err)
+				}
+				return
+			}
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
 		})
+	}
+}
+
+func TestTranslateToolResultsChecksLocalKindButDefersStoredCorrelation(t *testing.T) {
+	items := []bridge.InputItem{
+		bridge.FunctionCallOutput{CallID: "function-call", Output: "function output"},
+		bridge.FunctionCall{CallID: "function-call", Name: "lookup", Arguments: "{}"},
+		bridge.CustomToolCallOutput{CallID: "custom-call", Output: "custom output"},
+	}
+	results, err := TranslateToolResults(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Kind != bridge.ToolFunction || results[1].Kind != bridge.ToolCustom {
+		t.Fatalf("results = %#v", results)
+	}
+
+	_, err = TranslateToolResults([]bridge.InputItem{
+		bridge.FunctionCall{CallID: "call", Name: "lookup"},
+		bridge.CustomToolCallOutput{CallID: "call", Output: "wrong kind"},
+	})
+	if !errors.Is(err, ErrToolResultKindMismatch) {
+		t.Fatalf("kind error = %v, want %v", err, ErrToolResultKindMismatch)
 	}
 }

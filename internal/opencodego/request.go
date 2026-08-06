@@ -60,6 +60,10 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 			return ChatCompletionRequest{}, err
 		}
 	}
+	request.ToolRegistry = registry
+	if err := ValidateProviderToolBudget(request, bridge.DefaultMaxProviderTools, bridge.DefaultMaxFunctionSchemaBytes); err != nil {
+		return ChatCompletionRequest{}, err
+	}
 	var messages []ChatMessage
 	if request.Continuation != nil {
 		continuation, ok := request.Continuation.(*ContinuationRequest)
@@ -78,11 +82,7 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
 
-	if len(request.Tools) > bridge.DefaultMaxFunctionTools {
-		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
-	}
 	toolNames := make(map[string]struct{}, len(request.Tools))
-	schemaBytes := 0
 	for _, tool := range request.Tools {
 		if custom, err := customToolDeclaration(tool, registry); custom {
 			if err != nil {
@@ -107,10 +107,6 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 			return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 		}
 		toolNames[name] = struct{}{}
-		if len(mapped.Function.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
-			return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
-		}
-		schemaBytes += len(mapped.Function.Parameters)
 		result.Tools = append(result.Tools, mapped)
 	}
 	if registry != nil {
@@ -125,16 +121,9 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 				return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 			}
 			mapped := applyPatchTool()
-			if len(mapped.Function.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
-				return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
-			}
 			toolNames[mapped.Function.Name] = struct{}{}
 			result.Tools = append(result.Tools, mapped)
-			schemaBytes += len(mapped.Function.Parameters)
 		}
-	}
-	if len(result.Tools) > bridge.DefaultMaxFunctionTools {
-		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
 
 	if request.Generation.Reasoning.Effort != "" {
@@ -250,9 +239,11 @@ func mapContinuationInputItems(items []bridge.InputItem, lease *ContinuationLeas
 	seenResults := make(map[string]struct{}, len(results))
 	messages := make([]ChatMessage, 0, len(items)+1+len(results))
 	replayed := false
+	localCallsPresent := false
 	for _, item := range items {
 		switch value := item.(type) {
 		case bridge.FunctionCall:
+			localCallsPresent = true
 			if err := validateContinuationCall(value.CallID, bridge.ToolFunction, value.Name, value.Arguments, callKinds, callNames, callArguments, seenCalls); err != nil {
 				return nil, err
 			}
@@ -261,6 +252,7 @@ func mapContinuationInputItems(items []bridge.InputItem, lease *ContinuationLeas
 				replayed = true
 			}
 		case bridge.CustomToolCall:
+			localCallsPresent = true
 			wrapped, err := wrapApplyPatchInput(value.Input)
 			if err != nil {
 				return nil, providerError(ErrorInvalidRequest, err)
@@ -276,9 +268,17 @@ func mapContinuationInputItems(items []bridge.InputItem, lease *ContinuationLeas
 			if err := validateContinuationResult(value.CallID, bridge.ToolFunction, callKinds, seenResults); err != nil {
 				return nil, err
 			}
+			if !replayed {
+				messages = append(messages, continuationMessages(turn, results, providerIDs)...)
+				replayed = true
+			}
 		case bridge.CustomToolCallOutput:
 			if err := validateContinuationResult(value.CallID, bridge.ToolCustom, callKinds, seenResults); err != nil {
 				return nil, err
+			}
+			if !replayed {
+				messages = append(messages, continuationMessages(turn, results, providerIDs)...)
+				replayed = true
 			}
 		default:
 			message, err := mapInputItem(item)
@@ -288,7 +288,7 @@ func mapContinuationInputItems(items []bridge.InputItem, lease *ContinuationLeas
 			messages = append(messages, message)
 		}
 	}
-	if !replayed || len(seenCalls) != len(turn.ToolCalls) || len(seenResults) != len(results) {
+	if !replayed || (localCallsPresent && len(seenCalls) != len(turn.ToolCalls)) || len(seenResults) != len(results) {
 		return nil, providerError(ErrorInvalidRequest, nil)
 	}
 	return messages, nil

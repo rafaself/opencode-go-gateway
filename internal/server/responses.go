@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 	"github.com/rafaself/opencode-go-gateway/internal/codex"
@@ -27,20 +29,42 @@ const (
 )
 
 func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return
+	}
 	if r.Body == nil {
-		writeJSONError(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), requestInvalidText)
+		writeJSONErrorWithParam(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), "body", requestInvalidText)
 		return
 	}
 	defer r.Body.Close()
+	setReadDeadline(w, r.Context(), s.config.RequestBodyReadTimeout)
+	defer clearReadDeadline(w)
 
-	decoder, err := codex.NewDecoder(s.config.MaxBodyBytes)
+	decoder, err := codex.NewDecoderWithLimits(codex.DecoderLimits{
+		MaxBodyBytes:       s.config.MaxBodyBytes,
+		MaxInputItems:      s.config.MaxInputItems,
+		MaxCollectionItems: s.config.MaxCollectionItems,
+		MaxTools:           s.config.MaxTools,
+		MaxSchemaBytes:     s.config.MaxSchemaBytes,
+	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "server_configuration_error", "the gateway is not configured correctly")
 		return
 	}
 	request, err := decoder.DecodeRequest(r)
 	if err != nil {
+		if requestDecodeWasCanceled(r, err) {
+			return
+		}
+		if isRequestBodyTimeout(err) {
+			s.writeJSONErrorAfterBodyTimeout(w, http.StatusRequestTimeout, "timeout", "body", "The request body was not received within the configured phase timeout.")
+			return
+		}
 		writeRequestDecodeError(w, err)
+		return
+	}
+	clearReadDeadline(w)
+	if r.Context().Err() != nil {
 		return
 	}
 	registry, err := opencodego.NewToolRegistry(request)
@@ -71,7 +95,7 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		request.Continuation = opencodego.NewContinuationRequest(lease)
 		defer func() { _ = lease.Abort() }()
 	}
-	if err := validateResponsesRequest(request, lease != nil); err != nil {
+	if err := validateResponsesRequest(request, lease != nil, s.config.MaxTools, s.config.MaxSchemaBytes); err != nil {
 		if errors.Is(err, opencodego.ErrContinuationUnknown) {
 			writeContinuationError(w, err)
 			return
@@ -90,46 +114,85 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 	response, err := s.upstream.Do(upstreamContext, request)
 	if err != nil {
 		closeUpstreamResponse(response)
+		if r.Context().Err() != nil {
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
 	if err := validateUpstreamResponse(response); err != nil {
 		closeUpstreamResponse(response)
+		if r.Context().Err() != nil {
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
 	bodyCloser := &onceCloser{body: response.Body}
 	defer bodyCloser.Close()
+	activity := make(chan struct{}, 1)
+	streamBody := &activityBody{ReadCloser: response.Body, activity: activity}
 
 	session, err := codex.NewStreamSession(w, codex.StreamSessionOptions{
-		Model: opencodego.DefaultModel,
+		// The session must remain writable long enough to emit one safe
+		// response.failed for an internal stream timeout. The upstream child
+		// context is canceled independently by the watcher; inbound client and
+		// shutdown cancellation still cancel this request context immediately.
+		Context:                  r.Context(),
+		Model:                    opencodego.DefaultModel,
+		MaxAggregateBytes:        s.config.MaxSSEBufferedBytes,
+		MaxToolCallArgumentBytes: s.config.MaxToolCallArgumentBytes,
+		MaxOutputBytes:           s.config.MaxOutputBytes,
+		MaxTextBytes:             s.config.MaxTextBytes,
+		MaxReasoningBytes:        s.config.MaxReasoningBytes,
+		WriteTimeout:             s.config.DownstreamWriteTimeout,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "stream_configuration_error", "the response stream could not be initialized")
 		return
 	}
+	w.responseID = session.ResponseID
 	w.responseModel = session.Model
+	watcher := newStreamWatcher(r.Context().Done(), session.Done(), cancel, bodyCloser.Close, activity, s.config.StreamIdleTimeout)
+	defer watcher.Stop()
+	if r.Context().Err() != nil {
+		return
+	}
 	if err := session.Start(); err != nil {
 		return
 	}
-	stopWatcher := make(chan struct{})
-	watcherDone := make(chan struct{})
-	go watchUpstreamOwnership(stopWatcher, r.Context().Done(), session.Done(), cancel, bodyCloser.Close, watcherDone)
-	defer func() {
-		close(stopWatcher)
-		<-watcherDone
-	}()
 
-	streamDecoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.BridgeStreamDecoderOptions{
+	streamDecoder := opencodego.NewBridgeStreamDecoder(streamBody, opencodego.BridgeStreamDecoderOptions{
 		SSE: opencodego.SSEDecoderOptions{
-			MaxAggregateBytes: opencodego.DefaultStreamMaxAggregateBytes,
+			MaxLineBytes:             s.config.MaxSSELineBytes,
+			MaxEventBytes:            s.config.MaxSSEEventBytes,
+			MaxBufferedBytes:         s.config.MaxSSEBufferedBytes,
+			MaxAggregateBytes:        s.config.MaxSSEBufferedBytes,
+			MaxToolCallArgumentBytes: s.config.MaxToolCallArgumentBytes,
+			ReadBufferBytes:          s.config.MaxSSEReadBufferBytes,
 		},
-		AllowedToolNames: declaredFunctionToolNames(request),
-		ToolRegistry:     request.ToolRegistry,
+		AllowedToolNames:       declaredFunctionToolNames(request),
+		MaxToolCalls:           s.config.MaxTools,
+		MaxProviderCallIDBytes: bridge.DefaultMaxProviderCallIDBytes,
+		MaxToolNameBytes:       bridge.DefaultMaxToolNameBytes,
+		ToolRegistry:           request.ToolRegistry,
+		MaxOutputBytes:         s.config.MaxOutputBytes,
+		MaxTextBytes:           s.config.MaxTextBytes,
+		MaxReasoningBytes:      s.config.MaxReasoningBytes,
 	})
 	accepted := lease == nil
 	for {
 		event, decodeErr := streamDecoder.Next()
+		if reason := watcher.Reason(); reason != "" {
+			if reason == streamAbortTimeout && !session.TerminalEmitted && session.WriteFailure() == nil && r.Context().Err() == nil {
+				_ = session.Fail("timeout", "The upstream response stream exceeded its idle timeout.")
+				w.responseTerminal = "response.failed"
+			}
+			return
+		}
+		if r.Context().Err() != nil || session.WriteFailure() != nil {
+			return
+		}
 		if errors.Is(decodeErr, io.EOF) {
 			if !session.TerminalEmitted && session.WriteFailure() == nil {
 				_ = session.Fail("upstream_eof", "The upstream response stream ended unexpectedly.")
@@ -145,8 +208,14 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			return
 		}
 		if _, ok := event.(bridge.Completed); ok {
+			if r.Context().Err() != nil {
+				return
+			}
 			if turn, hasToolTurn := streamDecoder.PendingTurn(); hasToolTurn {
-				if err := s.continuations.Save(*turn); err != nil {
+				if err := s.continuations.SaveContext(r.Context(), *turn); err != nil {
+					if r.Context().Err() != nil {
+						return
+					}
 					if !session.TerminalEmitted && session.WriteFailure() == nil {
 						_ = session.Fail("continuation_capacity", "The gateway could not retain the provider tool turn.")
 						w.responseTerminal = "response.failed"
@@ -162,7 +231,13 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			return
 		}
 		if !accepted && isContinuationAcceptanceEvent(event) {
-			if err := lease.Commit(); err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			if err := lease.CommitContext(r.Context()); err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
 				if !session.TerminalEmitted && session.WriteFailure() == nil {
 					_ = session.Fail("continuation_commit", "The gateway could not finalize the continuation.")
 					w.responseTerminal = "response.failed"
@@ -176,6 +251,60 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func requestDecodeWasCanceled(request *http.Request, err error) bool {
+	if isRequestBodyTimeout(err) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if request == nil {
+		return false
+	}
+	contextError := request.Context().Err()
+	if contextError == nil || errors.Is(contextError, context.DeadlineExceeded) {
+		return false
+	}
+	return !isRequestBodyTimeout(err)
+}
+
+// writeJSONErrorAfterBodyTimeout owns the shutdown/write boundary for the
+// request. The dedicated lifecycle lock covers only the admission snapshot:
+// shutdown either wins before this response is admitted or the timeout write
+// is already authorized to finish independently. Neither lifecycle nor
+// active-request accounting is held across network I/O. The request context
+// itself is never replaced; statusWriter only permits this gateway-owned
+// timeout response through its scoped cancellation exception.
+func (s *Server) writeJSONErrorAfterBodyTimeout(w *statusWriter, status int, code, param, message string) bool {
+	if s == nil || w == nil {
+		return false
+	}
+	s.lifecycleMu.Lock()
+	s.activeRequestsMu.Lock()
+	shuttingDown := s.shuttingDown
+	if !shuttingDown {
+		w.allowCanceledWrite = true
+	}
+	s.activeRequestsMu.Unlock()
+	s.lifecycleMu.Unlock()
+	if shuttingDown {
+		return false
+	}
+	defer func() { w.allowCanceledWrite = false }()
+	setWriteDeadline(w, s.config.DownstreamWriteTimeout)
+	defer clearWriteDeadline(w)
+	writeJSONErrorWithParam(w, status, code, param, message)
+	return w.status == status
+}
+
+func isRequestBodyTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 func isContinuationAcceptanceEvent(event bridge.StreamEvent) bool {
@@ -195,9 +324,16 @@ func responseTerminalType(event bridge.StreamEvent) string {
 	}
 }
 
-func validateResponsesRequest(request bridge.Request, continuation bool) error {
+func validateResponsesRequest(request bridge.Request, continuation bool, maxProviderTools int, maxSchemaBytes int64) error {
 	if request.PreviousResponseID != "" && !continuation {
 		return opencodego.ErrContinuationUnknown
+	}
+	if err := opencodego.ValidateProviderToolBudget(request, maxProviderTools, maxSchemaBytes); err != nil {
+		var providerError *opencodego.ProviderError
+		if errors.As(err, &providerError) && providerError.Code == opencodego.ErrorRequestTooLarge {
+			return &codex.Error{Code: codex.ErrorRequestTooLarge, Param: "tools", Message: requestTooLargeText}
+		}
+		return err
 	}
 	for _, tool := range request.Tools {
 		if tool == nil {
@@ -300,7 +436,7 @@ func declaredFunctionToolNames(request bridge.Request) []string {
 func writeRequestDecodeError(w *statusWriter, err error) {
 	var decodeError *codex.Error
 	if !errors.As(err, &decodeError) {
-		writeJSONError(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), requestInvalidText)
+		writeJSONErrorWithParam(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), "body", requestInvalidText)
 		return
 	}
 	status := http.StatusBadRequest
@@ -313,7 +449,7 @@ func writeRequestDecodeError(w *statusWriter, err error) {
 		status = http.StatusNotImplemented
 		message = requestUnsupportedText
 	}
-	writeJSONError(w, status, string(decodeError.Code), message)
+	writeJSONErrorWithParam(w, status, string(decodeError.Code), decodeError.Param, message)
 }
 
 func validateUpstreamResponse(response *UpstreamResponse) error {
@@ -321,7 +457,7 @@ func validateUpstreamResponse(response *UpstreamResponse) error {
 		return &UpstreamError{Code: upstreamErrorBadGateway}
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return &UpstreamError{Code: upstreamCodeForStatus(response.StatusCode), StatusCode: response.StatusCode}
+		return &UpstreamError{Code: upstreamCodeForStatus(response.StatusCode), StatusCode: response.StatusCode, RetryAfter: safeRetryAfterHeader(response.Header.Get("Retry-After"))}
 	}
 	if response.Body == nil {
 		return &UpstreamError{Code: upstreamErrorMalformed}
@@ -343,7 +479,9 @@ func upstreamCodeForStatus(status int) string {
 		return upstreamErrorForbidden
 	case http.StatusTooManyRequests:
 		return upstreamErrorRateLimited
-	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return upstreamErrorTimeout
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
 		return upstreamErrorServer
 	default:
 		return upstreamErrorUnexpected
@@ -361,15 +499,33 @@ func writeUpstreamError(w *statusWriter, err error) {
 		if code == upstreamErrorRateLimited {
 			status = http.StatusTooManyRequests
 		}
+		if code == upstreamErrorTimeout {
+			status = http.StatusGatewayTimeout
+		}
 		if code == upstreamErrorBadRequest || code == upstreamErrorInvalidRequest || code == upstreamErrorTooLarge || code == upstreamErrorUnsupportedTool {
 			status = http.StatusBadRequest
 		}
 		if code == upstreamErrorNotConfigured {
 			status = http.StatusInternalServerError
 		}
+	} else {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			code = upstreamErrorTimeout
+			status = http.StatusGatewayTimeout
+		case errors.Is(err, context.Canceled):
+			code = upstreamErrorCanceled
+		case isNetworkTimeout(err):
+			code = upstreamErrorTimeout
+			status = http.StatusGatewayTimeout
+		case err != nil:
+			code = upstreamErrorNetwork
+		}
 	}
-	if retryAfter != "" && code == upstreamErrorRateLimited {
-		w.Header().Set("Retry-After", retryAfter)
+	if code == upstreamErrorRateLimited {
+		if retryAfter = safeRetryAfterHeader(retryAfter); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
 	}
 	message := upstreamFailureText
 	if code == upstreamErrorContentType {
@@ -378,14 +534,52 @@ func writeUpstreamError(w *statusWriter, err error) {
 	if code == upstreamErrorNotConfigured {
 		message = upstreamNotConfiguredText
 	}
+	if code == upstreamErrorTimeout {
+		message = "The upstream provider did not respond within the configured phase timeout."
+	}
+	if code == upstreamErrorCanceled {
+		message = "The upstream request was canceled."
+	}
 	writeJSONError(w, status, code, message)
+}
+
+func isNetworkTimeout(err error) bool {
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && networkErr.Timeout()
+}
+
+func safeRetryAfterHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	if allDecimalDigits(value) {
+		return value
+	}
+	parsed, err := http.ParseTime(value)
+	if err != nil {
+		return ""
+	}
+	return parsed.UTC().Format(http.TimeFormat)
+}
+
+func allDecimalDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, runeValue := range value {
+		if runeValue < '0' || runeValue > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func safeUpstreamCode(code string) string {
 	switch code {
 	case upstreamErrorBadGateway, upstreamErrorBadRequest, upstreamErrorUnauthorized, upstreamErrorForbidden,
 		upstreamErrorRateLimited, upstreamErrorServer, upstreamErrorUnexpected, upstreamErrorContentType,
-		upstreamErrorMalformed, upstreamErrorCanceled, upstreamErrorNotConfigured, upstreamErrorNetwork,
+		upstreamErrorMalformed, upstreamErrorCanceled, upstreamErrorTimeout, upstreamErrorNotConfigured, upstreamErrorNetwork,
 		upstreamErrorInvalidRequest, upstreamErrorTooLarge, upstreamErrorUnsupportedTool:
 		return code
 	default:
@@ -412,14 +606,111 @@ func (closer *onceCloser) Close() {
 	closer.once.Do(func() { _ = closer.body.Close() })
 }
 
-func watchUpstreamOwnership(stop <-chan struct{}, requestDone <-chan struct{}, sessionDone <-chan struct{}, cancel context.CancelFunc, closeBody func(), finished chan<- struct{}) {
-	defer close(finished)
-	select {
-	case <-stop:
-		return
-	case <-requestDone:
-	case <-sessionDone:
+const (
+	streamAbortCanceled = "canceled"
+	streamAbortTimeout  = "timeout"
+	streamAbortWrite    = "stream_interrupted"
+)
+
+type activityBody struct {
+	io.ReadCloser
+	activity chan<- struct{}
+}
+
+func (body *activityBody) Read(target []byte) (int, error) {
+	if body == nil || body.ReadCloser == nil {
+		return 0, io.EOF
 	}
-	cancel()
-	closeBody()
+	n, err := body.ReadCloser.Read(target)
+	if n > 0 && body.activity != nil {
+		select {
+		case body.activity <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+type streamWatcher struct {
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+	mu       sync.Mutex
+	reason   string
+}
+
+func newStreamWatcher(requestDone <-chan struct{}, sessionDone <-chan struct{}, cancel context.CancelFunc, closeBody func(), activity <-chan struct{}, idle time.Duration) *streamWatcher {
+	watcher := &streamWatcher{
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go watcher.run(requestDone, sessionDone, cancel, closeBody, activity, idle)
+	return watcher
+}
+
+func (watcher *streamWatcher) run(requestDone <-chan struct{}, sessionDone <-chan struct{}, cancel context.CancelFunc, closeBody func(), activity <-chan struct{}, idle time.Duration) {
+	defer close(watcher.done)
+	if idle <= 0 {
+		idle = defaultStreamIdleTimeout
+	}
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	for {
+		select {
+		case <-watcher.stop:
+			return
+		case <-requestDone:
+			watcher.interrupt(streamAbortCanceled, cancel, closeBody)
+			return
+		case <-sessionDone:
+			watcher.interrupt(streamAbortWrite, cancel, closeBody)
+			return
+		case <-activity:
+			resetTimer(timer, idle)
+		case <-timer.C:
+			watcher.interrupt(streamAbortTimeout, cancel, closeBody)
+			return
+		}
+	}
+}
+
+func (watcher *streamWatcher) interrupt(reason string, cancel context.CancelFunc, closeBody func()) {
+	watcher.mu.Lock()
+	if watcher.reason == "" {
+		watcher.reason = reason
+	}
+	watcher.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if closeBody != nil {
+		closeBody()
+	}
+}
+
+func (watcher *streamWatcher) Reason() string {
+	if watcher == nil {
+		return ""
+	}
+	watcher.mu.Lock()
+	defer watcher.mu.Unlock()
+	return watcher.reason
+}
+
+func (watcher *streamWatcher) Stop() {
+	if watcher == nil {
+		return
+	}
+	watcher.stopOnce.Do(func() { close(watcher.stop) })
+	<-watcher.done
+}
+
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
 }

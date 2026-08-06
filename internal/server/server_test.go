@@ -1,15 +1,23 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
 
 func TestRoutesReturnStableJSONContracts(t *testing.T) {
@@ -23,14 +31,15 @@ func TestRoutesReturnStableJSONContracts(t *testing.T) {
 		wantStatus      int
 		wantAllow       string
 		wantType        string
+		wantCode        string
 		wantStatusField string
 	}{
 		{name: "live", method: http.MethodGet, path: "/health/live", wantStatus: http.StatusOK, wantStatusField: "ok"},
 		{name: "ready", method: http.MethodGet, path: "/health/ready", wantStatus: http.StatusOK, wantStatusField: "ready"},
-		{name: "responses without provider", method: http.MethodPost, path: "/v1/responses", body: textRequestBodyForServerTest(), wantStatus: http.StatusInternalServerError, wantType: "upstream_not_configured"},
-		{name: "unknown path", method: http.MethodGet, path: "/unknown", wantStatus: http.StatusNotFound, wantType: "not_found"},
-		{name: "live method", method: http.MethodPost, path: "/health/live", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodGet, wantType: "method_not_allowed"},
-		{name: "responses method", method: http.MethodGet, path: "/v1/responses", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodPost, wantType: "method_not_allowed"},
+		{name: "responses without provider", method: http.MethodPost, path: "/v1/responses", body: textRequestBodyForServerTest(), wantStatus: http.StatusInternalServerError, wantType: "provider_unavailable", wantCode: "upstream_not_configured"},
+		{name: "unknown path", method: http.MethodGet, path: "/unknown", wantStatus: http.StatusNotFound, wantType: "invalid_request", wantCode: "not_found"},
+		{name: "live method", method: http.MethodPost, path: "/health/live", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodGet, wantType: "invalid_request", wantCode: "method_not_allowed"},
+		{name: "responses method", method: http.MethodGet, path: "/v1/responses", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodPost, wantType: "invalid_request", wantCode: "method_not_allowed"},
 	}
 
 	for _, test := range tests {
@@ -64,7 +73,11 @@ func TestRoutesReturnStableJSONContracts(t *testing.T) {
 			}
 			if test.wantType != "" {
 				errorPayload, ok := payload["error"].(map[string]any)
-				if !ok || errorPayload["type"] != test.wantType || errorPayload["code"] != test.wantType {
+				wantCode := test.wantCode
+				if wantCode == "" {
+					wantCode = test.wantType
+				}
+				if !ok || errorPayload["type"] != test.wantType || errorPayload["code"] != wantCode || errorPayload["param"] != "" {
 					t.Fatalf("error payload = %v", payload["error"])
 				}
 			}
@@ -84,8 +97,66 @@ func TestResponsesEnforceBodyLimit(t *testing.T) {
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), `"code":"request_too_large"`) {
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := payload["error"].(map[string]any)
+	if errorPayload["type"] != "request_too_large" || errorPayload["code"] != "request_too_large" || errorPayload["param"] != "body" || errorPayload["message"] == "" {
 		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestRequestBodyReadTimeoutReturnsSafeJSON(t *testing.T) {
+	upstreamCalled := make(chan struct{}, 1)
+	server := newTestServerWithConfigAndUpstream(t, Config{
+		ListenAddr:             "127.0.0.1:0",
+		RequestBodyReadTimeout: 100 * time.Millisecond,
+	}, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		upstreamCalled <- struct{}{}
+		return nil, nil
+	}), nil)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve() }()
+
+	connection, err := net.Dial("tcp", server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := fmt.Fprintf(connection, "POST /v1/responses HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"model\":\"", server.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(connection), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusRequestTimeout || !bytes.Contains(body, []byte(`"type":"timeout"`)) || !bytes.Contains(body, []byte(`"code":"timeout"`)) || !bytes.Contains(body, []byte(`"param":"body"`)) {
+		t.Fatalf("body timeout response = %d %s", response.StatusCode, body)
+	}
+	select {
+	case <-upstreamCalled:
+		t.Fatal("upstream was called before the request body completed")
+	default:
+	}
+	if err := server.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve error after body timeout test: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve loop did not exit after body timeout test")
 	}
 }
 
@@ -156,6 +227,171 @@ func TestReadyBecomesUnavailableDuringShutdown(t *testing.T) {
 	}
 }
 
+func TestServerWiresPendingLimitsIntoItsOwnedContinuationStore(t *testing.T) {
+	server, err := New(Config{
+		ListenAddr:               "127.0.0.1:0",
+		MaxPendingTurnBytes:      1024,
+		MaxPendingRecords:        2,
+		MaxPendingAggregateBytes: 2048,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if server.continuations == nil {
+		t.Fatal("server did not create a continuation store")
+	}
+	maxRecords, maxRecordBytes, maxAggregateBytes := server.continuations.CapacityLimits()
+	if maxRecordBytes != 1024 || maxRecords != 2 || maxAggregateBytes != 2048 {
+		t.Fatalf("continuation limits = records:%d record_bytes:%d aggregate_bytes:%d", maxRecords, maxRecordBytes, maxAggregateBytes)
+	}
+}
+
+func TestServerRejectsProviderBudgetOverflow(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config Config
+	}{
+		{
+			name:   "tool slots",
+			config: Config{ListenAddr: "127.0.0.1:0", MaxTools: bridge.DefaultMaxProviderTools + 1},
+		},
+		{
+			name:   "schema bytes",
+			config: Config{ListenAddr: "127.0.0.1:0", MaxSchemaBytes: int64(bridge.DefaultMaxFunctionSchemaBytes) + 1},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := New(test.config, nil); err == nil {
+				t.Fatal("provider budget overflow was accepted")
+			}
+		})
+	}
+}
+
+func TestServerShutdownAdmissionCheckIsAtomicWithActiveRequestAccounting(t *testing.T) {
+	server := &Server{
+		config:         Config{MaxActiveRequests: 1},
+		activeRequests: make(map[uint64]activeRequest),
+	}
+	firstCancel := func() {}
+	unregister, accepted, shuttingDown := server.trackRequest(1, firstCancel, nil)
+	if !accepted || shuttingDown {
+		t.Fatalf("first request admission = accepted %v shutting_down %v", accepted, shuttingDown)
+	}
+	defer unregister()
+	server.markShuttingDown()
+
+	secondUnregister, accepted, shuttingDown := server.trackRequest(2, func() {}, nil)
+	if accepted || !shuttingDown {
+		t.Fatalf("racing request admission = accepted %v shutting_down %v", accepted, shuttingDown)
+	}
+	secondUnregister()
+}
+
+func TestBodyTimeoutWriteGatePreservesRequestContext(t *testing.T) {
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	writer := &statusWriter{ResponseWriter: recorder, context: requestContext}
+	server := &Server{}
+
+	if !server.writeJSONErrorAfterBodyTimeout(writer, http.StatusRequestTimeout, "timeout", "body", "timed out") {
+		t.Fatal("body-timeout write was unexpectedly rejected")
+	}
+	if writer.context != requestContext {
+		t.Fatal("body-timeout path replaced the effective request context")
+	}
+	if writer.status != http.StatusRequestTimeout || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":"timeout"`)) {
+		t.Fatalf("body-timeout response = status %d body %s", writer.status, recorder.Body.String())
+	}
+}
+
+func TestBodyTimeoutWriteGateRejectsShutdownAtTheWriteBoundary(t *testing.T) {
+	server := &Server{}
+	recorder := httptest.NewRecorder()
+	writer := &statusWriter{ResponseWriter: recorder, context: context.Background()}
+
+	server.markShuttingDown()
+	if wrote := server.writeJSONErrorAfterBodyTimeout(writer, http.StatusRequestTimeout, "timeout", "body", "timed out"); wrote {
+		t.Fatal("body-timeout writer emitted a response after shutdown began")
+	}
+	if writer.status != 0 || recorder.Body.Len() != 0 {
+		t.Fatalf("post-shutdown body-timeout response = status %d body %s", writer.status, recorder.Body.String())
+	}
+}
+
+func TestBodyTimeoutWriteDoesNotHoldActiveRequestAccountingDuringIO(t *testing.T) {
+	underlying := &blockingResponseWriter{
+		header:  make(http.Header),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server := &Server{
+		config:         Config{MaxActiveRequests: 1, DownstreamWriteTimeout: time.Second},
+		activeRequests: make(map[uint64]activeRequest),
+	}
+	writer := &statusWriter{ResponseWriter: underlying, context: context.Background()}
+	writeDone := make(chan bool, 1)
+	go func() {
+		writeDone <- server.writeJSONErrorAfterBodyTimeout(writer, http.StatusRequestTimeout, "timeout", "body", "timed out")
+	}()
+
+	select {
+	case <-underlying.started:
+	case <-time.After(time.Second):
+		t.Fatal("body-timeout response did not reach the blocking write")
+	}
+	if underlying.deadline.IsZero() {
+		t.Fatal("body-timeout response did not apply the configured write deadline")
+	}
+
+	admission := make(chan struct {
+		unregister   func()
+		accepted     bool
+		shuttingDown bool
+	}, 1)
+	go func() {
+		unregister, accepted, shuttingDown := server.trackRequest(1, func() {}, nil)
+		admission <- struct {
+			unregister   func()
+			accepted     bool
+			shuttingDown bool
+		}{unregister: unregister, accepted: accepted, shuttingDown: shuttingDown}
+	}()
+	select {
+	case result := <-admission:
+		if !result.accepted || result.shuttingDown {
+			t.Fatalf("request admission while error response was blocked = accepted %v shutting_down %v", result.accepted, result.shuttingDown)
+		}
+		result.unregister()
+	case <-time.After(250 * time.Millisecond):
+		close(underlying.release)
+		t.Fatal("active request accounting was blocked by body-timeout network I/O")
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		server.markShuttingDown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(250 * time.Millisecond):
+		close(underlying.release)
+		t.Fatal("shutdown state tracking was blocked by body-timeout network I/O")
+	}
+
+	close(underlying.release)
+	select {
+	case wrote := <-writeDone:
+		if !wrote {
+			t.Fatal("body-timeout response was not admitted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("body-timeout response did not finish after the writer was released")
+	}
+}
+
 func TestShutdownStopsNetworkServer(t *testing.T) {
 	server := newTestServer(t, nil)
 	serveErr := make(chan error, 1)
@@ -200,4 +436,32 @@ func newTestServerWithConfig(t *testing.T, config Config, logger *slog.Logger) *
 		_ = server.Shutdown(shutdownContext)
 	})
 	return server
+}
+
+type blockingResponseWriter struct {
+	header    http.Header
+	status    int
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	deadline  time.Time
+}
+
+func (writer *blockingResponseWriter) Header() http.Header { return writer.header }
+
+func (writer *blockingResponseWriter) WriteHeader(status int) {
+	if writer.status == 0 {
+		writer.status = status
+	}
+}
+
+func (writer *blockingResponseWriter) Write(payload []byte) (int, error) {
+	writer.startOnce.Do(func() { close(writer.started) })
+	<-writer.release
+	return len(payload), nil
+}
+
+func (writer *blockingResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	writer.deadline = deadline
+	return nil
 }

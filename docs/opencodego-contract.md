@@ -93,14 +93,31 @@ are rejected explicitly in this milestone in every thinking mode; they are
 never silently rewritten to `auto`. A reasoning effort combined with disabled
 thinking is rejected.
 
-Function tools are bounded to 128 declarations and 256 KiB of aggregate raw
-JSON Schema bytes. The stream adapter bounds each accumulated call argument to
-1 MiB and the complete retained stream to its configured aggregate limit; the
-`apply_patch` freeform input has an exclusive 512 KiB ceiling: lengths at or
-above 512 KiB are rejected, so the largest accepted value is 512 KiB minus one
-byte. Schemas and model argument strings are transported without semantic
-rewriting; invalid model JSON is left for Codex/tool execution to handle. This
-gateway never executes or validates filesystem effects for `apply_patch`.
+Provider-visible function tools are bounded to 128 slots and 256 KiB of
+aggregate raw JSON Schema bytes. The synthetic `__ocg_apply_patch` wrapper
+consumes one slot and its schema bytes exactly once, whether `apply_patch` is
+implicit or explicitly declared; therefore a request with implicit
+`apply_patch` can carry at most 127 ordinary function declarations. The
+request decoder also rejects more than 128 raw tool declarations, while the
+provider preflight rejects any declaration set whose translated provider
+shape exceeds either budget before an upstream call is made. Deferred Codex
+metadata is omitted from both provider budgets. The stream adapter bounds each
+accumulated call argument to 1 MiB and the complete retained stream to its
+configured aggregate limit; the `apply_patch` freeform input has an exclusive
+512 KiB ceiling: lengths at or above 512 KiB are rejected, so the largest
+accepted value is 512 KiB minus one byte. Schemas and model argument strings
+are transported without semantic rewriting; invalid model JSON is left for
+Codex/tool execution to handle. This gateway never executes or validates
+filesystem effects for `apply_patch`.
+
+The runtime `max_tools` and `max_schema_bytes` settings cannot exceed those
+same provider safety caps. The 128-tool setting is the provider-visible cap;
+because the implicit `apply_patch` wrapper consumes one slot, 127 ordinary
+function declarations remain the normal maximum for an implicit custom-tool
+request. At the bridge/server boundary, the first valid provider terminal is
+authoritative and no later bytes are read ahead. This fail-closed policy avoids
+blocking on an irrelevant duplicate `[DONE]`; callers of the lower-level
+provider decoder can still drain it to obtain duplicate-terminal validation.
 
 Provider `reasoning_content` is present in `ChatCompletionResponse` and
 `ChatCompletionChunk` message structs. It remains provider metadata for the
@@ -125,7 +142,9 @@ or write reasoning, prompts, source, or tool output to logs.
 
 The next Responses request must contain every matching
 `function_call_output`/`custom_tool_call_output` item for that assistant turn.
-Results may arrive in any order; the reconstructed Chat Completions request
+It may contain only those output items; local `function_call` or
+`custom_tool_call` declarations are optional because the retained turn is the
+correlation authority. Results may arrive in any order; the reconstructed Chat Completions request
 contains exactly one assistant message with all original tool calls in order,
 followed by one `role: tool` message per result in request order. Custom
 `apply_patch` calls are replayed through the same private
@@ -175,13 +194,39 @@ must consume and close it, either with `response.Body.Close()` or
 `response.Close()`. All non-success paths close upstream bodies before
 returning. Error bodies are read only up to the configured bound and never
 stored in `ProviderError`; status category and a validated `Retry-After` value
-remain available as safe metadata. No automatic retries are performed.
+remain available as safe metadata. No automatic retries are performed: every
+request and stream is attempted once. The generated v0.1 Codex profile in
+`profiles/codex-v0.1.toml` sets `request_max_retries = 0` and
+`stream_max_retries = 0` so provider retry policy does not replay a request or
+an active stream.
 
 The default HTTP client never follows redirects. A redirect response is
 classified and its body is closed without exposing its contents, so the bearer
 credential cannot be replayed to either a same-host or cross-host target.
 
-The default transport uses proxy environment support, bounded connection
-phases, keep-alive pooling, and disabled automatic compression to avoid
-buffering behavior surprises in SSE. It has no total `http.Client.Timeout`;
-request context cancellation owns the lifetime of an active stream.
+The default transport disables ambient proxy environment support, uses bounded
+connect, TLS-handshake, and response-header phases, keeps connections pooled,
+and disables automatic compression to avoid buffering behavior surprises in
+SSE. It has no total `http.Client.Timeout`; request context cancellation owns
+the lifetime of an active stream. The server adds a bounded request-body phase,
+stream-idle/first-byte watchdog, per-write/flush deadline, and bounded graceful
+shutdown. These deadlines are independent, so a healthy long-running stream
+is not cut off by a short total-generation timer.
+
+The server-side error taxonomy is stable across provider details:
+`invalid_request`, `unsupported_feature`, `request_too_large`,
+`authentication_error`, `permission_error`, `rate_limit_error`,
+`provider_bad_request`, `provider_unavailable`, `provider_protocol_error`,
+`stream_interrupted`, `timeout`, `canceled`,
+`pending_tool_state_not_found`, `pending_tool_state_expired`, and
+`internal_error`. The JSON `type` uses this taxonomy while `code` retains a
+safe diagnostic detail such as `upstream_server_error` or
+`continuation_unknown`. Before SSE, errors are JSON only; after SSE begins,
+failures are one `response.failed` event and are never replaced by JSON.
+
+Resource limits cover request bodies, input items, JSON collections and
+structure, tools, aggregate schemas,
+SSE lines/events/read buffers/retained state, visible text/output, reasoning,
+tool arguments, pending turns, and active requests. They are configurable at
+the gateway boundary and default to finite values suitable for a local-first
+process.

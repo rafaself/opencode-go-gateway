@@ -1,10 +1,12 @@
 package opencodego
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +16,20 @@ import (
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
+
+type streamTestNetError struct{}
+
+func (streamTestNetError) Error() string   { return "network failure marker" }
+func (streamTestNetError) Timeout() bool   { return true }
+func (streamTestNetError) Temporary() bool { return true }
+
+func (streamTestNetError) Unwrap() error { return net.ErrClosed }
+
+type streamErrorReader struct {
+	err error
+}
+
+func (reader streamErrorReader) Read([]byte) (int, error) { return 0, reader.err }
 
 const providerStreamFixture = `data: {"id":"chat-1","object":"chat.completion.chunk","created":42,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"Olá, "},"finish_reason":null}]}
 
@@ -77,6 +93,35 @@ func TestChatCompletionStreamDecoderRejectsDuplicateDoneMarker(t *testing.T) {
 	}
 }
 
+func TestBridgeStreamDecoderUsesNoReadAheadAfterFirstTerminal(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat-terminal","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	decoder := NewBridgeStreamDecoder(strings.NewReader(stream), BridgeStreamDecoderOptions{})
+	var terminal bridge.StreamEvent
+	for {
+		event, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.StreamEventKind() == bridge.StreamCompleted || event.StreamEventKind() == bridge.StreamIncomplete || event.StreamEventKind() == bridge.StreamFailed {
+			terminal = event
+		}
+	}
+	completed, ok := terminal.(bridge.Completed)
+	if !ok || completed.Reason != "stop" {
+		t.Fatalf("terminal = %#v, want completed stop without read-ahead", terminal)
+	}
+	if _, err := decoder.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("post-terminal Next error = %v, want EOF", err)
+	}
+}
+
 func TestChatCompletionStreamDecoderIsInvariantAcrossEveryChunkSplit(t *testing.T) {
 	want := collectChatEvents(t, strings.NewReader(providerStreamFixture))
 	for split := 1; split < len(providerStreamFixture); split++ {
@@ -95,6 +140,63 @@ func TestChatCompletionStreamDecoderReturnsProviderErrorsWithoutRawJSONErrorText
 	}
 	if event.Error.Message != "secret prompt" || event.Error.Code != "bad" {
 		t.Fatalf("provider error = %#v", event.Error)
+	}
+}
+
+func TestChatCompletionStreamDecoderClassifiesTypedMidstreamReadErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "canceled", err: context.Canceled, want: ErrStreamCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, want: ErrStreamTimeout},
+		{name: "network timeout", err: streamTestNetError{}, want: ErrStreamTimeout},
+		{name: "connection reset", err: net.ErrClosed, want: ErrStreamInterrupted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := NewChatCompletionStreamDecoder(streamErrorReader{err: test.err}, SSEDecoderOptions{})
+			_, err := decoder.Next()
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want errors.Is(..., %v)", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBridgeStreamDecoderKeepsMalformedSSEAsProtocolError(t *testing.T) {
+	decoder := NewBridgeStreamDecoder(strings.NewReader("data: {\"id\":\n\n"), BridgeStreamDecoderOptions{})
+	event, err := decoder.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, ok := event.(bridge.Failed)
+	if !ok || failed.Code != "upstream_stream_error" {
+		t.Fatalf("event = %#v, want provider protocol failure", event)
+	}
+}
+
+func TestBridgeStreamDecoderMapsTransportFailuresToStableCodes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "interrupted", err: net.ErrClosed, want: "stream_interrupted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := NewBridgeStreamDecoder(streamErrorReader{err: test.err}, BridgeStreamDecoderOptions{})
+			event, err := decoder.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed, ok := event.(bridge.Failed)
+			if !ok || failed.Code != test.want {
+				t.Fatalf("event = %#v, want code %q", event, test.want)
+			}
+		})
 	}
 }
 
@@ -124,11 +226,9 @@ func TestBridgeStreamDecoderEmitsSemanticEventsAndMapsTerminalReason(t *testing.
 		bridge.StreamTextDelta,
 		bridge.StreamTextDelta,
 		bridge.StreamReasoningDelta,
+		bridge.StreamUsageUpdated,
 		bridge.StreamToolCallStarted,
 		bridge.StreamToolCallArgumentsDelta,
-		bridge.StreamToolCallMetadataDelta,
-		bridge.StreamToolCallArgumentsDelta,
-		bridge.StreamUsageUpdated,
 		bridge.StreamToolCallCompleted,
 		bridge.StreamCompleted,
 	}
@@ -139,19 +239,72 @@ func TestBridgeStreamDecoderEmitsSemanticEventsAndMapsTerminalReason(t *testing.
 	if !ok || completed.CallID != "call-" || completed.Name != "exec_command" || completed.Arguments != "{\"cmd\":\"true\"}" {
 		t.Fatalf("completed tool = %#v", events[len(events)-2])
 	}
-	started, ok := events[4].(bridge.ToolCallStarted)
-	if !ok || started.CallID != completed.CallID {
-		t.Fatalf("tool call IDs were not stable: started %#v completed %#v", events[4], completed)
+	var started bridge.ToolCallStarted
+	for _, event := range events {
+		if value, ok := event.(bridge.ToolCallStarted); ok {
+			started = value
+			break
+		}
 	}
-	metadata, ok := events[6].(bridge.ToolCallMetadataDelta)
-	if !ok || metadata.CallID != "" {
-		t.Fatalf("provider ID fragment crossed the bridge as downstream metadata: %#v", events[6])
+	if started.CallID == "" || started.CallID != completed.CallID {
+		t.Fatalf("tool call IDs were not stable: started %#v completed %#v", started, completed)
 	}
 	if providerCallID, ok := decoder.ProviderCallID(completed.CallID); !ok || providerCallID != "call-1" {
 		t.Fatalf("private provider call ID = %q, %v; want call-1", providerCallID, ok)
 	}
 	if started := events[0].(bridge.ResponseStarted); !started.CreatedAt.Equal(time.Unix(42, 0).UTC()) {
 		t.Fatalf("started timestamp = %v", started.CreatedAt)
+	}
+}
+
+func TestBridgeStreamDecoderDoesNotLeakAnAllowlistedNameBeforeFinalization(t *testing.T) {
+	index := 0
+	first := ChatCompletionChunk{
+		ID: "chat-extension", Created: 1, Model: "deepseek-v4-flash",
+		Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{{
+			Index: &index,
+			ID:    "provider-call",
+			Function: ToolCallFunction{
+				Name:      "lookup",
+				Arguments: "{}",
+			},
+		}}}}},
+	}
+	second := ChatCompletionChunk{
+		ID: "chat-extension", Created: 1, Model: "deepseek-v4-flash",
+		Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{{
+			Index:    &index,
+			Function: ToolCallFunction{Name: "Evil"},
+		}}}}},
+	}
+	finishReason := "tool_calls"
+	terminal := ChatCompletionChunk{
+		ID: "chat-extension", Created: 1, Model: "deepseek-v4-flash",
+		Choices: []ChatCompletionChunkChoice{{Index: 0, FinishReason: &finishReason}},
+	}
+	input := providerChunksInput(t, first, second, terminal)
+	decoder := NewBridgeStreamDecoder(strings.NewReader(input), BridgeStreamDecoderOptions{
+		AllowedToolNames: []string{"lookup"},
+	})
+	var failure bridge.Failed
+	var leaked int
+	for {
+		event, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch value := event.(type) {
+		case bridge.Failed:
+			failure = value
+		case bridge.ToolCallStarted, bridge.ToolCallMetadataDelta, bridge.ToolCallArgumentsDelta, bridge.ToolCallCompleted:
+			leaked++
+		}
+	}
+	if leaked != 0 || failure.Code != "upstream_tool_not_declared" {
+		t.Fatalf("extension result leaked %d tool events or returned %#v", leaked, failure)
 	}
 }
 
@@ -211,6 +364,77 @@ data: [DONE]
 			}
 			if incomplete.Reason != want {
 				t.Fatalf("incomplete = %#v, want %q", incomplete, want)
+			}
+		})
+	}
+}
+
+func TestBridgeStreamDecoderDoesNotCompleteTruncatedToolCalls(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		toolName     string
+		args         string
+		finishReason string
+		wantReason   string
+		registry     bool
+	}{
+		{name: "function length", toolName: "lookup", args: "{\"query\":\"partial", finishReason: "length", wantReason: "max_output_tokens"},
+		{name: "function content filter", toolName: "lookup", args: "{\"query\":\"partial", finishReason: "content_filter", wantReason: "other"},
+		{name: "function refusal", toolName: "lookup", args: "{\"query\":\"partial", finishReason: "refusal", wantReason: "other"},
+		{name: "custom length", toolName: ApplyPatchUpstreamName, args: `{"input":"*** Begin Patch\n*** Update File: partial`, finishReason: "length", wantReason: "max_output_tokens", registry: true},
+		{name: "custom content filter", toolName: ApplyPatchUpstreamName, args: `{"input":"*** Begin Patch\n*** Update File: partial`, finishReason: "content_filter", wantReason: "other", registry: true},
+		{name: "custom refusal", toolName: ApplyPatchUpstreamName, args: `{"input":"*** Begin Patch\n*** Update File: partial`, finishReason: "refusal", wantReason: "other", registry: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			index := 0
+			finishReason := test.finishReason
+			first := ChatCompletionChunk{
+				ID: "chat-truncated", Created: 1, Model: "m",
+				Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{{
+					Index: &index,
+					ID:    "call-truncated",
+					Type:  "function",
+					Function: ToolCallFunction{
+						Name:      test.toolName,
+						Arguments: test.args,
+					},
+				}}}}},
+			}
+			terminal := ChatCompletionChunk{
+				ID: "chat-truncated", Created: 1, Model: "m",
+				Choices: []ChatCompletionChunkChoice{{Index: 0, FinishReason: &finishReason}},
+			}
+			options := BridgeStreamDecoderOptions{}
+			if test.registry {
+				registry, err := NewToolRegistry(minimalRequest())
+				if err != nil {
+					t.Fatal(err)
+				}
+				options.ToolRegistry = registry
+			} else {
+				options.AllowedToolNames = []string{test.toolName}
+			}
+			decoder := NewBridgeStreamDecoder(strings.NewReader(providerChunksInput(t, first, terminal)), options)
+			var completedCalls int
+			var incomplete *bridge.Incomplete
+			for {
+				event, err := decoder.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch value := event.(type) {
+				case bridge.ToolCallCompleted:
+					completedCalls++
+				case bridge.Incomplete:
+					copy := value
+					incomplete = &copy
+				}
+			}
+			if completedCalls != 0 || incomplete == nil || incomplete.Reason != test.wantReason {
+				t.Fatalf("truncated %s calls = %d incomplete = %#v", test.name, completedCalls, incomplete)
 			}
 		})
 	}
@@ -326,6 +550,74 @@ func TestBridgeStreamDecoderEnforcesAggregateLimitAcrossSmallChunks(t *testing.T
 	}
 }
 
+func TestBridgeStreamDecoderChargesFunctionArgumentsBeforeMutation(t *testing.T) {
+	index := 0
+	makeChunk := func(arguments string) ChatCompletionChunk {
+		return ChatCompletionChunk{
+			ID: "chat-function-limit", Model: "m",
+			Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{{
+				Index:    &index,
+				Function: ToolCallFunction{Arguments: arguments},
+			}}}}},
+		}
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{
+		SSE:              SSEDecoderOptions{MaxAggregateBytes: 1 << 20},
+		AllowedToolNames: []string{"lookup"},
+	})
+	first := makeChunk("")
+	first.Choices[0].Delta.ToolCalls[0].ID = "call-function-limit"
+	first.Choices[0].Delta.ToolCalls[0].Function.Name = "lookup"
+	if err := decoder.consumeChunk(first); err != nil {
+		t.Fatal(err)
+	}
+	state := decoder.calls[bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0}]
+	if state == nil {
+		t.Fatal("function call state was not retained")
+	}
+	before := decoder.aggregateBytes
+	fragment := `{"query":"ok"}`
+	decoder.maxAggregateBytes = before + len(fragment)
+	if err := decoder.consumeChunk(makeChunk(fragment)); err != nil {
+		t.Fatalf("argument fragment at exact aggregate boundary = %v", err)
+	}
+	if decoder.aggregateBytes != before+len(fragment) || string(state.arguments) != fragment {
+		t.Fatalf("argument accounting = aggregate %d arguments %q, want %d/%q", decoder.aggregateBytes, state.arguments, before+len(fragment), fragment)
+	}
+
+	decoder.maxAggregateBytes = decoder.aggregateBytes
+	if err := decoder.consumeChunk(makeChunk("!")); !errors.Is(err, ErrStreamAggregateLimit) {
+		t.Fatalf("argument fragment over aggregate boundary = %v, want %v", err, ErrStreamAggregateLimit)
+	}
+	if string(state.arguments) != fragment {
+		t.Fatalf("argument state mutated after rejected fragment = %q", state.arguments)
+	}
+}
+
+func TestBridgeStreamDecoderBoundsNoOpChunksWithoutRecursion(t *testing.T) {
+	const noOpChunk = `data: {"id":"chat-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[]}` + "\n\n"
+	input := strings.Repeat(noOpChunk, 128) + "data: [DONE]\n\n"
+	decoder := NewBridgeStreamDecoder(strings.NewReader(input), BridgeStreamDecoderOptions{
+		SSE: SSEDecoderOptions{MaxAggregateBytes: 256},
+	})
+
+	for events := 0; events < 128; events++ {
+		event, err := decoder.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		failed, ok := event.(bridge.Failed)
+		if !ok {
+			continue
+		}
+		if failed.Code != "stream_limit_exceeded" {
+			t.Fatalf("no-op stream failure = %#v, want stream_limit_exceeded", failed)
+		}
+		return
+	}
+	t.Fatal("no-op stream was not bounded by the aggregate stream limit")
+}
+
 func TestBridgeStreamDecoderChargesRetainedProviderCallIDGrowth(t *testing.T) {
 	makeChunk := func(id, name string) ChatCompletionChunk {
 		index := 0
@@ -378,6 +670,114 @@ func TestBridgeStreamDecoderChargesRetainedProviderCallIDGrowth(t *testing.T) {
 	decoder.maxAggregateBytes = beforeUnique + len(fragment)
 	if err := decoder.consumeChunk(unique); err != nil {
 		t.Fatalf("provider ID fragment at aggregate boundary = %v", err)
+	}
+}
+
+func TestBridgeStreamDecoderBoundsToolIndexesBeforeStateMutation(t *testing.T) {
+	makeChunk := func(index int) ChatCompletionChunk {
+		return ChatCompletionChunk{
+			ID:    "chat-1",
+			Model: "m",
+			Choices: []ChatCompletionChunkChoice{{
+				Index: 0,
+				Delta: ChatMessage{ToolCalls: []ToolCall{{
+					Index: &index,
+				}}},
+			}},
+		}
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{
+		SSE:          SSEDecoderOptions{MaxAggregateBytes: 1 << 20},
+		MaxToolCalls: 2,
+	})
+	for _, index := range []int{0, 1} {
+		if err := decoder.consumeChunk(makeChunk(index)); err != nil {
+			t.Fatalf("tool index %d: %v", index, err)
+		}
+	}
+	if len(decoder.calls) != 2 {
+		t.Fatalf("retained calls = %d, want 2", len(decoder.calls))
+	}
+	if err := decoder.consumeChunk(makeChunk(2)); !errors.Is(err, ErrToolCallLimit) {
+		t.Fatalf("third empty tool index error = %v, want %v", err, ErrToolCallLimit)
+	}
+	if len(decoder.calls) != 2 {
+		t.Fatalf("call count after boundary rejection = %d, want 2", len(decoder.calls))
+	}
+
+	sparse := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{MaxToolCalls: 2})
+	if err := sparse.consumeChunk(makeChunk(1000000)); !errors.Is(err, ErrToolCallLimit) {
+		t.Fatalf("sparse empty tool index error = %v, want %v", err, ErrToolCallLimit)
+	}
+	if len(sparse.calls) != 0 || sparse.started || len(sparse.pending) != 0 {
+		t.Fatalf("sparse rejection mutated decoder state: calls=%d started=%t pending=%d", len(sparse.calls), sparse.started, len(sparse.pending))
+	}
+}
+
+func TestBridgeStreamDecoderBoundsFragmentedProviderToolNamesBeforeAppend(t *testing.T) {
+	index := 0
+	chunk := func(name string) ChatCompletionChunk {
+		return ChatCompletionChunk{Choices: []ChatCompletionChunkChoice{{
+			Index: 0,
+			Delta: ChatMessage{ToolCalls: []ToolCall{{
+				Index:    &index,
+				Function: ToolCallFunction{Name: name},
+			}}},
+		}}}
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{
+		SSE:              SSEDecoderOptions{MaxAggregateBytes: 1 << 20},
+		MaxToolNameBytes: 4,
+		AllowedToolNames: []string{"long"},
+	})
+	if err := decoder.consumeChunk(chunk("lo")); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.consumeChunk(chunk("ng")); err != nil {
+		t.Fatal(err)
+	}
+	state := decoder.calls[bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0}]
+	if state == nil || string(state.name) != "long" {
+		t.Fatalf("name before overflow = %#v", state)
+	}
+	if err := decoder.consumeChunk(chunk("x")); !errors.Is(err, ErrToolCallMetadataLimit) {
+		t.Fatalf("fragmented name overflow error = %v, want %v", err, ErrToolCallMetadataLimit)
+	}
+	if got := string(state.name); got != "long" {
+		t.Fatalf("name mutated after overflow = %q, want long", got)
+	}
+}
+
+func TestBridgeStreamDecoderBoundsFragmentedProviderCallIDsBeforeAppend(t *testing.T) {
+	index := 0
+	chunk := func(id string) ChatCompletionChunk {
+		return ChatCompletionChunk{Choices: []ChatCompletionChunkChoice{{
+			Index: 0,
+			Delta: ChatMessage{ToolCalls: []ToolCall{{
+				Index: &index,
+				ID:    id,
+			}}},
+		}}}
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{
+		SSE:                    SSEDecoderOptions{MaxAggregateBytes: 1 << 20},
+		MaxProviderCallIDBytes: 8,
+	})
+	if err := decoder.consumeChunk(chunk("ab")); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.consumeChunk(chunk("abcdefgh")); err != nil {
+		t.Fatal(err)
+	}
+	state := decoder.calls[bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0}]
+	if state == nil || string(state.providerCallID) != "abcdefgh" {
+		t.Fatalf("provider ID before overflow = %#v", state)
+	}
+	if err := decoder.consumeChunk(chunk("abcdefghi")); !errors.Is(err, ErrToolCallMetadataLimit) {
+		t.Fatalf("provider ID overflow error = %v, want %v", err, ErrToolCallMetadataLimit)
+	}
+	if got := string(state.providerCallID); got != "abcdefgh" {
+		t.Fatalf("provider ID mutated after overflow = %q, want abcdefgh", got)
 	}
 }
 
@@ -800,6 +1200,7 @@ func TestBridgeStreamDecoderRejectsUndeclaredCompletedToolName(t *testing.T) {
 		AllowedToolNames: []string{"lookup"},
 	})
 	var completed, terminals int
+	var leakedToolEvents int
 	var failure bridge.Failed
 	for {
 		event, err := decoder.Next()
@@ -817,9 +1218,13 @@ func TestBridgeStreamDecoderRejectsUndeclaredCompletedToolName(t *testing.T) {
 		case bridge.Failed:
 			failure = value
 		}
+		switch event.StreamEventKind() {
+		case bridge.StreamToolCallStarted, bridge.StreamToolCallMetadataDelta, bridge.StreamToolCallArgumentsDelta, bridge.StreamToolCallCompleted:
+			leakedToolEvents++
+		}
 	}
-	if completed != 0 || terminals != 0 || failure.Code != "upstream_tool_not_declared" {
-		t.Fatalf("undeclared tool result = completed %d terminals %d failure %#v", completed, terminals, failure)
+	if completed != 0 || terminals != 0 || leakedToolEvents != 0 || failure.Code != "upstream_tool_not_declared" {
+		t.Fatalf("undeclared tool result = completed %d terminals %d leaked %d failure %#v", completed, terminals, leakedToolEvents, failure)
 	}
 }
 
@@ -844,14 +1249,10 @@ func TestBridgeStreamDecoderMatchesCheckedFragmentedFixture(t *testing.T) {
 	wantKinds := []bridge.StreamEventKind{
 		bridge.StreamResponseStarted,
 		bridge.StreamTextDelta,
-		bridge.StreamToolCallStarted,
-		bridge.StreamToolCallArgumentsDelta,
-		bridge.StreamToolCallStarted,
-		bridge.StreamToolCallArgumentsDelta,
 		bridge.StreamTextDelta,
-		bridge.StreamToolCallMetadataDelta,
+		bridge.StreamToolCallStarted,
 		bridge.StreamToolCallArgumentsDelta,
-		bridge.StreamToolCallMetadataDelta,
+		bridge.StreamToolCallStarted,
 		bridge.StreamToolCallArgumentsDelta,
 		bridge.StreamToolCallCompleted,
 		bridge.StreamToolCallCompleted,

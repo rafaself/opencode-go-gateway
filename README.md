@@ -46,12 +46,50 @@ runtime metadata. Configuration is loaded from these environment variables:
 | `OPENCODE_GATEWAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 | `OPENCODE_GATEWAY_SHUTDOWN_TIMEOUT` | `10s` | bounded graceful shutdown |
 | `OPENCODE_GATEWAY_READ_HEADER_TIMEOUT` | `5s` | HTTP header deadline |
-| `OPENCODE_GATEWAY_READ_TIMEOUT` | `30s` | HTTP read deadline |
-| `OPENCODE_GATEWAY_WRITE_TIMEOUT` | `30s` | HTTP write deadline |
 | `OPENCODE_GATEWAY_IDLE_TIMEOUT` | `60s` | HTTP idle connection deadline |
+| `OPENCODE_GATEWAY_REQUEST_BODY_READ_TIMEOUT` | `30s` | request-body read phase |
+| `OPENCODE_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `10s` | upstream TCP connect phase |
+| `OPENCODE_GATEWAY_TLS_HANDSHAKE_TIMEOUT` | `10s` | upstream TLS handshake phase |
+| `OPENCODE_GATEWAY_RESPONSE_HEADER_TIMEOUT` | `30s` | upstream response-header phase |
+| `OPENCODE_GATEWAY_STREAM_IDLE_TIMEOUT` | `60s` | maximum silence between upstream bytes, including the first byte |
+| `OPENCODE_GATEWAY_DOWNSTREAM_WRITE_TIMEOUT` | `30s` | each downstream SSE write/flush |
 | `OPENCODE_GATEWAY_MAX_BODY_BYTES` | `16777216` | request body limit |
 | `OPENCODE_GATEWAY_MAX_HEADER_BYTES` | `65536` | request header limit |
+| `OPENCODE_GATEWAY_MAX_INPUT_ITEMS` | `256` | input item count limit |
+| `OPENCODE_GATEWAY_MAX_COLLECTION_ITEMS` | `256` | JSON object-member and array-element limit |
+| `OPENCODE_GATEWAY_MAX_TOOLS` | `128` | declared tool count limit |
+| `OPENCODE_GATEWAY_MAX_SCHEMA_BYTES` | `262144` | aggregate provider schema limit, including the implicit apply_patch wrapper |
+| `OPENCODE_GATEWAY_MAX_SSE_LINE_BYTES` | `262144` | one upstream SSE line limit |
+| `OPENCODE_GATEWAY_MAX_SSE_EVENT_BYTES` | `4194304` | one upstream SSE event limit |
+| `OPENCODE_GATEWAY_MAX_SSE_BUFFERED_BYTES` | `8388608` | upstream SSE/retained stream limit |
+| `OPENCODE_GATEWAY_MAX_SSE_READ_BUFFER_BYTES` | `32768` | SSE decoder read buffer size |
+| `OPENCODE_GATEWAY_MAX_OUTPUT_BYTES` | `16777216` | visible output and tool-argument limit |
+| `OPENCODE_GATEWAY_MAX_TEXT_BYTES` | `8388608` | visible text limit |
+| `OPENCODE_GATEWAY_MAX_REASONING_BYTES` | `8388608` | retained reasoning metadata limit |
+| `OPENCODE_GATEWAY_MAX_TOOL_CALL_ARGUMENT_BYTES` | `1048576` | one tool-argument limit |
+| `OPENCODE_GATEWAY_MAX_PENDING_TURN_BYTES` | `16777216` | one retained continuation limit |
+| `OPENCODE_GATEWAY_MAX_PENDING_RECORDS` | `128` | retained continuation record-count limit |
+| `OPENCODE_GATEWAY_MAX_PENDING_AGGREGATE_BYTES` | `134217728` | retained continuation aggregate-byte limit |
+| `OPENCODE_GATEWAY_MAX_ACTIVE_REQUESTS` | `64` | concurrent request limit; overflow returns `429` |
 | `OPENCODE_GATEWAY_ALLOW_NON_LOOPBACK` | `false` | explicit opt-in for non-loopback binding |
+
+The local listener and request `Host`/`Origin` are loopback-only by default.
+Non-loopback binding requires the explicit opt-in above; requests still receive
+no permissive CORS headers. The provider URL is validated as an HTTPS URL (or a
+loopback HTTP URL for local tests), redirects are disabled, and the transport
+does not use ambient proxy settings. The gateway has no automatic retries: a
+failed request or stream is attempted once. The checked-in generated v0.1
+profile at [`profiles/codex-v0.1.toml`](profiles/codex-v0.1.toml) targets the
+default loopback address and sets both request and stream maximum retries to
+`0`.
+
+Errors before the first downstream SSE frame are JSON envelopes with stable
+`error.type` taxonomy, provider/detail `error.code`, `error.param`, and a safe
+`error.message`. After SSE begins, provider and phase failures are represented
+by exactly one `response.failed`; the gateway never falls back to a second JSON
+error. `Retry-After` is forwarded only when it is a valid numeric delay or HTTP
+date. The timeout settings are phase-specific; no total generation timeout is
+applied while an active stream continues to produce data.
 
 The HTTP contract for the function-tool milestone is:
 

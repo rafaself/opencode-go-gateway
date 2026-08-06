@@ -182,6 +182,89 @@ func TestStreamSessionEnforcesAggregateLimitAcrossManySmallChunks(t *testing.T) 
 	}
 }
 
+func TestStreamSessionEnforcesOutputTextReasoningLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		options StreamSessionOptions
+		prepare func(*StreamSession) error
+		event   bridge.StreamEvent
+	}{
+		{
+			name:    "text",
+			options: StreamSessionOptions{MaxTextBytes: 3, MaxOutputBytes: 64},
+			event:   bridge.TextDelta{ChoiceIndex: 0, Text: "four"},
+		},
+		{
+			name:    "reasoning",
+			options: StreamSessionOptions{MaxReasoningBytes: 3, MaxOutputBytes: 64},
+			event:   bridge.ReasoningDelta{ChoiceIndex: 0, Text: "four"},
+		},
+		{
+			name:    "tool arguments",
+			options: StreamSessionOptions{MaxOutputBytes: 3, MaxToolCallArgumentBytes: 64},
+			prepare: func(session *StreamSession) error {
+				return session.Handle(bridge.ToolCallStarted{
+					Key:    bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0},
+					Kind:   bridge.ToolFunction,
+					CallID: "call",
+					Name:   "lookup",
+				})
+			},
+			event: bridge.ToolCallArgumentsDelta{
+				Key:       bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0},
+				Arguments: "four",
+			},
+		},
+		{
+			name:    "tool completion arguments",
+			options: StreamSessionOptions{MaxOutputBytes: 3, MaxToolCallArgumentBytes: 64},
+			prepare: func(session *StreamSession) error {
+				return session.Handle(bridge.ToolCallStarted{
+					Key:    bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0},
+					Kind:   bridge.ToolFunction,
+					CallID: "call",
+					Name:   "lookup",
+				})
+			},
+			event: bridge.ToolCallCompleted{
+				Key:       bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 0},
+				Kind:      bridge.ToolFunction,
+				CallID:    "call",
+				Name:      "lookup",
+				Arguments: "four",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.options.ResponseID = "resp_separate_limit"
+			test.options.CreatedAt = time.Unix(0, 0).UTC()
+			test.options.Clock = func() time.Time { return time.Unix(0, 0).UTC() }
+			session, err := NewStreamSession(recorder, test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				if err := test.prepare(session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := session.Handle(test.event); !errors.Is(err, ErrStreamLimit) {
+				t.Fatalf("limit error = %v, want ErrStreamLimit", err)
+			}
+			events := decodeResponseSSE(t, recorder.Body.Bytes())
+			if terminalCount(events) != 1 || events[len(events)-1]["type"] != "response.failed" {
+				t.Fatalf("terminal events = %#v", events)
+			}
+			errorObject := events[len(events)-1]["response"].(map[string]any)["error"].(map[string]any)
+			if errorObject["type"] != "request_too_large" || errorObject["code"] != "stream_limit_exceeded" {
+				t.Fatalf("limit error payload = %#v", errorObject)
+			}
+		})
+	}
+}
+
 func TestStreamSessionAggregateLimitCoversReasoningAndToolState(t *testing.T) {
 	tests := map[string]func(*StreamSession) error{
 		"reasoning": func(session *StreamSession) error {
