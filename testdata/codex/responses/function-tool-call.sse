@@ -10,4 +10,6 @@ data: {"type":"response.function_call_arguments.done","item_id":"fc_0","output_i
 
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_0","type":"function_call","status":"completed","call_id":"call_0","name":"exec_command","arguments":"{\"cmd\":\"true\"}"},"sequence_number":5}
 
-data: {"type":"response.completed","response":{"id":"resp_function","object":"response","created_at":0,"status":"completed","completed_at":0,"output":[{"id":"fc_0","type":"function_call","status":"completed","call_id":"call_0","name":"exec_command","arguments":"{\"cmd\":\"true\"}"}]},"sequence_number":6}
+data: {"type":"response.completed","response":{"id":"resp_function","object":"response","created_at":0,"status":"completed","completed_at":0,"error":null,"output":[{"id":"fc_0","type":"function_call","status":"completed","call_id":"call_0","name":"exec_command","arguments":"{\"cmd\":\"true\"}"}]},"sequence_number":6}
+
+: fixture terminator

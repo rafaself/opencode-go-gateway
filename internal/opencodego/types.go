@@ -1,9 +1,8 @@
 // Package opencodego contains the OpenCode Go Chat Completions wire client.
 //
 // Bridge values are translated into provider-specific messages here. The
-// package intentionally does not import internal/codex and does not decode
-// SSE; callers own a successful response body and the next milestone performs
-// incremental stream translation.
+// package intentionally does not import internal/codex; it owns provider SSE
+// decoding and emits semantic stream events for the Responses adapter.
 package opencodego
 
 import (
@@ -169,7 +168,12 @@ type Usage struct {
 	TotalTokens             int                      `json:"total_tokens"`
 	PromptCacheHitTokens    int                      `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens   int                      `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type CompletionTokensDetails struct {

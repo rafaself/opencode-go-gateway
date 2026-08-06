@@ -6,7 +6,7 @@ data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_te
 
 data: {"type":"response.content_part.added","item_id":"msg_text","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]},"sequence_number":3}
 
-data: {"type":"response.output_text.delta","item_id":"msg_text","output_index":0,"content_index":0,"delta":"capture acknowledged","sequence_number":4}
+data: {"type":"response.output_text.delta","item_id":"msg_text","output_index":0,"content_index":0,"delta":"capture acknowledged","logprobs":[],"sequence_number":4}
 
 data: {"type":"response.output_text.done","item_id":"msg_text","output_index":0,"content_index":0,"text":"capture acknowledged","sequence_number":5}
 
@@ -15,3 +15,5 @@ data: {"type":"response.content_part.done","item_id":"msg_text","output_index":0
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_text","status":"completed","type":"message","role":"assistant","content":[{"type":"output_text","text":"capture acknowledged","annotations":[]}]},"sequence_number":7}
 
 data: {"type":"response.completed","response":{"id":"resp_text","object":"response","created_at":0,"status":"completed","completed_at":0,"error":null,"output":[{"id":"msg_text","status":"completed","type":"message","role":"assistant","content":[{"type":"output_text","text":"capture acknowledged","annotations":[]}]}]},"sequence_number":8}
+
+: fixture terminator

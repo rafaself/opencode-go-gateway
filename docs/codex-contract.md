@@ -151,3 +151,8 @@ Cancellation is represented by `cancellation-request.json`: the request was reco
 6. Update the version recorded in this document and run `go test ./...`.
 
 The fixture tests intentionally fail if a request field is not classified or if an SSE fixture is not valid JSON-per-event with increasing sequence numbers.
+
+The incremental provider decoder and per-request Responses session introduced
+by M4 are documented in [Streaming boundaries](codex-streaming.md). They keep
+provider chunks, bridge semantics, and Responses wire state in separate
+packages so issue #7 can orchestrate them without generic map plumbing.

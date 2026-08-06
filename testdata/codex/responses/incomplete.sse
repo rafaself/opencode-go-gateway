@@ -2,4 +2,6 @@ data: {"type":"response.created","response":{"id":"resp_incomplete","object":"re
 
 data: {"type":"response.in_progress","response":{"id":"resp_incomplete","object":"response","created_at":0,"status":"in_progress","output":[]},"sequence_number":1}
 
-data: {"type":"response.incomplete","response":{"id":"resp_incomplete","object":"response","created_at":0,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]},"sequence_number":2}
+data: {"type":"response.incomplete","response":{"id":"resp_incomplete","object":"response","created_at":0,"status":"incomplete","completed_at":0,"incomplete_details":{"reason":"max_output_tokens"},"output":[]},"sequence_number":2}
+
+: fixture terminator
