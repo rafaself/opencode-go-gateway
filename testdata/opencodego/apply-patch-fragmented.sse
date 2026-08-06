@@ -1,0 +1,9 @@
+data: {"id":"provider-apply-patch","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"provider-custom","type":"function","function":{"name":"__ocg_apply_patch","arguments":"{\"in"}}]},"finish_reason":null}]}
+
+data: {"id":"provider-apply-patch","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"put\":\"*** Begin Patch\\n*** End Patch\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"provider-apply-patch","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+: fixture terminator

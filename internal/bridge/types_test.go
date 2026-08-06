@@ -55,3 +55,29 @@ func TestInputAndToolUnionsRemainExplicit(t *testing.T) {
 		t.Fatalf("tool union = %T", tool)
 	}
 }
+
+func TestToolRegistryIsScopedAndDeterministic(t *testing.T) {
+	registry, err := NewToolRegistry([]ToolRegistration{
+		{Kind: ToolCustom, InboundName: "apply_patch", UpstreamName: "__ocg_apply_patch", WrapperField: "input"},
+		{Kind: ToolCustom, InboundName: "custom_other", UpstreamName: "__ocg_custom_other", WrapperField: "input"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := registry.Inbound("apply_patch"); !ok || got.UpstreamName != "__ocg_apply_patch" {
+		t.Fatalf("inbound registration = %#v, %v", got, ok)
+	}
+	if got, ok := registry.Upstream("__ocg_apply_patch"); !ok || got.InboundName != "apply_patch" {
+		t.Fatalf("upstream registration = %#v, %v", got, ok)
+	}
+	registrations := registry.Registrations()
+	if len(registrations) != 2 || registrations[0].InboundName != "apply_patch" || registrations[1].InboundName != "custom_other" {
+		t.Fatalf("registrations = %#v", registrations)
+	}
+	if _, err := NewToolRegistry([]ToolRegistration{
+		{Kind: ToolCustom, InboundName: "apply_patch", UpstreamName: "__ocg_apply_patch", WrapperField: "input"},
+		{Kind: ToolCustom, InboundName: "other", UpstreamName: "__ocg_apply_patch", WrapperField: "input"},
+	}); err == nil {
+		t.Fatal("duplicate upstream registration was accepted")
+	}
+}

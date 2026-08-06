@@ -21,6 +21,11 @@ type Request struct {
 	Tools              []Tool            `json:"tools"`
 	ToolChoice         ToolChoice        `json:"tool_choice"`
 	Generation         GenerationOptions `json:"generation"`
+	// ToolRegistry is request-scoped adapter state. It is deliberately not
+	// serialized as part of the bridge request or shared between requests.
+	// Provider adapters may attach it when a continuation chain needs stable
+	// tool-name translations.
+	ToolRegistry *ToolRegistry `json:"-"`
 }
 
 // GenerationOptions contains only options with a shared semantic meaning in
@@ -215,6 +220,29 @@ type FunctionTool struct {
 
 func (FunctionTool) Kind() ToolKind { return ToolFunction }
 func (FunctionTool) isTool()        {}
+
+// CustomTool is the Responses custom-tool declaration. The current gateway
+// translates only the text/freeform apply_patch declaration at the provider
+// boundary; retaining the explicit union here prevents it from being
+// mistaken for a generic function schema.
+type CustomTool struct {
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Format      CustomToolFormat `json:"format"`
+}
+
+func (CustomTool) Kind() ToolKind { return ToolCustom }
+func (CustomTool) isTool()        {}
+
+type CustomToolFormatKind string
+
+const (
+	CustomToolFormatText CustomToolFormatKind = "text"
+)
+
+type CustomToolFormat struct {
+	Kind CustomToolFormatKind `json:"kind"`
+}
 
 // DeferredTool identifies a known provider tool that is intentionally held
 // out of translation until a later milestone.

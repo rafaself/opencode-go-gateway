@@ -24,6 +24,9 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 	if err := validateProviderModel(model); err != nil {
 		return ChatCompletionRequest{}, err
 	}
+	if err := validateToolNameCollisions(request.Tools); err != nil {
+		return ChatCompletionRequest{}, err
+	}
 	if !request.Generation.Stream {
 		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
@@ -49,7 +52,15 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 		result.Messages = append(result.Messages, ChatMessage{Role: "system", Content: &content})
 	}
 
-	messages, err := mapInputItems(request.Input)
+	registry := request.ToolRegistry
+	var err error
+	if registry == nil && hasCustomToolDeclaration(request.Tools) {
+		registry, err = NewToolRegistry(request)
+		if err != nil {
+			return ChatCompletionRequest{}, err
+		}
+	}
+	messages, err := mapInputItems(request.Input, registry)
 	if err != nil {
 		return ChatCompletionRequest{}, err
 	}
@@ -64,6 +75,20 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 	toolNames := make(map[string]struct{}, len(request.Tools))
 	schemaBytes := 0
 	for _, tool := range request.Tools {
+		if custom, err := customToolDeclaration(tool, registry); custom {
+			if err != nil {
+				return ChatCompletionRequest{}, err
+			}
+			continue
+		}
+		if deferred, ok := tool.(bridge.DeferredTool); ok {
+			if err := ValidateCapturedDeferredTool(deferred); err != nil {
+				return ChatCompletionRequest{}, err
+			}
+			if registry != nil {
+				continue
+			}
+		}
 		mapped, err := mapTool(tool)
 		if err != nil {
 			return ChatCompletionRequest{}, err
@@ -78,6 +103,29 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 		}
 		schemaBytes += len(mapped.Function.Parameters)
 		result.Tools = append(result.Tools, mapped)
+	}
+	if registry != nil {
+		for _, registration := range registry.Registrations() {
+			if registration.Kind != bridge.ToolCustom {
+				continue
+			}
+			if err := validateCustomToolRegistration(registration); err != nil {
+				return ChatCompletionRequest{}, err
+			}
+			if _, exists := toolNames[registration.UpstreamName]; exists {
+				return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+			}
+			mapped := applyPatchTool()
+			if len(mapped.Function.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
+				return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+			}
+			toolNames[mapped.Function.Name] = struct{}{}
+			result.Tools = append(result.Tools, mapped)
+			schemaBytes += len(mapped.Function.Parameters)
+		}
+	}
+	if len(result.Tools) > bridge.DefaultMaxFunctionTools {
+		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
 
 	if request.Generation.Reasoning.Effort != "" {
@@ -106,13 +154,13 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 	return result, nil
 }
 
-func mapInputItems(items []bridge.InputItem) ([]ChatMessage, error) {
+func mapInputItems(items []bridge.InputItem, registry *bridge.ToolRegistry) ([]ChatMessage, error) {
 	messages := make([]ChatMessage, 0, len(items))
 	for index := 0; index < len(items); {
 		if isToolCallInput(items[index]) {
 			calls := make([]ToolCall, 0, 1)
 			for index < len(items) && isToolCallInput(items[index]) {
-				call, err := mapToolCallInput(items[index])
+				call, err := mapToolCallInput(items[index], registry)
 				if err != nil {
 					return nil, err
 				}
@@ -162,16 +210,21 @@ func mapInputItem(item bridge.InputItem) (ChatMessage, error) {
 	}
 }
 
-func mapToolCallInput(item bridge.InputItem) (ToolCall, error) {
+func mapToolCallInput(item bridge.InputItem, registry *bridge.ToolRegistry) (ToolCall, error) {
 	var callID, name, arguments string
 	switch item := item.(type) {
 	case bridge.FunctionCall:
 		callID, name, arguments = item.CallID, item.Name, item.Arguments
 	case bridge.CustomToolCall:
-		// Chat Completions has no custom-tool union. A prior custom call is
-		// represented as a function call with its exact input as arguments so
-		// continuation work can preserve its correlation and bytes.
-		callID, name, arguments = item.CallID, item.Name, item.Input
+		registration, ok := registry.Inbound(item.Name)
+		if !ok || validateCustomToolRegistration(registration) != nil {
+			return ToolCall{}, providerError(ErrorInvalidRequest, nil)
+		}
+		wrapped, err := wrapApplyPatchInput(item.Input)
+		if err != nil {
+			return ToolCall{}, err
+		}
+		callID, name, arguments = item.CallID, registration.UpstreamName, wrapped
 	default:
 		return ToolCall{}, providerError(ErrorInvalidRequest, nil)
 	}

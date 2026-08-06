@@ -8,7 +8,7 @@ The checked-in request fixtures were normalized from the installed Codex CLI ver
 
 The current request shape observed from Codex 0.146.0 includes `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `stream`, `store`, `include`, `prompt_cache_key`, and `client_metadata`. The request fixtures also cover the function-call and tool-result item shapes that occur across a tool turn.
 
-Observed input item types are `message`, `function_call`, `function_call_output`, `custom_tool_call`, and `custom_tool_call_output`. Observed request tool types are `function`, `namespace`, and `web_search`; the latter two are explicitly deferred in the field policy. The `apply_patch` custom call is represented by `custom_tool_call` response items and their follow-up result items.
+Observed input item types are `message`, `function_call`, `function_call_output`, `custom_tool_call`, and `custom_tool_call_output`. Observed request tool types are `function`, `namespace`, and `web_search`; the latter two remain non-executing metadata at the gateway boundary. The `apply_patch` capability is not declared as a generic `type=custom` request tool in the checked-in #2 capture: Codex enables it from model capability metadata, where the selected model entry uses `"apply_patch_tool_type": "freeform"`. Its call and result are represented by `custom_tool_call` and `custom_tool_call_output` items.
 
 ## Run a local capture
 
@@ -64,7 +64,7 @@ The transient output directory `testdata/codex/captures/` is ignored by Git. Rev
 | `model` | translate | observed |
 | `instructions` | translate | observed |
 | `input` | translate | observed; message and tool-result items are covered |
-| `tools` | translate | observed; function, namespace, and web-search declarations are covered |
+| `tools` | translate | observed; function, custom, namespace, and web-search declarations are covered |
 | `tool_choice` | translate | observed |
 | `parallel_tool_calls` | translate | observed |
 | `reasoning` | translate | observed |
@@ -80,9 +80,9 @@ The transient output directory `testdata/codex/captures/` is ignored by Git. Rev
 | `background` | defer | not part of the first vertical slice |
 | unknown fields | reject | regression test fails until explicitly classified |
 
-Input and tool item types are classified in the `item_types` and `tool_types` maps in `testdata/codex/field-policy.json`. Function calls and their outputs, including the custom `apply_patch` call shape, are translated; Codex namespaces and standalone web search are deferred until a later vertical slice.
+Input and tool item types are classified in the `item_types` and `tool_types` maps in `testdata/codex/field-policy.json`. Function calls and their outputs, including the custom `apply_patch` call shape, are translated; namespace and standalone web-search declarations remain explicitly non-executing metadata.
 
-The capture server records unknown fields so that they cannot disappear during investigation. The M2 decoder in `internal/codex` applies the same policy before creating `internal/bridge` values: unknown fields and deferred top-level fields fail with stable structured errors, while the observed deferred `namespace` and `web_search` declarations are represented as explicit `bridge.DeferredTool` values rather than untyped provider maps. Compatibility no-op fields are type-checked and then omitted from the bridge model. `stream` must be present and `true` because the initial bridge milestone does not implement non-streaming Responses.
+The capture server records unknown fields so that they cannot disappear during investigation. The M2 decoder in `internal/codex` applies the same policy before creating `internal/bridge` values: unknown fields and deferred top-level fields fail with stable structured errors, while the observed `namespace` and `web_search` declarations are represented as explicit `bridge.DeferredTool` values rather than untyped provider maps. For the exact #2 request, the server accepts those two declarations as no-op metadata and omits them from the provider request; it does not execute or generically translate deferred tools. Compatibility no-op fields are type-checked and then omitted from the bridge model. `stream` must be present and `true` because the initial bridge milestone does not implement non-streaming Responses.
 
 ## M2 request boundary
 
@@ -129,6 +129,74 @@ response.custom_tool_call_input.done
 response.output_item.done
 response.completed
 ```
+
+## Codex custom apply_patch boundary (#9)
+
+The exact contract is established by `testdata/codex/requests/apply-patch-request.json`, `testdata/codex/requests/custom-tool-result-request.json`, and `testdata/codex/responses/custom-tool-call.sse`, together with the current [Responses custom-tool definition](https://platform.openai.com/docs/guides/function-calling#custom-tools) and [streaming event reference](https://developers.openai.com/api/reference/resources/responses/streaming-events). The request tool list contains ordinary function tools plus the observed `namespace`/`web_search` metadata; it does not contain a generic custom-tool declaration. The Codex model catalog selects the freeform capability with:
+
+```json
+{"apply_patch_tool_type":"freeform"}
+```
+
+When the capability is represented as an explicit Responses tool declaration,
+the current custom-tool shape is:
+
+```json
+{"type":"custom","name":"apply_patch","description":"<tool description>","format":{"type":"text"}}
+```
+
+`format.type = "text"` means unconstrained freeform text; grammar formats
+are not part of this apply_patch adapter.
+
+Codex-facing input and result items are exactly these validated unions:
+
+```json
+{"type":"custom_tool_call","call_id":"...","name":"apply_patch","input":"<freeform patch text>"}
+{"type":"custom_tool_call_output","call_id":"...","output":"<result text>"}
+```
+
+The OpenCode Go Chat Completions endpoint has only function tools, so the
+provider adapter translates the implicit custom tool for one request or
+continuation chain into this strict synthetic declaration:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "__ocg_apply_patch",
+    "description": "Apply the exact patch text supplied by Codex to the current workspace.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "input": {"type": "string", "description": "The exact freeform apply_patch text, including all newlines and markers."}
+      },
+      "required": ["input"],
+      "additionalProperties": false
+    }
+  }
+}
+```
+
+The wrapper is an adapter envelope only. Its decoded `input` string is kept
+byte-for-byte (including newlines, Unicode, quotes, backslashes, and empty
+input), bounded by an exclusive 512 KiB ceiling (512 KiB and larger are
+rejected), and never applied, validated as a filesystem patch, or logged. The registry is request-scoped; a user
+function named `apply_patch` or using the reserved `__ocg_` namespace is
+rejected deterministically. Fragmented provider function arguments are
+buffered until the complete wrapper object is available, then only a string
+`input` field is accepted. The synthetic name never crosses back into
+Responses output.
+
+The decoded call emits `response.output_item.added`,
+`response.custom_tool_call_input.delta`,
+`response.custom_tool_call_input.done`, and `response.output_item.done` with
+the public `apply_patch` name, original call correlation, and stable output
+index. Malformed, missing, duplicate, or non-string wrapper input produces a
+safe `response.failed` event; the gateway does not execute the call. The
+checked-in provider fixture is
+`testdata/opencodego/apply-patch-fragmented.sse`, and the HTTP integration
+test asserts the actual downstream SSE bytes and ordering.
 
 Terminal fixtures cover `response.completed`, `response.incomplete`, and `response.failed`. The public [Responses streaming event reference](https://developers.openai.com/api/reference/resources/responses/streaming-events) defines the event fields, including `sequence_number`, response/item IDs, `output_index`, and `content_index`.
 

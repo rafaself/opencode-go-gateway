@@ -6,7 +6,7 @@
     "model": {"policy": "translate", "observed": true, "notes": "Selects the upstream model."},
     "instructions": {"policy": "translate", "observed": true, "notes": "Developer/system instruction block; prompt content is always redacted in fixtures."},
     "input": {"policy": "translate", "observed": true, "notes": "Conversation and tool-result items."},
-    "tools": {"policy": "translate", "observed": true, "notes": "Function, namespace, and web-search tool declarations."},
+    "tools": {"policy": "translate", "observed": true, "notes": "Function, custom, namespace, and web-search tool declarations."},
     "tool_choice": {"policy": "translate", "observed": true, "notes": "Tool selection policy."},
     "parallel_tool_calls": {"policy": "translate", "observed": true, "notes": "Controls whether multiple tool calls may be emitted."},
     "reasoning": {"policy": "translate", "observed": true, "notes": "Reasoning summary/encrypted-content settings."},
@@ -31,6 +31,7 @@
   },
   "tool_types": {
     "function": "translate",
+    "custom": "translate",
     "namespace": "defer",
     "web_search": "defer"
   }

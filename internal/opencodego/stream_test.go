@@ -1,7 +1,9 @@
 package opencodego
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -385,6 +387,251 @@ func TestBridgeStreamDecoderReconstructsInterleavedFragmentedCallsAndText(t *tes
 	}
 }
 
+func TestBridgeStreamDecoderUnwrapsFragmentedApplyPatchWrapper(t *testing.T) {
+	patch := "*** Begin Patch\n*** Update File: café.txt\n+Olá, 世界\n*** End Patch"
+	toolIndex := 0
+	finishReason := "tool_calls"
+	wrapped, err := json.Marshal(struct {
+		Input string `json:"input"`
+	}{Input: patch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstArgument := string(wrapped[:4])
+	secondArgument := string(wrapped[4:])
+	firstCall := ToolCall{
+		Index: &toolIndex,
+		ID:    "provider-call",
+		Type:  "function",
+		Function: ToolCallFunction{
+			Name:      ReservedToolNamePrefix,
+			Arguments: firstArgument,
+		},
+	}
+	secondCall := ToolCall{
+		Index: &toolIndex,
+		Function: ToolCallFunction{
+			Name:      ApplyPatchToolName,
+			Arguments: secondArgument,
+		},
+	}
+	chunks := []ChatCompletionChunk{
+		{
+			ID: "chat-apply", Created: 1, Model: "deepseek-v4-flash",
+			Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{firstCall}}}},
+		},
+		{
+			ID: "chat-apply", Created: 1, Model: "deepseek-v4-flash",
+			Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{secondCall}}}},
+		},
+		{
+			ID: "chat-apply", Created: 1, Model: "deepseek-v4-flash",
+			Choices: []ChatCompletionChunkChoice{{Index: 0, FinishReason: &finishReason}},
+		},
+	}
+	input := providerChunksInput(t, chunks...)
+	request := minimalRequest()
+	registry, err := NewToolRegistry(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(input), BridgeStreamDecoderOptions{ToolRegistry: registry})
+	var events []bridge.StreamEvent
+	for {
+		event, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	var started bridge.ToolCallStarted
+	var argumentDeltas []bridge.ToolCallArgumentsDelta
+	var completed bridge.ToolCallCompleted
+	for _, event := range events {
+		switch value := event.(type) {
+		case bridge.ToolCallStarted:
+			started = value
+		case bridge.ToolCallArgumentsDelta:
+			argumentDeltas = append(argumentDeltas, value)
+		case bridge.ToolCallCompleted:
+			completed = value
+		}
+		if strings.Contains(fmt.Sprintf("%#v", event), ApplyPatchUpstreamName) {
+			t.Fatalf("synthetic function name leaked through bridge event: %#v", event)
+		}
+	}
+	if started.Kind != bridge.ToolCustom || started.Name != ApplyPatchToolName || started.CallID != "provider-call" {
+		t.Fatalf("custom start = %#v", started)
+	}
+	if len(argumentDeltas) != 1 || argumentDeltas[0].Arguments != patch {
+		t.Fatalf("custom argument deltas = %#v, want one exact patch", argumentDeltas)
+	}
+	if completed.Kind != bridge.ToolCustom || completed.CallID != started.CallID || completed.Name != ApplyPatchToolName || completed.Arguments != patch {
+		t.Fatalf("custom completion = %#v", completed)
+	}
+	if _, ok := events[len(events)-1].(bridge.Completed); !ok {
+		t.Fatalf("last event = %#v", events[len(events)-1])
+	}
+}
+
+func providerChunksInput(t *testing.T, chunks ...ChatCompletionChunk) string {
+	t.Helper()
+	var lines []string
+	for _, chunk := range chunks {
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, "data: "+string(encoded))
+	}
+	lines = append(lines, "data: [DONE]")
+	return strings.Join(lines, "\n\n") + "\n\n"
+}
+
+func TestBridgeStreamDecoderRejectsMalformedApplyPatchWrappers(t *testing.T) {
+	for name, arguments := range map[string]string{
+		"missing":    `{"other":"patch"}`,
+		"non-string": `{"input":42}`,
+		"duplicate":  `{"input":"one","input":"two"}`,
+		"trailing":   `{"input":"patch"} {}`,
+		"malformed":  `{"input":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := `data: {"id":"chat-apply","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"__ocg_apply_patch","arguments":"` + escapeJSON(arguments) + `"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" + "data: [DONE]\n\n"
+			request := minimalRequest()
+			registry, err := NewToolRegistry(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder := NewBridgeStreamDecoder(strings.NewReader(input), BridgeStreamDecoderOptions{ToolRegistry: registry})
+			failed := collectLastFailed(t, decoder)
+			if failed.Code != "upstream_custom_tool_invalid" {
+				t.Fatalf("failure = %#v, want upstream_custom_tool_invalid", failed)
+			}
+		})
+	}
+}
+
+func TestBridgeStreamDecoderEnforcesDedicatedApplyPatchInputLimit(t *testing.T) {
+	const marker = "sensitive-patch-marker"
+	for _, test := range []struct {
+		name string
+		size int
+		ok   bool
+	}{
+		{name: "one byte below", size: DefaultMaxApplyPatchInputBytes - 1, ok: true},
+		{name: "exact boundary", size: DefaultMaxApplyPatchInputBytes},
+		{name: "one byte above", size: DefaultMaxApplyPatchInputBytes + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := strings.Repeat("x", test.size-len(marker)) + marker
+			wrapper, err := json.Marshal(struct {
+				Input string `json:"input"`
+			}{Input: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			toolIndex := 0
+			chunks := make([]ChatCompletionChunk, 0, (len(wrapper)+32767)/32768+2)
+			for offset := 0; offset < len(wrapper); {
+				end := offset + 32768
+				if end > len(wrapper) {
+					end = len(wrapper)
+				}
+				call := ToolCall{
+					Index: &toolIndex,
+					Function: ToolCallFunction{
+						Arguments: string(wrapper[offset:end]),
+					},
+				}
+				if offset == 0 {
+					call.ID = "limit-call"
+					call.Type = "function"
+					call.Function.Name = ApplyPatchUpstreamName
+				}
+				chunks = append(chunks, ChatCompletionChunk{
+					ID:      "chat-limit",
+					Created: 1,
+					Model:   "deepseek-v4-flash",
+					Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: ChatMessage{ToolCalls: []ToolCall{call}}}},
+				})
+				offset = end
+			}
+			finishReason := "tool_calls"
+			chunks = append(chunks, ChatCompletionChunk{
+				ID: "chat-limit", Created: 1, Model: "deepseek-v4-flash",
+				Choices: []ChatCompletionChunkChoice{{Index: 0, FinishReason: &finishReason}},
+			})
+			registry, err := NewToolRegistry(minimalRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder := NewBridgeStreamDecoder(strings.NewReader(providerChunksInput(t, chunks...)), BridgeStreamDecoderOptions{ToolRegistry: registry})
+			var events []bridge.StreamEvent
+			for {
+				event, err := decoder.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				events = append(events, event)
+			}
+			if test.ok {
+				completed, ok := events[len(events)-1].(bridge.Completed)
+				if !ok || completed.Reason != "tool_calls" {
+					t.Fatalf("terminal event = %#v", events[len(events)-1])
+				}
+				for _, event := range events {
+					if call, ok := event.(bridge.ToolCallCompleted); ok && call.Name == ApplyPatchToolName {
+						if len(call.Arguments) != test.size || !strings.HasSuffix(call.Arguments, marker) {
+							t.Fatalf("completed input length/content = %d/%q", len(call.Arguments), call.Arguments[len(call.Arguments)-len(marker):])
+						}
+					}
+				}
+				return
+			}
+			failed, ok := events[len(events)-1].(bridge.Failed)
+			if !ok || failed.Code != "stream_limit_exceeded" {
+				t.Fatalf("limit terminal event = %#v", events[len(events)-1])
+			}
+			if strings.Contains(fmt.Sprintf("%#v", failed), marker) {
+				t.Fatal("input marker leaked through the stream failure")
+			}
+		})
+	}
+}
+
+func escapeJSON(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded[1 : len(encoded)-1])
+}
+
+func collectLastFailed(t *testing.T, decoder *BridgeStreamDecoder) bridge.Failed {
+	t.Helper()
+	var failed bridge.Failed
+	for {
+		event, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value, ok := event.(bridge.Failed); ok {
+			failed = value
+		}
+	}
+	return failed
+}
+
 func TestBridgeStreamDecoderKeepsSyntheticIDWhenProviderIDArrivesLater(t *testing.T) {
 	input := strings.Join([]string{
 		`data: {"id":"chat-1","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"look","arguments":"["}}]},"finish_reason":null}]}`,
@@ -529,6 +776,53 @@ func TestBridgeStreamDecoderMatchesCheckedFragmentedFixture(t *testing.T) {
 	}
 	if completed[1].CallID != "call_0_1" || completed[1].Name != "other_tool" || completed[1].Arguments != "not-json" {
 		t.Fatalf("fixture second call = %#v", completed[1])
+	}
+}
+
+func TestBridgeStreamDecoderMatchesCheckedApplyPatchFixture(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "testdata", "opencodego", "apply-patch-fragmented.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewToolRegistry(minimalRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(string(fixture)), BridgeStreamDecoderOptions{ToolRegistry: registry})
+	var events []bridge.StreamEvent
+	for {
+		event, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	var completed bridge.ToolCallCompleted
+	var kinds []bridge.StreamEventKind
+	for _, event := range events {
+		kinds = append(kinds, event.StreamEventKind())
+		if value, ok := event.(bridge.ToolCallCompleted); ok {
+			completed = value
+		}
+		if strings.Contains(fmt.Sprintf("%#v", event), ApplyPatchUpstreamName) {
+			t.Fatalf("synthetic name leaked through bridge event: %#v", event)
+		}
+	}
+	wantKinds := []bridge.StreamEventKind{
+		bridge.StreamResponseStarted,
+		bridge.StreamToolCallStarted,
+		bridge.StreamToolCallArgumentsDelta,
+		bridge.StreamToolCallCompleted,
+		bridge.StreamCompleted,
+	}
+	if !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("apply_patch fixture event kinds = %v, want %v", kinds, wantKinds)
+	}
+	if completed.Kind != bridge.ToolCustom || completed.CallID != "provider-custom" || completed.Name != ApplyPatchToolName || completed.Arguments != "*** Begin Patch\n*** End Patch" {
+		t.Fatalf("apply_patch fixture completion = %#v", completed)
 	}
 }
 

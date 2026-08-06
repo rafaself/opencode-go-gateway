@@ -10,10 +10,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 	"github.com/rafaself/opencode-go-gateway/internal/opencodego"
@@ -202,8 +204,8 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 			return
 		}
 		tools, ok := providerRequest["tools"].([]any)
-		if !ok || len(tools) != 2 {
-			http.Error(writer, "function tools missing", http.StatusBadRequest)
+		if !ok || len(tools) != 3 {
+			http.Error(writer, "function and custom tools missing", http.StatusBadRequest)
 			return
 		}
 		seenNames := map[string]bool{}
@@ -212,8 +214,12 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 			function := tool["function"].(map[string]any)
 			name, _ := function["name"].(string)
 			seenNames[name] = true
-			if tool["type"] != "function" || (name != "lookup" && name != "other_tool") {
+			if tool["type"] != "function" || (name != "lookup" && name != "other_tool" && name != opencodego.ApplyPatchUpstreamName) {
 				http.Error(writer, "function tool changed", http.StatusBadRequest)
+				return
+			}
+			if name == opencodego.ApplyPatchUpstreamName && function["strict"] != true {
+				http.Error(writer, "custom wrapper is not strict", http.StatusBadRequest)
 				return
 			}
 			if name == "lookup" {
@@ -229,7 +235,7 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 				}
 			}
 		}
-		if !seenNames["lookup"] || !seenNames["other_tool"] {
+		if !seenNames["lookup"] || !seenNames["other_tool"] || !seenNames[opencodego.ApplyPatchUpstreamName] {
 			http.Error(writer, "function tools changed", http.StatusBadRequest)
 			return
 		}
@@ -321,6 +327,250 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 	}
 	if strings.Contains(logs.String(), "not-json") || strings.Contains(logs.String(), providerKey) {
 		t.Fatalf("tool data or provider credential appeared in logs: %s", logs.String())
+	}
+}
+
+func TestResponsesStreamsCheckedApplyPatchFixtureThroughProvider(t *testing.T) {
+	patch := "*** Begin Patch\n*** Update File: café.txt\n+Olá, \"world\" \\ literal\n*** End Patch"
+	wrapper, err := json.Marshal(struct {
+		Input string `json:"input"`
+	}{Input: patch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragments := make([]string, 0, (len(wrapper)+2)/3)
+	for offset := 0; offset < len(wrapper); {
+		end := offset + 3
+		if end > len(wrapper) {
+			end = len(wrapper)
+		}
+		for end < len(wrapper) && !utf8.RuneStart(wrapper[end]) {
+			end++
+		}
+		fragments = append(fragments, string(wrapper[offset:end]))
+		offset = end
+	}
+	providerStream := providerToolStream(t, opencodego.ApplyPatchUpstreamName, "provider-custom-call", fragments...)
+
+	var providerRequest map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&providerRequest); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		tools, ok := providerRequest["tools"].([]any)
+		if !ok || len(tools) != 2 {
+			http.Error(writer, "fixture tools were not translated", http.StatusBadRequest)
+			return
+		}
+		seen := make(map[string]map[string]any)
+		for _, rawTool := range tools {
+			tool, ok := rawTool.(map[string]any)
+			if !ok || tool["type"] != "function" {
+				http.Error(writer, "unexpected provider tool", http.StatusBadRequest)
+				return
+			}
+			function, ok := tool["function"].(map[string]any)
+			if !ok {
+				http.Error(writer, "missing provider function", http.StatusBadRequest)
+				return
+			}
+			name, _ := function["name"].(string)
+			seen[name] = function
+		}
+		if _, ok := seen["exec_command"]; !ok {
+			http.Error(writer, "standard function was not preserved", http.StatusBadRequest)
+			return
+		}
+		customFunction, ok := seen[opencodego.ApplyPatchUpstreamName]
+		if !ok || customFunction["strict"] != true {
+			http.Error(writer, "synthetic custom function was not declared strictly", http.StatusBadRequest)
+			return
+		}
+		parameters, ok := customFunction["parameters"].(map[string]any)
+		properties, propertiesOK := parameters["properties"].(map[string]any)
+		inputSchema, inputOK := properties[opencodego.ApplyPatchWrapperField].(map[string]any)
+		required, requiredOK := parameters["required"].([]any)
+		if !ok || !propertiesOK || !inputOK || inputSchema["type"] != "string" || parameters["type"] != "object" || parameters["additionalProperties"] != false || !requiredOK || len(required) != 1 || required[0] != opencodego.ApplyPatchWrapperField {
+			http.Error(writer, "custom wrapper schema changed", http.StatusBadRequest)
+			return
+		}
+		if _, exists := seen["mcp"]; exists {
+			http.Error(writer, "namespace metadata was sent upstream", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(writer, providerStream)
+	}))
+	defer provider.Close()
+
+	client, err := opencodego.NewClient(opencodego.ClientConfig{
+		APIKey:     "apply-patch-provider-key",
+		BaseURL:    provider.URL,
+		HTTPClient: provider.Client(),
+		UserAgent:  "opencode-go-gateway/apply-patch-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), slog.New(slog.NewTextHandler(&logs, nil)))
+	response := postRequest(t, gateway, checkedFixtureRequestBody(t, "apply-patch-request.json"))
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, readBody(t, response.Body))
+	}
+	rawResponse := readBody(t, response.Body)
+	events := readResponseEvents(t, strings.NewReader(rawResponse))
+	wantTypes := []string{
+		"response.created",
+		"response.in_progress",
+		"response.output_item.added",
+		"response.custom_tool_call_input.delta",
+		"response.custom_tool_call_input.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	if got := responseEventTypes(events); !equalStrings(got, wantTypes) {
+		t.Fatalf("event types = %v, want %v; bytes = %s", got, wantTypes, rawResponse)
+	}
+	for index, event := range events {
+		if event["sequence_number"] != float64(index) {
+			t.Fatalf("event %d sequence = %#v", index, event["sequence_number"])
+		}
+	}
+	addedItem := events[2]["item"].(map[string]any)
+	addedID, _ := addedItem["id"].(string)
+	if !strings.HasPrefix(addedID, "ctc_") || addedItem["call_id"] != "provider-custom-call" || addedItem["name"] != opencodego.ApplyPatchToolName || addedItem["input"] != "" || events[2]["output_index"] != float64(0) {
+		t.Fatalf("custom added item = %#v", addedItem)
+	}
+	if events[3]["item_id"] != addedID || events[3]["output_index"] != float64(0) || events[3]["delta"] != patch {
+		t.Fatalf("custom input delta = %#v", events[3])
+	}
+	if events[4]["item_id"] != addedID || events[4]["output_index"] != float64(0) || events[4]["input"] != patch {
+		t.Fatalf("custom input done = %#v", events[4])
+	}
+	doneItem := events[5]["item"].(map[string]any)
+	if doneItem["id"] != addedID || doneItem["call_id"] != "provider-custom-call" || doneItem["input"] != patch || doneItem["status"] != "completed" {
+		t.Fatalf("custom done item = %#v", doneItem)
+	}
+	if strings.Contains(rawResponse, opencodego.ApplyPatchUpstreamName) || strings.Contains(string(mustJSON(t, providerRequest)), patch) || strings.Contains(logs.String(), patch) {
+		t.Fatalf("synthetic name or patch leaked into a forbidden boundary: response=%s logs=%s", rawResponse, logs.String())
+	}
+}
+
+func TestResponsesMapsCheckedCustomToolResultHistoryThroughProvider(t *testing.T) {
+	var providerRequest map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&providerRequest); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		messages, ok := providerRequest["messages"].([]any)
+		if !ok || len(messages) != 4 {
+			http.Error(writer, "custom result history was not grouped", http.StatusBadRequest)
+			return
+		}
+		assistant, ok := messages[2].(map[string]any)
+		toolCalls, callsOK := assistant["tool_calls"].([]any)
+		if !ok || !callsOK || len(toolCalls) != 1 {
+			http.Error(writer, "custom call history was not mapped", http.StatusBadRequest)
+			return
+		}
+		toolCall := toolCalls[0].(map[string]any)
+		function := toolCall["function"].(map[string]any)
+		if function["name"] != opencodego.ApplyPatchUpstreamName || toolCall["id"] != "<normalized:id>" {
+			http.Error(writer, "custom call identity was changed", http.StatusBadRequest)
+			return
+		}
+		var arguments map[string]string
+		if err := json.Unmarshal([]byte(function["arguments"].(string)), &arguments); err != nil || arguments[opencodego.ApplyPatchWrapperField] != "<redacted:string>" {
+			http.Error(writer, "custom call wrapper was changed", http.StatusBadRequest)
+			return
+		}
+		resultMessage, ok := messages[3].(map[string]any)
+		if !ok || resultMessage["role"] != "tool" || resultMessage["tool_call_id"] != "<normalized:id>" || resultMessage["content"] != "<redacted:string>" {
+			http.Error(writer, "custom result was changed", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(writer, strings.Join([]string{
+			`data: {"id":"provider-result","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"continued"},"finish_reason":null}]}`,
+			`data: {"id":"provider-result","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}, "\n\n")+"\n\n")
+	}))
+	defer provider.Close()
+	client, err := opencodego.NewClient(opencodego.ClientConfig{
+		APIKey:     "custom-result-provider-key",
+		BaseURL:    provider.URL,
+		HTTPClient: provider.Client(),
+		UserAgent:  "opencode-go-gateway/custom-result-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), nil)
+	response := postRequest(t, gateway, checkedFixtureRequestBody(t, "custom-tool-result-request.json"))
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, readBody(t, response.Body))
+	}
+	events := readResponseEvents(t, response.Body)
+	if len(events) == 0 || events[len(events)-1]["type"] != "response.completed" {
+		t.Fatalf("custom result response = %#v", events)
+	}
+}
+
+func TestResponsesRejectsApplyPatchSyntheticNameCollisions(t *testing.T) {
+	for _, name := range []string{opencodego.ApplyPatchToolName, opencodego.ApplyPatchUpstreamName} {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+				called = true
+				return nil, errors.New("provider must not be called")
+			}), nil)
+			body := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"` + name + `","parameters":{"type":"object"}}],"stream":true}`
+			response := postRequest(t, gateway, body)
+			defer response.Body.Close()
+			responseBody := readBody(t, response.Body)
+			if response.StatusCode != http.StatusBadRequest || !strings.Contains(responseBody, `"code":"invalid_request"`) || strings.Contains(responseBody, name) {
+				t.Fatalf("collision response = %d %s", response.StatusCode, responseBody)
+			}
+			if called {
+				t.Fatal("provider was called for a synthetic-name collision")
+			}
+		})
+	}
+}
+
+func TestResponsesMapsMalformedApplyPatchWrappersToSafeFailures(t *testing.T) {
+	for name, arguments := range map[string]string{
+		"missing":    `{"other":"patch"}`,
+		"non-string": `{"input":42}`,
+		"trailing":   `{"input":"patch"} {}`,
+		"malformed":  `{"input":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			gateway := newIntegrationGateway(t, staticUpstream(providerToolStream(t, opencodego.ApplyPatchUpstreamName, "provider-malformed-call", arguments)), nil)
+			response := postTextRequest(t, gateway)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", response.StatusCode)
+			}
+			rawResponse := readBody(t, response.Body)
+			events := readResponseEvents(t, strings.NewReader(rawResponse))
+			if len(events) == 0 || events[len(events)-1]["type"] != "response.failed" {
+				t.Fatalf("events = %#v", events)
+			}
+			terminalResponse := events[len(events)-1]["response"].(map[string]any)
+			responseError := terminalResponse["error"].(map[string]any)
+			if responseError["code"] != "upstream_custom_tool_invalid" || strings.Contains(rawResponse, opencodego.ApplyPatchUpstreamName) || strings.Contains(rawResponse, `"input":42`) || strings.Contains(rawResponse, `"other":"patch"`) || strings.Contains(rawResponse, `"input":"patch"} {`) {
+				t.Fatalf("malformed custom response = %s", rawResponse)
+			}
+		})
 	}
 }
 
@@ -893,6 +1143,76 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func checkedFixtureRequestBody(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("../../testdata/codex/requests/" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Request struct {
+			Body json.RawMessage `json:"body"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Request.Body) == 0 {
+		t.Fatalf("fixture %q has no request body", name)
+	}
+	return string(fixture.Request.Body)
+}
+
+func providerToolStream(t *testing.T, name, callID string, fragments ...string) string {
+	t.Helper()
+	toolIndex := 0
+	chunks := make([]opencodego.ChatCompletionChunk, 0, len(fragments)+2)
+	for index, fragment := range fragments {
+		tool := opencodego.ToolCall{
+			Index: &toolIndex,
+			Function: opencodego.ToolCallFunction{
+				Arguments: fragment,
+			},
+		}
+		if index == 0 {
+			tool.ID = callID
+			tool.Type = "function"
+			tool.Function.Name = name
+		}
+		chunks = append(chunks, opencodego.ChatCompletionChunk{
+			ID: "provider-stream",
+			Choices: []opencodego.ChatCompletionChunkChoice{{
+				Index: 0,
+				Delta: opencodego.ChatMessage{ToolCalls: []opencodego.ToolCall{tool}},
+			}},
+			Created: 1700000000,
+			Model:   "deepseek-v4-flash",
+		})
+	}
+	finishReason := "tool_calls"
+	chunks = append(chunks, opencodego.ChatCompletionChunk{
+		ID: "provider-stream",
+		Choices: []opencodego.ChatCompletionChunkChoice{{
+			Index:        0,
+			FinishReason: &finishReason,
+		}},
+		Created: 1700000000,
+		Model:   "deepseek-v4-flash",
+	})
+	var builder strings.Builder
+	for _, chunk := range chunks {
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		builder.WriteString("data: ")
+		builder.Write(encoded)
+		builder.WriteString("\n\n")
+	}
+	builder.WriteString("data: [DONE]\n\n")
+	return builder.String()
 }
 
 func equalStrings(left, right []string) bool {

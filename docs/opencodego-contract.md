@@ -45,6 +45,13 @@ The tool history mapping is explicit:
 | `FunctionCallOutput` | `tool` message with `tool_call_id` |
 | `CustomToolCallOutput` | `tool` message with `tool_call_id` |
 
+`CustomToolCall` is mapped only when the request carries its request-scoped
+`bridge.ToolRegistry`. The Codex `apply_patch` name is wrapped as the
+provider function `__ocg_apply_patch` with one strict string property named
+`input`; the decoded value is not interpreted or normalized. `CustomToolCall`
+and `CustomToolCallOutput` retain their original call ID so a later
+continuation can reconstruct the provider tool turn.
+
 Contiguous tool-call inputs form one assistant message. A normal message or a
 tool result ends the group, and tool results remain separate messages in their
 original order. This preserves the Chat Completions conversation shape and
@@ -52,11 +59,16 @@ gives #10 a stable grouping boundary when reconstructing parallel calls. Each
 function name is validated against the provider's ASCII `[A-Za-z0-9_-]`
 contract and the 64-byte maximum before the request is sent.
 
-The provider supports function tools only. Function schemas are copied as raw
-validated JSON under the provider's `{ "type": "function", "function": ... }`
-wrapper. Namespace and web-search declarations are rejected explicitly rather
-than dropped. JSON-schema response formatting is also rejected because the
-provider MVP supports only text and `json_object` output formats.
+The provider request supports function declarations only. Function schemas are
+copied as raw validated JSON under the provider's `{ "type": "function", "function": ... }`
+wrapper. The implicit Codex `apply_patch` capability uses the same provider
+function wire shape through the synthetic wrapper described above. When a
+request registry is attached, the exact #2 `mcp` namespace and standalone
+web-search declarations are accepted as metadata and omitted from the
+provider request; they are never executed or treated as generic plugins.
+Direct mapping without that registry still rejects deferred tools. JSON-schema
+response formatting is also rejected because the provider MVP supports only
+text and `json_object` output formats.
 
 ## Thinking and tool-choice policy
 
@@ -83,9 +95,12 @@ thinking is rejected.
 
 Function tools are bounded to 128 declarations and 256 KiB of aggregate raw
 JSON Schema bytes. The stream adapter bounds each accumulated call argument to
-1 MiB and the complete retained stream to its configured aggregate limit.
-Schemas and model argument strings are transported without semantic rewriting;
-invalid model JSON is left for Codex/tool execution to handle.
+1 MiB and the complete retained stream to its configured aggregate limit; the
+`apply_patch` freeform input has an exclusive 512 KiB ceiling: lengths at or
+above 512 KiB are rejected, so the largest accepted value is 512 KiB minus one
+byte. Schemas and model argument strings are transported without semantic
+rewriting; invalid model JSON is left for Codex/tool execution to handle. This
+gateway never executes or validates filesystem effects for `apply_patch`.
 
 Provider `reasoning_content` is present in `ChatCompletionResponse` and
 `ChatCompletionChunk` message structs. It remains provider metadata for the

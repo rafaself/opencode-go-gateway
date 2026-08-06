@@ -285,6 +285,11 @@ func TestPolicyListedToolTypesHaveBehaviorDrivenDecisions(t *testing.T) {
 			body:   `{"type":"function","name":"domain_function","description":"domain description","parameters":{"type":"object"},"strict":true}`,
 			kind:   bridge.ToolFunction,
 		},
+		string(bridge.ToolCustom): {
+			policy: string(policyTranslate),
+			body:   `{"type":"custom","name":"apply_patch","description":"domain description","format":{"type":"text"}}`,
+			kind:   bridge.ToolCustom,
+		},
 		string(bridge.ToolNamespace): {
 			policy: string(policyDefer),
 			body:   `{"type":"namespace","name":"domain_namespace","description":"domain description","tools":[]}`,

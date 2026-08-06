@@ -100,8 +100,11 @@ the session records that failure and never attempts a second response.
 
 `StreamSessionOptions.CustomTools` registers typed custom-tool event hooks by
 bridge tool kind. The default `bridge.ToolCustom` hook produces the captured
-`custom_tool_call` event names. Function-call serialization is built in for
-#8; custom wrapper/translation policy remains in #9.
+`custom_tool_call` event names. Issue #9 supplies the provider-side
+request-scoped registry: fragmented `__ocg_apply_patch` function arguments are
+unwrapped only after the strict object is complete, and the bridge emits the
+public `apply_patch` custom events. The synthetic provider name is never
+passed to the Responses session.
 
 The session generates and owns the public Responses response ID. A provider
 `ResponseStarted.ID` is private correlation metadata and is never copied into
@@ -125,9 +128,11 @@ close the provider body.
 
 1. `codex.Decoder.DecodeRequest` validates the request media type, body size,
    UTF-8, duplicate keys, trailing values, and field policy.
-2. The server accepts standard function tools, but rejects custom/deferred
-   tools, tool-call/result inputs, structured output formats, and continuation
-   state before calling the provider.
+2. The server creates a request-scoped tool registry, accepts standard
+   function tools plus the exact captured `mcp`/`web_search` metadata and
+   `apply_patch` custom call/result shapes, and rejects unknown custom/deferred
+   tools, function tool-call/result inputs, structured output formats, and
+   continuation state before calling the provider.
 3. The injected `server.UpstreamClient` returns only a provider-neutral status,
    headers, and body. Status and `text/event-stream` are validated before the
    downstream session commits headers.
@@ -135,9 +140,10 @@ close the provider body.
    failure or inbound cancellation cancels that context and closes the body;
    the watcher is joined before the handler returns.
 5. The bridge decoder and Responses session process one semantic event at a
-   time. Provider errors, malformed JSON, and truncated streams become one
-   terminal `response.failed` event when downstream delivery is still possible;
-   `finish_reason=length` becomes `response.incomplete`.
+   time. Provider errors, malformed JSON, truncated streams, and malformed
+   custom-tool wrappers become one terminal `response.failed` event when
+   downstream delivery is still possible; `finish_reason=length` becomes
+   `response.incomplete`.
 
 The application constructs the OpenCode Go client from `OPENCODE_GO_API_KEY`
 and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or included in

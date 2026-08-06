@@ -23,6 +23,7 @@ const (
 	upstreamFailureText       = "The upstream provider request failed."
 	upstreamContentTypeText   = "The upstream provider returned an unsupported content type."
 	upstreamNotConfiguredText = "The upstream provider is not configured."
+	requestToolCollisionText  = "The request contains a reserved or conflicting tool name."
 )
 
 func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
@@ -42,6 +43,12 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		writeRequestDecodeError(w, err)
 		return
 	}
+	registry, err := opencodego.NewToolRegistry(request)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), requestToolCollisionText)
+		return
+	}
+	request.ToolRegistry = registry
 	if err := validateResponsesRequest(request); err != nil {
 		var decodeError *codex.Error
 		if errors.As(err, &decodeError) {
@@ -93,6 +100,7 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			MaxAggregateBytes: opencodego.DefaultStreamMaxAggregateBytes,
 		},
 		AllowedToolNames: declaredFunctionToolNames(request),
+		ToolRegistry:     request.ToolRegistry,
 	})
 	for {
 		event, decodeErr := streamDecoder.Next()
@@ -144,7 +152,17 @@ func validateResponsesRequest(request bridge.Request) error {
 		if tool == nil {
 			return errors.New(featureNotImplementedText)
 		}
-		if _, ok := tool.(bridge.FunctionTool); !ok {
+		switch tool := tool.(type) {
+		case bridge.FunctionTool:
+		case bridge.CustomTool:
+			if tool.Name != opencodego.ApplyPatchToolName || (tool.Format.Kind != "" && tool.Format.Kind != bridge.CustomToolFormatText) {
+				return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "tools", Message: "only the apply_patch text custom tool is supported"}
+			}
+		case bridge.DeferredTool:
+			if err := opencodego.ValidateCapturedDeferredTool(tool); err != nil {
+				return err
+			}
+		default:
 			return errors.New(featureNotImplementedText)
 		}
 	}
@@ -152,8 +170,15 @@ func validateResponsesRequest(request bridge.Request) error {
 		if item == nil {
 			return errors.New(featureNotImplementedText)
 		}
-		if item.Kind() != bridge.InputMessage {
-			return errors.New("tool results and prior tool calls are not implemented in the current milestone")
+		switch item := item.(type) {
+		case bridge.Message:
+		case bridge.CustomToolCall:
+			if item.Name != opencodego.ApplyPatchToolName {
+				return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "input", Message: "only apply_patch custom tool calls are supported"}
+			}
+		case bridge.CustomToolCallOutput:
+		default:
+			return errors.New("function tool results and prior function calls are not implemented in the current milestone")
 		}
 	}
 	switch request.ToolChoice.Kind {

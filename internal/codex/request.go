@@ -345,6 +345,15 @@ type functionToolWire struct {
 func (tool functionToolWire) isToolWire()      {}
 func (tool functionToolWire) toolName() string { return tool.Name }
 
+type customToolWire struct {
+	Name        string
+	Description string
+	Format      bridge.CustomToolFormatKind
+}
+
+func (tool customToolWire) isToolWire()      {}
+func (tool customToolWire) toolName() string { return tool.Name }
+
 type deferredToolWire struct {
 	Kind bridge.ToolKind
 	Name string
@@ -768,6 +777,12 @@ func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
 			}
 			schemaBytes += len(parsed.Parameters)
 			tool = parsed
+		case string(bridge.ToolCustom):
+			parsed, parseErr := decodeCustomTool(fields, path)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			tool = parsed
 		case string(bridge.ToolNamespace):
 			parsed, parseErr := decodeNamespaceTool(fields, path)
 			if parseErr != nil {
@@ -792,6 +807,38 @@ func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
 		result = append(result, tool)
 	}
 	return result, nil
+}
+
+func decodeCustomTool(fields map[string]json.RawMessage, path string) (customToolWire, error) {
+	if err := rejectUnknown(fields, path, "type", "name", "description", "format"); err != nil {
+		return customToolWire{}, err
+	}
+	name, err := requiredStringField(fields, "name", path)
+	if err != nil {
+		return customToolWire{}, err
+	}
+	description, err := optionalString(fields, "description", path+".description")
+	if err != nil {
+		return customToolWire{}, err
+	}
+	formatKind := bridge.CustomToolFormatText
+	if raw, exists := fields["format"]; exists {
+		formatFields, decodeErr := rawObject(raw, path+".format")
+		if decodeErr != nil {
+			return customToolWire{}, decodeErr
+		}
+		if decodeErr := rejectUnknown(formatFields, path+".format", "type"); decodeErr != nil {
+			return customToolWire{}, decodeErr
+		}
+		formatType, decodeErr := requiredStringField(formatFields, "type", path+".format")
+		if decodeErr != nil {
+			return customToolWire{}, decodeErr
+		}
+		if bridge.CustomToolFormatKind(formatType) != bridge.CustomToolFormatText {
+			return customToolWire{}, newError(ErrorInvalidRequest, path+".format.type", "only text custom-tool input is supported")
+		}
+	}
+	return customToolWire{Name: name, Description: description, Format: formatKind}, nil
 }
 
 func decodeFunctionTool(fields map[string]json.RawMessage, path string) (functionToolWire, error) {
@@ -1048,6 +1095,8 @@ func translateRequest(wire responsesRequestWire) (bridge.Request, error) {
 				return bridge.Request{}, fmt.Errorf("internal error: function schema was not validated: %w", err)
 			}
 			request.Tools = append(request.Tools, bridge.FunctionTool{Name: tool.Name, Description: tool.Description, Parameters: parameters, Strict: cloneBoolPointer(tool.Strict)})
+		case customToolWire:
+			request.Tools = append(request.Tools, bridge.CustomTool{Name: tool.Name, Description: tool.Description, Format: bridge.CustomToolFormat{Kind: tool.Format}})
 		case deferredToolWire:
 			request.Tools = append(request.Tools, bridge.DeferredTool{ToolKind: tool.Kind, Name: tool.Name})
 		default:

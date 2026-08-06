@@ -118,6 +118,9 @@ func (err *streamDecodeError) Unwrap() error { return errors.Join(ErrMalformedSt
 type BridgeStreamDecoderOptions struct {
 	SSE              SSEDecoderOptions
 	AllowedToolNames []string
+	// ToolRegistry is scoped to the request/continuation chain. Synthetic
+	// provider names are translated only while this decoder is alive.
+	ToolRegistry *bridge.ToolRegistry
 }
 
 // BridgeStreamDecoder translates provider chunks into semantic events. It
@@ -137,15 +140,21 @@ type BridgeStreamDecoder struct {
 	aggregateBytes           int
 	maxAggregateBytes        int
 	maxToolCallArgumentBytes int
+	toolRegistry             *bridge.ToolRegistry
 }
 
 type providerToolCall struct {
-	key            bridge.ToolCallKey
-	callID         []byte // immutable downstream Responses call_id
-	providerCallID []byte // private provider ID/fragments for continuation
-	name           []byte
-	arguments      []byte
-	completed      bool
+	key              bridge.ToolCallKey
+	callID           []byte // immutable downstream Responses call_id
+	providerCallID   []byte // private provider ID/fragments for continuation
+	name             []byte
+	arguments        []byte
+	argumentsEmitted int
+	kind             bridge.ToolKind
+	registration     bridge.ToolRegistration
+	started          bool
+	customCandidate  bool
+	completed        bool
 }
 
 func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions) *BridgeStreamDecoder {
@@ -156,6 +165,13 @@ func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions
 			allowedToolNames[name] = struct{}{}
 		}
 	}
+	if options.ToolRegistry != nil {
+		for _, registration := range options.ToolRegistry.Registrations() {
+			if registration.UpstreamName != "" {
+				allowedToolNames[registration.UpstreamName] = struct{}{}
+			}
+		}
+	}
 	return &BridgeStreamDecoder{
 		provider:                 NewChatCompletionStreamDecoder(reader, options.SSE),
 		calls:                    make(map[bridge.ToolCallKey]*providerToolCall),
@@ -163,6 +179,7 @@ func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions
 		allowedToolNames:         allowedToolNames,
 		maxAggregateBytes:        options.SSE.MaxAggregateBytes,
 		maxToolCallArgumentBytes: options.SSE.MaxToolCallArgumentBytes,
+		toolRegistry:             options.ToolRegistry,
 	}
 }
 
@@ -251,6 +268,9 @@ func (decoder *BridgeStreamDecoder) bridgeFailure(err error) bridge.Failed {
 	}
 	if errors.Is(err, ErrUndeclaredToolCall) {
 		return bridge.Failed{Code: "upstream_tool_not_declared", Message: "The upstream provider returned an undeclared function tool."}
+	}
+	if errors.Is(err, ErrMalformedCustomToolArguments) || errors.Is(err, ErrApplyPatchInputLimit) {
+		return bridge.Failed{Code: customToolErrorCode(err), Message: customToolErrorMessage(err)}
 	}
 	return bridge.Failed{Code: "upstream_stream_error", Message: "upstream stream could not be decoded"}
 }
@@ -370,18 +390,19 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 			callID = syntheticToolCallID(key)
 		}
 		state.callID = append(state.callID, callID...)
-		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
 		decoder.calls[key] = state
-		if err := decoder.queue(bridge.ToolCallStarted{
-			Key:    key,
-			Kind:   bridge.ToolFunction,
-			CallID: callID,
-			Name:   tool.Function.Name,
-		}, len(callID)+len(tool.Function.Name)); err != nil {
-			return err
-		}
-	} else if tool.ID != "" || tool.Function.Name != "" {
+	}
+	if tool.ID != "" {
 		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
+	}
+	state.name = append(state.name, tool.Function.Name...)
+	if decoder.customNameCandidate(string(state.name)) {
+		state.customCandidate = true
+	}
+	if err := decoder.ensureToolStarted(state); err != nil {
+		return err
+	}
+	if exists && tool.Function.Name != "" && state.kind != bridge.ToolCustom && state.started {
 		if err := decoder.queue(bridge.ToolCallMetadataDelta{
 			Key: key,
 			// Provider IDs may be fragmented or delayed. The downstream call
@@ -393,16 +414,81 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 			return err
 		}
 	}
-	state.name = append(state.name, tool.Function.Name...)
 	if len(tool.Function.Arguments) > decoder.maxToolCallArgumentBytes-len(state.arguments) {
 		return ErrToolCallArgumentLimit
 	}
 	state.arguments = append(state.arguments, tool.Function.Arguments...)
-	if tool.Function.Arguments != "" {
-		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: key, Arguments: tool.Function.Arguments}, len(tool.Function.Arguments)); err != nil {
+	if state.kind == bridge.ToolCustom || state.customCandidate {
+		if err := decoder.reserveRawArgument(len(tool.Function.Arguments)); err != nil {
 			return err
 		}
+		return nil
 	}
+	if state.started && state.argumentsEmitted < len(state.arguments) {
+		delta := string(state.arguments[state.argumentsEmitted:])
+		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: key, Arguments: delta}, len(delta)); err != nil {
+			return err
+		}
+		state.argumentsEmitted = len(state.arguments)
+	}
+	return nil
+}
+
+func (decoder *BridgeStreamDecoder) customNameCandidate(name string) bool {
+	if name == "" || strings.HasPrefix(name, ReservedToolNamePrefix) {
+		return name != ""
+	}
+	if decoder.toolRegistry == nil {
+		return false
+	}
+	for _, registration := range decoder.toolRegistry.Registrations() {
+		if registration.Kind == bridge.ToolCustom && strings.HasPrefix(registration.UpstreamName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (decoder *BridgeStreamDecoder) ensureToolStarted(state *providerToolCall) error {
+	if state.started {
+		return nil
+	}
+	name := string(state.name)
+	if name == "" || (state.customCandidate && name != ApplyPatchUpstreamName) {
+		return nil
+	}
+	kind := bridge.ToolFunction
+	publicName := name
+	if registration, ok := customToolRegistration(decoder.toolRegistry, name); ok {
+		kind = registration.Kind
+		publicName = registration.InboundName
+		state.registration = registration
+	}
+	state.kind = kind
+	if err := decoder.queue(bridge.ToolCallStarted{
+		Key:    state.key,
+		Kind:   kind,
+		CallID: string(state.callID),
+		Name:   publicName,
+	}, len(state.callID)+len(publicName)); err != nil {
+		return err
+	}
+	state.started = true
+	if kind != bridge.ToolCustom && state.argumentsEmitted < len(state.arguments) {
+		delta := string(state.arguments[state.argumentsEmitted:])
+		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: delta}, len(delta)); err != nil {
+			return err
+		}
+		state.argumentsEmitted = len(state.arguments)
+	}
+	return nil
+}
+
+func (decoder *BridgeStreamDecoder) reserveRawArgument(bytes int) error {
+	if bytes < 0 || decoder.aggregateBytes > decoder.maxAggregateBytes-bytes {
+		return ErrStreamAggregateLimit
+	}
+	decoder.aggregateBytes += bytes
 	return nil
 }
 
@@ -457,6 +543,9 @@ func (decoder *BridgeStreamDecoder) finish() error {
 		if state.completed {
 			continue
 		}
+		if err := decoder.ensureToolStarted(state); err != nil {
+			return err
+		}
 		name := string(state.name)
 		if name == "" {
 			return ErrMalformedStream
@@ -479,6 +568,25 @@ func (decoder *BridgeStreamDecoder) finish() error {
 			callIDs[callID] = key
 		}
 		state.completed = true
+		if state.kind == bridge.ToolCustom {
+			input, err := unwrapApplyPatchArguments(string(state.arguments))
+			if err != nil {
+				return err
+			}
+			if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: state.key, Arguments: input}, len(input)); err != nil {
+				return err
+			}
+			if err := decoder.queue(bridge.ToolCallCompleted{
+				Key:       state.key,
+				Kind:      bridge.ToolCustom,
+				CallID:    string(state.callID),
+				Name:      state.registration.InboundName,
+				Arguments: input,
+			}, len(state.callID)+len(state.registration.InboundName)+len(input)); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := decoder.queue(bridge.ToolCallCompleted{
 			Key:       state.key,
 			Kind:      bridge.ToolFunction,
