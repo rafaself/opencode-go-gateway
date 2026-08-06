@@ -1,1 +1,5 @@
 /testdata/codex/captures/
+/opencode-gateway
+/bin/
+/dist/
+coverage.out

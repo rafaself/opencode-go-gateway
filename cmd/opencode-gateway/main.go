@@ -8,21 +8,106 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
+	"github.com/rafaself/opencode-go-gateway/internal/app"
 	"github.com/rafaself/opencode-go-gateway/internal/capture"
+	"github.com/rafaself/opencode-go-gateway/internal/config"
 )
 
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
+var errUsage = errors.New("invalid command usage")
+
 func main() {
-	if len(os.Args) < 3 || os.Args[1] != "dev" || os.Args[2] != "capture-codex" {
-		usage(os.Stderr)
-		os.Exit(2)
+	os.Exit(commandExitCode(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func commandExitCode(args []string, stdout, stderr io.Writer) int {
+	if err := execute(args, stdout, stderr); err != nil {
+		if errors.Is(err, errUsage) {
+			return 2
+		}
+		fmt.Fprintf(stderr, "opencode-gateway: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func execute(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		usage(stderr)
+		return errUsage
 	}
 
-	if err := runCapture(os.Args[3:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintf(os.Stderr, "opencode-gateway: %v\n", err)
-		os.Exit(1)
+	switch args[0] {
+	case "run":
+		return runServer(args[1:], stdout, stderr)
+	case "version":
+		if len(args) != 1 {
+			usage(stderr)
+			return errUsage
+		}
+		return printVersion(stdout)
+	case "dev":
+		if len(args) < 2 || args[1] != "capture-codex" {
+			usage(stderr)
+			return errUsage
+		}
+		return runCapture(args[2:], stdout, stderr)
+	default:
+		usage(stderr)
+		return errUsage
 	}
+}
+
+func runServer(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: opencode-gateway run")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Start the local gateway HTTP server using OPENCODE_* environment settings.")
+	}
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "run: unexpected arguments: %v\n", flags.Args())
+		return errUsage
+	}
+
+	ctx, stop := signalContext(context.Background())
+	defer stop()
+	return runGateway(ctx, os.LookupEnv, stdout, stderr)
+}
+
+func runGateway(ctx context.Context, lookup config.LookupEnv, stdout, stderr io.Writer) error {
+	settings, err := config.Load(lookup)
+	if err != nil {
+		return err
+	}
+	logger := app.NewLogger(stderr, settings.LogLevel)
+	return app.Run(ctx, settings, logger, func(address string) {
+		fmt.Fprintf(stdout, "opencode-gateway listening on http://%s\n", address)
+	})
+}
+
+func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
+func printVersion(w io.Writer) error {
+	_, err := fmt.Fprintf(w, "opencode-gateway version=%s commit=%s build_date=%s go=%s\n", version, commit, buildDate, runtime.Version())
+	return err
 }
 
 func runCapture(args []string, stdout, stderr io.Writer) error {
@@ -40,15 +125,17 @@ func runCapture(args []string, stdout, stderr io.Writer) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %v", flags.Args())
+		fmt.Fprintf(stderr, "capture-codex: unexpected arguments: %v\n", flags.Args())
+		return errUsage
 	}
 
 	mode, err := capture.ParseResponseMode(*responseMode)
 	if err != nil {
-		return err
+		fmt.Fprintf(stderr, "capture-codex: %v\n", err)
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 	server, err := capture.Listen(capture.Config{
 		ListenAddr:    *listenAddr,
@@ -75,7 +162,7 @@ func runCapture(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "Codex capture server listening on %s\n", server.BaseURL())
 	fmt.Fprintf(stdout, "Configure Codex with model_providers.capture.base_url = %q and wire_api = %q\n", server.BaseURL(), "responses")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext(context.Background())
 	defer stop()
 	if err := server.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
@@ -84,8 +171,10 @@ func runCapture(args []string, stdout, stderr io.Writer) error {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: opencode-gateway dev capture-codex [flags]")
+	fmt.Fprintln(w, "Usage: opencode-gateway <command>")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Start a loopback-only Codex Responses contract capture server.")
-	fmt.Fprintln(w, "Run `opencode-gateway dev capture-codex -h` for flags.")
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  run                    Start the local gateway server")
+	fmt.Fprintln(w, "  version                Print version and build metadata")
+	fmt.Fprintln(w, "  dev capture-codex      Start the development-only contract capture server")
 }
