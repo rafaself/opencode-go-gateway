@@ -37,6 +37,35 @@ func TestServerBehaviorPersistsPartialStreamEvents(t *testing.T) {
 	}
 }
 
+func TestServerBehaviorPersistsCancellationAfterInProgress(t *testing.T) {
+	outputDir := t.TempDir()
+	server, err := Listen(Config{OutputDir: outputDir, FixturePrefix: "context-cancel", ResponseMode: ResponseText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var writer *serverBehaviorFailingResponseWriter
+	writer = &serverBehaviorFailingResponseWriter{
+		failAfter: 100,
+		afterWrite: func() {
+			if writer.successfulWrites == 2 {
+				cancel()
+			}
+		},
+		err: errors.New("unexpected write failure"),
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", bytes.NewBufferString(`{"model":"gpt-5.3-codex","stream":true}`)).WithContext(requestContext)
+	server.ServeHTTP(writer, request)
+
+	fixture := readServerBehaviorFixture(t, filepath.Join(outputDir, "context-cancel-001.json"))
+	if want := []string{"response.created", "response.in_progress"}; !reflect.DeepEqual(fixture.Response.EventTypes, want) {
+		t.Fatalf("event types = %v, want %v", fixture.Response.EventTypes, want)
+	}
+}
+
 func TestServerBehaviorPreservesGenericStreamError(t *testing.T) {
 	events, err := responseEvents(ResponseText, "gpt-5.3-codex", "capture acknowledged", 1)
 	if err != nil {
@@ -128,6 +157,7 @@ type serverBehaviorFailingResponseWriter struct {
 	status           int
 	successfulWrites int
 	failAfter        int
+	afterWrite       func()
 	err              error
 	body             bytes.Buffer
 }
@@ -148,7 +178,11 @@ func (w *serverBehaviorFailingResponseWriter) Write(payload []byte) (int, error)
 		return 0, w.err
 	}
 	w.successfulWrites++
-	return w.body.Write(payload)
+	n, err := w.body.Write(payload)
+	if err == nil && w.afterWrite != nil {
+		w.afterWrite()
+	}
+	return n, err
 }
 
 func (w *serverBehaviorFailingResponseWriter) Flush() {}
