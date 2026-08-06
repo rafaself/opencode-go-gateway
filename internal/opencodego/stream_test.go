@@ -216,6 +216,40 @@ data: [DONE]
 	}
 }
 
+func TestBridgeStreamDecoderCapturesPrivatePendingTurnAfterFinalizedCustomCall(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"provider-turn","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"private reasoning"},"finish_reason":null}]}`,
+		`data: {"id":"provider-turn","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"provider-custom","type":"function","function":{"name":"__ocg_apply_patch","arguments":"{\"input\":\"patch"}}]},"finish_reason":null}]}`,
+		`data: {"id":"provider-turn","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	registry, err := NewToolRegistry(bridge.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := NewBridgeStreamDecoder(strings.NewReader(stream), BridgeStreamDecoderOptions{ToolRegistry: registry})
+	for {
+		_, err := decoder.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	turn, ok := decoder.PendingTurn()
+	if !ok {
+		t.Fatal("finalized tool turn was not captured")
+	}
+	if turn.Model != "deepseek-v4-flash" || turn.ReasoningContent != "private reasoning" || turn.AssistantContent != "" || len(turn.ToolCalls) != 1 {
+		t.Fatalf("pending turn = %#v", turn)
+	}
+	call := turn.ToolCalls[0]
+	if call.CallID != "provider-custom" || call.ProviderCallID != "provider-custom" || call.Kind != bridge.ToolCustom || call.Name != ApplyPatchUpstreamName || call.Arguments != `{"input":"patch"}` {
+		t.Fatalf("pending custom call = %#v", call)
+	}
+}
+
 func TestBridgeStreamDecoderRejectsMissingOrNegativeToolIndexes(t *testing.T) {
 	for name, tool := range map[string]string{
 		"missing":  `{"id":"call","function":{"name":"first","arguments":"{}"}}`,
@@ -289,6 +323,61 @@ func TestBridgeStreamDecoderEnforcesAggregateLimitAcrossSmallChunks(t *testing.T
 			t.Fatalf("failure = %#v, want stream_limit_exceeded", failed)
 		}
 		return
+	}
+}
+
+func TestBridgeStreamDecoderChargesRetainedProviderCallIDGrowth(t *testing.T) {
+	makeChunk := func(id, name string) ChatCompletionChunk {
+		index := 0
+		return ChatCompletionChunk{
+			ID:    "chat-1",
+			Model: "m",
+			Choices: []ChatCompletionChunkChoice{{
+				Index: 0,
+				Delta: ChatMessage{ToolCalls: []ToolCall{{
+					Index: &index,
+					ID:    id,
+					Function: ToolCallFunction{
+						Name: name,
+					},
+				}}},
+			}},
+		}
+	}
+	first := makeChunk("seed", "lookup")
+	decoder := NewBridgeStreamDecoder(strings.NewReader(""), BridgeStreamDecoderOptions{
+		SSE:              SSEDecoderOptions{MaxAggregateBytes: 1 << 20},
+		AllowedToolNames: []string{"lookup"},
+	})
+	if err := decoder.consumeChunk(first); err != nil {
+		t.Fatal(err)
+	}
+	beforeRepeat := decoder.aggregateBytes
+	repeated := makeChunk("seed", "")
+	if err := decoder.consumeChunk(repeated); err != nil {
+		t.Fatal(err)
+	}
+	if decoder.aggregateBytes != beforeRepeat {
+		t.Fatalf("repeated provider ID changed aggregate budget: before %d after %d", beforeRepeat, decoder.aggregateBytes)
+	}
+
+	fragment := "unique-provider-fragment"
+	beforeUnique := decoder.aggregateBytes
+	decoder.maxAggregateBytes = beforeUnique + len(fragment) - 1
+	unique := makeChunk(fragment, "")
+	err := decoder.consumeChunk(unique)
+	if !errors.Is(err, ErrStreamAggregateLimit) {
+		t.Fatalf("unique provider ID fragment error = %v, want %v", err, ErrStreamAggregateLimit)
+	}
+	if strings.Contains(err.Error(), fragment) {
+		t.Fatalf("stream limit error exposed provider ID fragment: %v", err)
+	}
+	if providerID, ok := decoder.ProviderCallID("seed"); !ok || providerID != "seed" {
+		t.Fatalf("failed provider ID fragment mutated retained state: %q, %v", providerID, ok)
+	}
+	decoder.maxAggregateBytes = beforeUnique + len(fragment)
+	if err := decoder.consumeChunk(unique); err != nil {
+		t.Fatalf("provider ID fragment at aggregate boundary = %v", err)
 	}
 }
 

@@ -309,6 +309,8 @@ func (functionCallWire) isInputWire() {}
 type functionCallOutputWire struct {
 	CallID string
 	Output string
+	Status string
+	Error  bool
 }
 
 func (functionCallOutputWire) isInputWire() {}
@@ -326,6 +328,8 @@ func (customToolCallWire) isInputWire() {}
 type customToolCallOutputWire struct {
 	CallID string
 	Output string
+	Status string
+	Error  bool
 }
 
 func (customToolCallOutputWire) isInputWire() {}
@@ -503,9 +507,12 @@ func decodeRequestWire(fields map[string]json.RawMessage) (responsesRequestWire,
 }
 
 func decodeInputItems(items []json.RawMessage) ([]inputWire, error) {
+	// Validate item shapes and local call identity here, but defer result
+	// duplicate/kind correlation to the continuation owner. The provider
+	// adapter owns retained state and can therefore return stable continuation
+	// taxonomy instead of collapsing these cases into invalid_request.
 	result := make([]inputWire, 0, len(items))
 	callKinds := make(map[string]bridge.InputKind)
-	completedCalls := make(map[string]struct{})
 	for index, raw := range items {
 		path := fmt.Sprintf("input[%d]", index)
 		item, err := decodeInputItem(raw, path)
@@ -525,29 +532,13 @@ func decodeInputItems(items []json.RawMessage) ([]inputWire, error) {
 			}
 			callKinds[item.CallID] = bridge.InputCustomToolCall
 		case functionCallOutputWire:
-			kind, exists := callKinds[item.CallID]
-			if !exists {
+			if _, exists := callKinds[item.CallID]; !exists {
 				return nil, invalidRequest(path+".call_id", "call_id does not correlate to a prior tool call")
 			}
-			if kind != bridge.InputFunctionCall {
-				return nil, invalidRequest(path+".call_id", "call_id correlates to a different tool-call kind")
-			}
-			if _, exists := completedCalls[item.CallID]; exists {
-				return nil, invalidRequest(path+".call_id", "call_id has more than one tool result")
-			}
-			completedCalls[item.CallID] = struct{}{}
 		case customToolCallOutputWire:
-			kind, exists := callKinds[item.CallID]
-			if !exists {
+			if _, exists := callKinds[item.CallID]; !exists {
 				return nil, invalidRequest(path+".call_id", "call_id does not correlate to a prior tool call")
 			}
-			if kind != bridge.InputCustomToolCall {
-				return nil, invalidRequest(path+".call_id", "call_id correlates to a different tool-call kind")
-			}
-			if _, exists := completedCalls[item.CallID]; exists {
-				return nil, invalidRequest(path+".call_id", "call_id has more than one tool result")
-			}
-			completedCalls[item.CallID] = struct{}{}
 		}
 	}
 	return result, nil
@@ -688,7 +679,7 @@ func decodeFunctionCall(fields map[string]json.RawMessage, path string) (functio
 }
 
 func decodeFunctionCallOutput(fields map[string]json.RawMessage, path string) (functionCallOutputWire, error) {
-	if err := rejectUnknown(fields, path, "type", "call_id", "output"); err != nil {
+	if err := rejectUnknown(fields, path, "type", "call_id", "output", "status", "error"); err != nil {
 		return functionCallOutputWire{}, err
 	}
 	callID, err := requiredStringField(fields, "call_id", path)
@@ -699,7 +690,15 @@ func decodeFunctionCallOutput(fields map[string]json.RawMessage, path string) (f
 	if err != nil {
 		return functionCallOutputWire{}, err
 	}
-	return functionCallOutputWire{CallID: callID, Output: output}, nil
+	status, err := optionalString(fields, "status", path+".status")
+	if err != nil {
+		return functionCallOutputWire{}, err
+	}
+	errorMarker, err := optionalErrorMarker(fields, path+".error")
+	if err != nil {
+		return functionCallOutputWire{}, err
+	}
+	return functionCallOutputWire{CallID: callID, Output: output, Status: status, Error: errorMarker || resultStatusIsError(status)}, nil
 }
 
 func decodeCustomToolCall(fields map[string]json.RawMessage, path string) (customToolCallWire, error) {
@@ -730,7 +729,7 @@ func decodeCustomToolCall(fields map[string]json.RawMessage, path string) (custo
 }
 
 func decodeCustomToolCallOutput(fields map[string]json.RawMessage, path string) (customToolCallOutputWire, error) {
-	if err := rejectUnknown(fields, path, "type", "call_id", "output"); err != nil {
+	if err := rejectUnknown(fields, path, "type", "call_id", "output", "status", "error"); err != nil {
 		return customToolCallOutputWire{}, err
 	}
 	callID, err := requiredStringField(fields, "call_id", path)
@@ -741,7 +740,15 @@ func decodeCustomToolCallOutput(fields map[string]json.RawMessage, path string) 
 	if err != nil {
 		return customToolCallOutputWire{}, err
 	}
-	return customToolCallOutputWire{CallID: callID, Output: output}, nil
+	status, err := optionalString(fields, "status", path+".status")
+	if err != nil {
+		return customToolCallOutputWire{}, err
+	}
+	errorMarker, err := optionalErrorMarker(fields, path+".error")
+	if err != nil {
+		return customToolCallOutputWire{}, err
+	}
+	return customToolCallOutputWire{CallID: callID, Output: output, Status: status, Error: errorMarker || resultStatusIsError(status)}, nil
 }
 
 func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
@@ -1078,11 +1085,11 @@ func translateRequest(wire responsesRequestWire) (bridge.Request, error) {
 		case functionCallWire:
 			request.Input = append(request.Input, bridge.FunctionCall{ID: item.ID, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Status: item.Status})
 		case functionCallOutputWire:
-			request.Input = append(request.Input, bridge.FunctionCallOutput{CallID: item.CallID, Output: item.Output})
+			request.Input = append(request.Input, bridge.FunctionCallOutput{CallID: item.CallID, Output: item.Output, Status: item.Status, Error: item.Error})
 		case customToolCallWire:
 			request.Input = append(request.Input, bridge.CustomToolCall{ID: item.ID, CallID: item.CallID, Name: item.Name, Input: item.Input, Status: item.Status})
 		case customToolCallOutputWire:
-			request.Input = append(request.Input, bridge.CustomToolCallOutput{CallID: item.CallID, Output: item.Output})
+			request.Input = append(request.Input, bridge.CustomToolCallOutput{CallID: item.CallID, Output: item.Output, Status: item.Status, Error: item.Error})
 		default:
 			return bridge.Request{}, fmt.Errorf("internal error: unsupported decoded input %T", item)
 		}
@@ -1226,6 +1233,39 @@ func optionalString(fields map[string]json.RawMessage, field, param string) (str
 		return "", nil
 	}
 	return stringValue(raw, param)
+}
+
+// optionalErrorMarker records only whether a result carries an error marker.
+// Error payloads can contain tool output or other sensitive text, so they are
+// deliberately not copied into the bridge model or any client-facing error.
+// Codex has emitted boolean, string, and object-shaped markers across result
+// forms; every non-null marker is semantically an error unless it is false.
+func optionalErrorMarker(fields map[string]json.RawMessage, param string) (bool, error) {
+	raw, ok := fields["error"]
+	if !ok {
+		return false, nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return false, nil
+	}
+	var value bool
+	if err := json.Unmarshal(trimmed, &value); err == nil {
+		return value, nil
+	}
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return false, invalidRequest(param, "error marker is malformed")
+	}
+	return true, nil
+}
+
+func resultStatusIsError(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "error", "failed", "failure", "cancelled", "canceled", "incomplete":
+		return true
+	default:
+		return false
+	}
 }
 
 func boolValue(raw json.RawMessage, param string) (bool, error) {

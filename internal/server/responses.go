@@ -49,7 +49,33 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		return
 	}
 	request.ToolRegistry = registry
-	if err := validateResponsesRequest(request); err != nil {
+	results, err := opencodego.TranslateToolResults(request.Input)
+	if err != nil {
+		switch {
+		case errors.Is(err, opencodego.ErrToolResultDuplicate):
+			writeContinuationError(w, opencodego.ErrContinuationDuplicate)
+		case errors.Is(err, opencodego.ErrToolResultKindMismatch):
+			writeContinuationError(w, opencodego.ErrContinuationKindMismatch)
+		default:
+			writeJSONError(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), requestInvalidText)
+		}
+		return
+	}
+	var lease *opencodego.ContinuationLease
+	if len(results) > 0 {
+		lease, err = s.continuations.Begin(results)
+		if err != nil {
+			writeContinuationError(w, err)
+			return
+		}
+		request.Continuation = opencodego.NewContinuationRequest(lease)
+		defer func() { _ = lease.Abort() }()
+	}
+	if err := validateResponsesRequest(request, lease != nil); err != nil {
+		if errors.Is(err, opencodego.ErrContinuationUnknown) {
+			writeContinuationError(w, err)
+			return
+		}
 		var decodeError *codex.Error
 		if errors.As(err, &decodeError) {
 			writeRequestDecodeError(w, err)
@@ -72,7 +98,6 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		writeUpstreamError(w, err)
 		return
 	}
-
 	bodyCloser := &onceCloser{body: response.Body}
 	defer bodyCloser.Close()
 
@@ -102,6 +127,7 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		AllowedToolNames: declaredFunctionToolNames(request),
 		ToolRegistry:     request.ToolRegistry,
 	})
+	accepted := lease == nil
 	for {
 		event, decodeErr := streamDecoder.Next()
 		if errors.Is(decodeErr, io.EOF) {
@@ -118,17 +144,42 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			}
 			return
 		}
+		if _, ok := event.(bridge.Completed); ok {
+			if turn, hasToolTurn := streamDecoder.PendingTurn(); hasToolTurn {
+				if err := s.continuations.Save(*turn); err != nil {
+					if !session.TerminalEmitted && session.WriteFailure() == nil {
+						_ = session.Fail("continuation_capacity", "The gateway could not retain the provider tool turn.")
+						w.responseTerminal = "response.failed"
+					}
+					return
+				}
+			}
+		}
 		if handleErr := session.Handle(event); handleErr != nil {
 			if session.TerminalEmitted {
 				w.responseTerminal = responseTerminalType(event)
 			}
 			return
 		}
+		if !accepted && isContinuationAcceptanceEvent(event) {
+			if err := lease.Commit(); err != nil {
+				if !session.TerminalEmitted && session.WriteFailure() == nil {
+					_ = session.Fail("continuation_commit", "The gateway could not finalize the continuation.")
+					w.responseTerminal = "response.failed"
+				}
+				return
+			}
+			accepted = true
+		}
 		if session.TerminalEmitted {
 			w.responseTerminal = responseTerminalType(event)
 			return
 		}
 	}
+}
+
+func isContinuationAcceptanceEvent(event bridge.StreamEvent) bool {
+	return event != nil && event.StreamEventKind() == bridge.StreamResponseStarted
 }
 
 func responseTerminalType(event bridge.StreamEvent) string {
@@ -144,9 +195,9 @@ func responseTerminalType(event bridge.StreamEvent) string {
 	}
 }
 
-func validateResponsesRequest(request bridge.Request) error {
-	if request.PreviousResponseID != "" {
-		return errors.New("continuation state is not implemented in the current milestone")
+func validateResponsesRequest(request bridge.Request, continuation bool) error {
+	if request.PreviousResponseID != "" && !continuation {
+		return opencodego.ErrContinuationUnknown
 	}
 	for _, tool := range request.Tools {
 		if tool == nil {
@@ -172,11 +223,21 @@ func validateResponsesRequest(request bridge.Request) error {
 		}
 		switch item := item.(type) {
 		case bridge.Message:
+		case bridge.FunctionCall, bridge.FunctionCallOutput:
+			if !continuation {
+				return errors.New("function tool continuation is not available")
+			}
 		case bridge.CustomToolCall:
+			if !continuation {
+				return errors.New("custom tool continuation is not available")
+			}
 			if item.Name != opencodego.ApplyPatchToolName {
 				return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "input", Message: "only apply_patch custom tool calls are supported"}
 			}
 		case bridge.CustomToolCallOutput:
+			if !continuation {
+				return errors.New("custom tool continuation is not available")
+			}
 		default:
 			return errors.New("function tool results and prior function calls are not implemented in the current milestone")
 		}
@@ -192,6 +253,37 @@ func validateResponsesRequest(request bridge.Request) error {
 		return errors.New("structured response formats are not implemented in the current milestone")
 	}
 	return nil
+}
+
+func writeContinuationError(w *statusWriter, err error) {
+	code := "continuation_invalid"
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, opencodego.ErrContinuationUnknown):
+		code = "continuation_unknown"
+	case errors.Is(err, opencodego.ErrContinuationExpired):
+		code = "continuation_expired"
+	case errors.Is(err, opencodego.ErrContinuationBusy):
+		code = "continuation_busy"
+		status = http.StatusConflict
+	case errors.Is(err, opencodego.ErrContinuationConsumed):
+		code = "continuation_consumed"
+	case errors.Is(err, opencodego.ErrContinuationIncomplete):
+		code = "continuation_incomplete"
+	case errors.Is(err, opencodego.ErrContinuationKindMismatch):
+		code = "continuation_kind_mismatch"
+	case errors.Is(err, opencodego.ErrContinuationMixed):
+		code = "continuation_mixed"
+	case errors.Is(err, opencodego.ErrContinuationDuplicate):
+		code = "continuation_duplicate"
+	case errors.Is(err, opencodego.ErrContinuationCapacity):
+		code = "continuation_capacity"
+		status = http.StatusServiceUnavailable
+	case errors.Is(err, opencodego.ErrContinuationClosed):
+		code = "continuation_closed"
+		status = http.StatusServiceUnavailable
+	}
+	writeJSONError(w, status, code, requestInvalidText)
 }
 
 func declaredFunctionToolNames(request bridge.Request) []string {
@@ -269,7 +361,7 @@ func writeUpstreamError(w *statusWriter, err error) {
 		if code == upstreamErrorRateLimited {
 			status = http.StatusTooManyRequests
 		}
-		if code == upstreamErrorInvalidRequest || code == upstreamErrorTooLarge || code == upstreamErrorUnsupportedTool {
+		if code == upstreamErrorBadRequest || code == upstreamErrorInvalidRequest || code == upstreamErrorTooLarge || code == upstreamErrorUnsupportedTool {
 			status = http.StatusBadRequest
 		}
 		if code == upstreamErrorNotConfigured {

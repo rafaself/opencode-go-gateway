@@ -1,10 +1,10 @@
 # OpenCode Go Chat Completions client
 
-`internal/opencodego` is the outbound provider boundary for the M3 client. It
-owns the Chat Completions wire structs and translates only the validated
-provider-neutral values in `internal/bridge`. It does not import
-`internal/codex`, decode SSE, retry requests, or expose provider reasoning as
-bridge text.
+`internal/opencodego` is the outbound provider boundary for the Chat
+Completions client and its temporary M8 continuation state. It owns the Chat
+Completions wire structs and translates only the validated provider-neutral
+values in `internal/bridge`. It does not import `internal/codex`, execute
+tools, or expose provider reasoning as bridge text.
 
 The shipped provider defaults are:
 
@@ -104,14 +104,63 @@ gateway never executes or validates filesystem effects for `apply_patch`.
 
 Provider `reasoning_content` is present in `ChatCompletionResponse` and
 `ChatCompletionChunk` message structs. It remains provider metadata for the
-SSE/continuation milestones; this package never turns it into bridge text.
-DeepSeek requires that value to be carried through later tool-call turns, so
-the wire type is intentionally ready for #6/#10. Stream choice indexes and each
-tool-call delta's `index` are retained, including index zero, so #6 can
-reconstruct interleaved parallel calls without guessing positions.
+SSE/continuation boundary; this package never turns it into bridge text or a
+Responses summary. DeepSeek requires that value to be carried through later
+tool-call turns, so the M8 continuation store retains it only until its
+bounded TTL. Stream choice indexes and each tool-call delta's `index` are
+retained, including index zero, so #6 can reconstruct interleaved parallel
+calls without guessing positions.
 
 `parallel_tool_calls` is always emitted as an explicit boolean, including
 `false`, to preserve the bridge request's generation policy.
+
+## Tool-result continuation state
+
+Issue #10 adds an in-memory continuation store owned by `internal/opencodego`.
+When a finalized provider stream ends with one or more tool calls, the adapter
+retains only the provider/model identity, non-public `reasoning_content`,
+compatible assistant content, original provider tool calls and registrations,
+call IDs, and bounded lifecycle metadata. It does not retain the conversation
+or write reasoning, prompts, source, or tool output to logs.
+
+The next Responses request must contain every matching
+`function_call_output`/`custom_tool_call_output` item for that assistant turn.
+Results may arrive in any order; the reconstructed Chat Completions request
+contains exactly one assistant message with all original tool calls in order,
+followed by one `role: tool` message per result in request order. Custom
+`apply_patch` calls are replayed through the same private
+`__ocg_apply_patch` wrapper used by #9, while Codex continues to see the public
+`apply_patch` name. Empty output is preserved as an empty, non-null provider
+message. Error/status markers remain semantic bridge metadata while the exact
+textual output is passed unchanged to the provider.
+
+The store uses explicit `pending`, `consuming`, `consumed`, and `expired`
+states. A result request reserves a lease; the lease is committed only after
+the first valid provider response-start event has been translated and handled
+by the Responses stream. Header validation alone is not acceptance. The lease
+is aborted on cancellation, transport failure, malformed/empty streams, or an
+upstream 4xx before that event, allowing a retry. Once response-start is
+accepted, later provider failures retain consumed semantics.
+Concurrent submissions receive a stable busy error, and duplicate submissions
+after acceptance receive a consumed error during the short grace period.
+Unknown, expired, mixed-turn, incomplete, duplicate, and mismatched-kind
+results are rejected without echoing call IDs or result content. Expired
+records are removed from capacity accounting immediately; bounded call-ID
+tombstones keep a recently expired submission distinguishable from an unknown
+call before eventually becoming `continuation_unknown`. The default
+store bounds are a five-minute pending TTL, a ten-minute consuming lease
+deadline, 128 records, 16 MiB per record, 128 MiB aggregate, and a 30-second
+consumed grace period. Pending state uses only the pending TTL; once `Begin`
+reserves a result set, the active lease uses its own finite deadline so a
+long-running upstream request can commit after the pending TTL without
+retaining abandoned state forever. Cleanup, commit, and abort are serialized
+by the store mutex; an active lease that reaches its deadline becomes
+expired and cannot commit. All limits, lease durations, and the cleanup
+interval are configurable with `ContinuationStoreConfig`. `Close` stops
+the cleanup goroutine and releases retained state. Because v0.1 is
+process-local, a gateway restart loses pending state and the next result must
+be retried from a fresh provider turn; the gateway reports this as a
+recoverable `continuation_unknown` error.
 
 ## HTTP ownership and errors
 

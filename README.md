@@ -60,9 +60,10 @@ GET  /health/live   -> 200 {"status":"ok"}
 GET  /health/ready  -> 200 {"status":"ready"}
 POST /v1/responses  -> 200 text/event-stream (messages and function tools)
                          plus Codex's apply_patch custom-tool event shape
+                         plus function/custom tool-result continuations
                          4xx/5xx JSON error envelope before streaming
                          501 feature_not_implemented for unsupported custom
-                             tools, function tool results, and continuation
+                             tools and other unsupported Responses features
 ```
 
 Unknown paths return a JSON `not_found` error and unsupported methods return a
@@ -107,10 +108,14 @@ This milestone accepts standard function definitions with bounded JSON Schema
 parameters, reconstructs fragmented/parallel provider tool calls, and adapts
 Codex's implicit freeform `apply_patch` tool through a request-scoped strict
 function wrapper. Thinking mode omits upstream `tool_choice: auto` for
-DeepSeek compatibility. The gateway preserves exact custom input text but
-never executes or validates filesystem effects; forced or named choices,
-unsupported custom tools, function tool results, and continuation state return
-an explicit unsupported/invalid request response.
+DeepSeek compatibility. The gateway preserves exact custom input and result
+text but never executes or validates filesystem effects; forced or named
+choices and unsupported custom tools return explicit unsupported/invalid
+responses. Finalized DeepSeek reasoning/tool-call turns are retained only in a
+bounded in-memory store for the next matching function/custom result request;
+unknown, expired, mixed, incomplete, duplicate, or mismatched results return
+stable continuation errors. A process restart intentionally loses that
+temporary state and requires the client to retry from a fresh tool turn.
 
 ## Capture the Codex contract
 

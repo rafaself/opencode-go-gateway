@@ -134,6 +134,22 @@ func TestRequestFixturesDecodeDeterministically(t *testing.T) {
 	}
 }
 
+func TestDecoderTranslatesEmptyAndErroredToolResultForms(t *testing.T) {
+	decoder := mustDecoder(t, 1<<20)
+	body := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"continue"},{"type":"function_call","call_id":"call","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call","output":"","status":"failed","error":{"code":"tool_failed"}}],"stream":true}`
+	request, err := decoder.Decode(bytes.NewReader([]byte(body)), "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := request.Input[2].(bridge.FunctionCallOutput)
+	if !ok {
+		t.Fatalf("result type = %T", request.Input[2])
+	}
+	if result.CallID != "call" || result.Output != "" || result.Status != "failed" || !result.Error {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestRequestFixturesPreserveDomainValues(t *testing.T) {
 	decoder := mustDecoder(t, 1<<20)
 	requestDir := filepath.Join("..", "..", "testdata", "codex", "requests")
@@ -343,8 +359,6 @@ func TestDecodeRequestBoundaryAndPolicyErrors(t *testing.T) {
 		{name: "unknown tool type", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"hosted_tool"}]}`, contentType: "application/json", code: ErrorUnsupportedToolType, param: "tools[0].type", messagePart: "not supported"},
 		{name: "missing function call id", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","name":"exec_command","arguments":"{}"}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[0].call_id", messagePart: "required"},
 		{name: "missing output correlation", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call_output","call_id":"call_missing","output":""}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[0].call_id", messagePart: "does not correlate"},
-		{name: "mismatched output kind", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},{"type":"custom_tool_call_output","call_id":"call_1","output":""}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[1].call_id", messagePart: "kind"},
-		{name: "duplicate output correlation", body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"one"},{"type":"function_call_output","call_id":"call_1","output":"two"}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "input[2].call_id", messagePart: "more than one"},
 		{name: "duplicate tool name", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":{}},{"type":"function","name":"exec","parameters":{}}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[1].name", messagePart: "duplicate"},
 		{name: "invalid schema root", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":[]}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[0].parameters", messagePart: "JSON Schema"},
 		{name: "invalid nested schema", body: `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"exec","parameters":{"type":"object","properties":{"arg":"bad"}}}]}`, contentType: "application/json", code: ErrorInvalidRequest, param: "tools[0].parameters", messagePart: "JSON Schema"},
@@ -372,6 +386,34 @@ func TestDecodeRequestBoundaryAndPolicyErrors(t *testing.T) {
 			}
 			if decodeErr.Message == "" || !strings.Contains(decodeErr.Message, test.messagePart) {
 				t.Fatalf("message = %q, want substring %q", decodeErr.Message, test.messagePart)
+			}
+		})
+	}
+}
+
+func TestDecodeDefersContinuationResultCorrelation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "mismatched output kind",
+			body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},{"type":"custom_tool_call_output","call_id":"call_1","output":""}]}`,
+		},
+		{
+			name: "duplicate output correlation",
+			body: `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"one"},{"type":"function_call_output","call_id":"call_1","output":"two"}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := mustDecoder(t, DefaultMaxBodyBytes)
+			request, err := decoder.Decode(strings.NewReader(test.body), "application/json")
+			if err != nil {
+				t.Fatalf("Decode returned an unrelated request error: %v", err)
+			}
+			if len(request.Input) < 2 {
+				t.Fatalf("decoded input items = %#v", request.Input)
 			}
 		})
 	}
@@ -495,6 +537,8 @@ type bridgeFunctionCallGolden struct {
 type bridgeFunctionCallOutputGolden struct {
 	CallID string `json:"call_id"`
 	Output string `json:"output"`
+	Status string `json:"status,omitempty"`
+	Error  bool   `json:"error,omitempty"`
 }
 
 type bridgeCustomToolCallGolden struct {
@@ -508,6 +552,8 @@ type bridgeCustomToolCallGolden struct {
 type bridgeCustomToolCallOutputGolden struct {
 	CallID string `json:"call_id"`
 	Output string `json:"output"`
+	Status string `json:"status,omitempty"`
+	Error  bool   `json:"error,omitempty"`
 }
 
 type bridgeToolGolden struct {
@@ -579,11 +625,11 @@ func bridgeInputGoldens(items []bridge.InputItem) []bridgeInputGolden {
 		case bridge.FunctionCall:
 			golden.FunctionCall = &bridgeFunctionCallGolden{ID: item.ID, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Status: item.Status}
 		case bridge.FunctionCallOutput:
-			golden.FunctionCallOutput = &bridgeFunctionCallOutputGolden{CallID: item.CallID, Output: item.Output}
+			golden.FunctionCallOutput = &bridgeFunctionCallOutputGolden{CallID: item.CallID, Output: item.Output, Status: item.Status, Error: item.Error}
 		case bridge.CustomToolCall:
 			golden.CustomToolCall = &bridgeCustomToolCallGolden{ID: item.ID, CallID: item.CallID, Name: item.Name, Input: item.Input, Status: item.Status}
 		case bridge.CustomToolCallOutput:
-			golden.CustomToolCallOutput = &bridgeCustomToolCallOutputGolden{CallID: item.CallID, Output: item.Output}
+			golden.CustomToolCallOutput = &bridgeCustomToolCallOutputGolden{CallID: item.CallID, Output: item.Output, Status: item.Status, Error: item.Error}
 		default:
 			panic("bridge input contains an unsupported union")
 		}

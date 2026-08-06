@@ -26,6 +26,11 @@ type Request struct {
 	// Provider adapters may attach it when a continuation chain needs stable
 	// tool-name translations.
 	ToolRegistry *ToolRegistry `json:"-"`
+	// Continuation is opaque adapter-owned state for a provider continuation.
+	// The bridge only carries it across the server/upstream seam; it is never
+	// serialized or interpreted here. Provider-specific replay remains in the
+	// owning adapter package.
+	Continuation any `json:"-"`
 }
 
 // GenerationOptions contains only options with a shared semantic meaning in
@@ -142,6 +147,8 @@ func (FunctionCall) ToolKind() ToolKind { return ToolFunction }
 type FunctionCallOutput struct {
 	CallID string `json:"call_id"`
 	Output string `json:"output"`
+	Status string `json:"status,omitempty"`
+	Error  bool   `json:"error,omitempty"`
 }
 
 func (FunctionCallOutput) Kind() InputKind    { return InputFunctionCallOutput }
@@ -165,11 +172,24 @@ func (CustomToolCall) ToolKind() ToolKind { return ToolCustom }
 type CustomToolCallOutput struct {
 	CallID string `json:"call_id"`
 	Output string `json:"output"`
+	Status string `json:"status,omitempty"`
+	Error  bool   `json:"error,omitempty"`
 }
 
 func (CustomToolCallOutput) Kind() InputKind    { return InputCustomToolCallOutput }
 func (CustomToolCallOutput) isInputItem()       {}
 func (CustomToolCallOutput) ToolKind() ToolKind { return ToolCustom }
+
+// ToolResult is the provider-neutral result of one Codex tool-result item.
+// Output is kept byte-for-byte as text; Error and Status carry only the
+// semantic outcome and never retain an untrusted error payload.
+type ToolResult struct {
+	CallID string
+	Kind   ToolKind
+	Output string
+	Status string
+	Error  bool
+}
 
 // ContentKind identifies an explicit message content union member.
 type ContentKind string

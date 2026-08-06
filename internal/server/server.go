@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
+	"github.com/rafaself/opencode-go-gateway/internal/opencodego"
 )
 
 const (
@@ -41,6 +42,11 @@ type Config struct {
 	IdleTimeout       time.Duration
 	MaxBodyBytes      int64
 	MaxHeaderBytes    int
+	// ContinuationStore may be injected by an embedding application or test.
+	// When nil, New creates and owns a standard-library in-memory store using
+	// ContinuationStoreConfig.
+	ContinuationStore       *opencodego.ContinuationStore
+	ContinuationStoreConfig opencodego.ContinuationStoreConfig
 }
 
 // Server owns the loopback HTTP listener and the Codex-facing route surface.
@@ -58,6 +64,10 @@ type Server struct {
 	activeRequests   map[uint64]context.CancelFunc
 	shuttingDown     bool
 
+	continuations         *opencodego.ContinuationStore
+	ownsContinuations     bool
+	continuationCloseOnce sync.Once
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -74,9 +84,21 @@ func New(config Config, logger *slog.Logger) (*Server, error) {
 	if config.MaxBodyBytes <= 0 || config.MaxHeaderBytes <= 0 {
 		return nil, fmt.Errorf("HTTP limits must be positive")
 	}
+	continuations := config.ContinuationStore
+	ownsContinuations := false
+	if continuations == nil {
+		continuations, err = opencodego.NewContinuationStore(config.ContinuationStoreConfig)
+		if err != nil {
+			return nil, fmt.Errorf("configure continuation store: %w", err)
+		}
+		ownsContinuations = true
+	}
 
 	listener, err := net.ListenTCP("tcp", address)
 	if err != nil {
+		if ownsContinuations {
+			_ = continuations.Close()
+		}
 		return nil, fmt.Errorf("listen on %s: %w", config.ListenAddr, err)
 	}
 	if logger == nil {
@@ -90,11 +112,13 @@ func New(config Config, logger *slog.Logger) (*Server, error) {
 		})
 	}
 	server := &Server{
-		config:         config,
-		ln:             listener,
-		logger:         logger,
-		upstream:       upstream,
-		activeRequests: make(map[uint64]context.CancelFunc),
+		config:            config,
+		ln:                listener,
+		logger:            logger,
+		upstream:          upstream,
+		continuations:     continuations,
+		ownsContinuations: ownsContinuations,
+		activeRequests:    make(map[uint64]context.CancelFunc),
 	}
 	server.http = &http.Server{
 		Handler:           server,
@@ -164,6 +188,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.ready.Store(false)
 		s.cancelActiveRequests()
 		s.shutdownErr = s.http.Shutdown(ctx)
+		s.closeContinuations()
 	})
 	return s.shutdownErr
 }
@@ -175,7 +200,16 @@ func (s *Server) Close() error {
 	s.ready.Store(false)
 	s.markShuttingDown()
 	s.cancelActiveRequests()
-	return s.http.Close()
+	err := s.http.Close()
+	s.closeContinuations()
+	return err
+}
+
+func (s *Server) closeContinuations() {
+	if s == nil || !s.ownsContinuations || s.continuations == nil {
+		return
+	}
+	s.continuationCloseOnce.Do(func() { _ = s.continuations.Close() })
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

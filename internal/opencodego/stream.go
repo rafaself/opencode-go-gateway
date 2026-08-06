@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -141,6 +142,12 @@ type BridgeStreamDecoder struct {
 	maxAggregateBytes        int
 	maxToolCallArgumentBytes int
 	toolRegistry             *bridge.ToolRegistry
+	providerModel            string
+	createdAt                time.Time
+	assistantContent         []byte
+	reasoningContent         []byte
+	finalized                bool
+	toolTurn                 bool
 }
 
 type providerToolCall struct {
@@ -289,6 +296,14 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 		}, len(chunk.ID)+len(chunk.Model)); err != nil {
 			return err
 		}
+		decoder.providerModel = chunk.Model
+		decoder.createdAt = createdAt
+	}
+	if decoder.providerModel == "" && chunk.Model != "" {
+		decoder.providerModel = chunk.Model
+	}
+	if decoder.createdAt.IsZero() && chunk.Created != 0 {
+		decoder.createdAt = time.Unix(chunk.Created, 0).UTC()
 	}
 	for _, choice := range chunk.Choices {
 		if choice.Index < 0 {
@@ -329,11 +344,13 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 			if err := decoder.queue(bridge.TextDelta{ChoiceIndex: choice.Index, Text: *choice.Delta.Content}, len(*choice.Delta.Content)); err != nil {
 				return err
 			}
+			decoder.assistantContent = append(decoder.assistantContent, (*choice.Delta.Content)...)
 		}
 		if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
 			if err := decoder.queue(bridge.ReasoningDelta{ChoiceIndex: choice.Index, Text: *choice.Delta.ReasoningContent}, len(*choice.Delta.ReasoningContent)); err != nil {
 				return err
 			}
+			decoder.reasoningContent = append(decoder.reasoningContent, (*choice.Delta.ReasoningContent)...)
 		}
 		seenToolIndexes := make(map[int]struct{}, len(choice.Delta.ToolCalls))
 		for _, tool := range choice.Delta.ToolCalls {
@@ -393,6 +410,9 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 		decoder.calls[key] = state
 	}
 	if tool.ID != "" {
+		if err := decoder.reserveAggregateBytes(providerCallIDGrowth(state.providerCallID, tool.ID)); err != nil {
+			return err
+		}
 		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
 	}
 	state.name = append(state.name, tool.Function.Name...)
@@ -419,7 +439,7 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 	}
 	state.arguments = append(state.arguments, tool.Function.Arguments...)
 	if state.kind == bridge.ToolCustom || state.customCandidate {
-		if err := decoder.reserveRawArgument(len(tool.Function.Arguments)); err != nil {
+		if err := decoder.reserveAggregateBytes(len(tool.Function.Arguments)); err != nil {
 			return err
 		}
 		return nil
@@ -484,7 +504,7 @@ func (decoder *BridgeStreamDecoder) ensureToolStarted(state *providerToolCall) e
 	return nil
 }
 
-func (decoder *BridgeStreamDecoder) reserveRawArgument(bytes int) error {
+func (decoder *BridgeStreamDecoder) reserveAggregateBytes(bytes int) error {
 	if bytes < 0 || decoder.aggregateBytes > decoder.maxAggregateBytes-bytes {
 		return ErrStreamAggregateLimit
 	}
@@ -506,6 +526,23 @@ func appendProviderCallID(existing []byte, fragment string) []byte {
 		return append(existing[:0], fragment...)
 	default:
 		return append(existing, fragment...)
+	}
+}
+
+func providerCallIDGrowth(existing []byte, fragment string) int {
+	if fragment == "" {
+		return 0
+	}
+	current := string(existing)
+	switch {
+	case current == "":
+		return len(fragment)
+	case current == fragment:
+		return 0
+	case strings.HasPrefix(fragment, current):
+		return len(fragment) - len(current)
+	default:
+		return len(fragment)
 	}
 }
 
@@ -599,6 +636,8 @@ func (decoder *BridgeStreamDecoder) finish() error {
 	}
 	switch decoder.finishReason {
 	case "stop", "tool_calls":
+		decoder.finalized = true
+		decoder.toolTurn = decoder.finishReason == "tool_calls" && len(decoder.calls) > 0
 		return decoder.queue(bridge.Completed{Reason: decoder.finishReason}, 0)
 	case "length":
 		return decoder.queue(bridge.Incomplete{Reason: "max_output_tokens"}, 0)
@@ -607,6 +646,63 @@ func (decoder *BridgeStreamDecoder) finish() error {
 	default:
 		return decoder.queue(bridge.Failed{Code: "upstream_terminal_error", Message: "upstream stream reported an unsupported terminal reason"}, 0)
 	}
+}
+
+// PendingTurn returns the finalized provider-side assistant turn when this
+// stream ended with tool calls. It is intentionally unavailable for ordinary
+// text turns and for streams that have not reached a valid terminal event.
+// Private reasoning and provider identifiers stay inside the provider adapter
+// and are never represented by bridge stream events.
+func (decoder *BridgeStreamDecoder) PendingTurn() (*PendingTurn, bool) {
+	if decoder == nil || !decoder.finalized || !decoder.toolTurn {
+		return nil, false
+	}
+	keys := sortedToolKeys(decoder.calls)
+	turn := PendingTurn{
+		Provider:         ProviderName,
+		Model:            decoder.providerModel,
+		ReasoningContent: string(decoder.reasoningContent),
+		AssistantContent: string(decoder.assistantContent),
+		CreatedAt:        decoder.createdAt,
+		ToolCalls:        make([]UpstreamToolCall, 0, len(keys)),
+		CallIDs:          make([]string, 0, len(keys)),
+	}
+	registrations := make(map[string]bridge.ToolRegistration)
+	for _, key := range keys {
+		state := decoder.calls[key]
+		if !state.completed || !state.started {
+			return nil, false
+		}
+		providerCallID := string(state.providerCallID)
+		if providerCallID == "" {
+			providerCallID = string(state.callID)
+		}
+		name := string(state.name)
+		arguments := string(state.arguments)
+		if state.kind == bridge.ToolCustom {
+			name = state.registration.UpstreamName
+			if name == "" {
+				return nil, false
+			}
+			registrations[state.registration.InboundName] = state.registration
+		}
+		turn.ToolCalls = append(turn.ToolCalls, UpstreamToolCall{
+			CallID:         string(state.callID),
+			ProviderCallID: providerCallID,
+			Kind:           state.kind,
+			Name:           name,
+			Arguments:      arguments,
+			Registration:   state.registration,
+		})
+		turn.CallIDs = append(turn.CallIDs, string(state.callID))
+	}
+	for _, registration := range registrations {
+		turn.ToolRegistrations = append(turn.ToolRegistrations, registration)
+	}
+	sort.Slice(turn.ToolRegistrations, func(left, right int) bool {
+		return turn.ToolRegistrations[left].InboundName < turn.ToolRegistrations[right].InboundName
+	})
+	return &turn, true
 }
 
 func sortedToolKeys(calls map[bridge.ToolCallKey]*providerToolCall) []bridge.ToolCallKey {

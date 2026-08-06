@@ -460,67 +460,396 @@ func TestResponsesStreamsCheckedApplyPatchFixtureThroughProvider(t *testing.T) {
 	}
 }
 
-func TestResponsesMapsCheckedCustomToolResultHistoryThroughProvider(t *testing.T) {
-	var providerRequest map[string]any
+func TestResponsesRejectsUnknownToolResultHistory(t *testing.T) {
+	called := false
+	gateway := newIntegrationGateway(t, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		called = true
+		return nil, errors.New("upstream must not be called")
+	}), nil)
+	response := postRequest(t, gateway, checkedFixtureRequestBody(t, "custom-tool-result-request.json"))
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, readBody(t, response.Body))
+	}
+	body := readBody(t, response.Body)
+	if !strings.Contains(body, `"continuation_unknown"`) || strings.Contains(body, "<normalized:id>") {
+		t.Fatalf("unknown continuation response = %s", body)
+	}
+	if called {
+		t.Fatal("upstream was called for an unknown continuation")
+	}
+}
+
+func TestResponsesPreservesContinuationErrorsForDeferredResultCorrelation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code string
+	}{
+		{
+			name: "duplicate result",
+			body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","output":"one"},{"type":"function_call_output","call_id":"call-1","output":"two"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
+			code: "continuation_duplicate",
+		},
+		{
+			name: "mismatched result kind",
+			body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"custom_tool_call_output","call_id":"call-1","output":"wrong kind"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
+			code: "continuation_kind_mismatch",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+				called = true
+				return nil, errors.New("upstream must not be called")
+			}), nil)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			server.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"`+test.code+`"`) {
+				t.Fatalf("response = %d %s", recorder.Code, recorder.Body.String())
+			}
+			if called {
+				t.Fatal("upstream was called for a continuation validation error")
+			}
+		})
+	}
+}
+
+func TestResponsesReplaysDeepSeekReasoningAndToolResultsEndToEnd(t *testing.T) {
+	var providerRequests []map[string]any
 	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if err := json.NewDecoder(request.Body).Decode(&providerRequest); err != nil {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			http.Error(writer, "invalid request", http.StatusBadRequest)
 			return
 		}
-		messages, ok := providerRequest["messages"].([]any)
-		if !ok || len(messages) != 4 {
-			http.Error(writer, "custom result history was not grouped", http.StatusBadRequest)
-			return
-		}
-		assistant, ok := messages[2].(map[string]any)
-		toolCalls, callsOK := assistant["tool_calls"].([]any)
-		if !ok || !callsOK || len(toolCalls) != 1 {
-			http.Error(writer, "custom call history was not mapped", http.StatusBadRequest)
-			return
-		}
-		toolCall := toolCalls[0].(map[string]any)
-		function := toolCall["function"].(map[string]any)
-		if function["name"] != opencodego.ApplyPatchUpstreamName || toolCall["id"] != "<normalized:id>" {
-			http.Error(writer, "custom call identity was changed", http.StatusBadRequest)
-			return
-		}
-		var arguments map[string]string
-		if err := json.Unmarshal([]byte(function["arguments"].(string)), &arguments); err != nil || arguments[opencodego.ApplyPatchWrapperField] != "<redacted:string>" {
-			http.Error(writer, "custom call wrapper was changed", http.StatusBadRequest)
-			return
-		}
-		resultMessage, ok := messages[3].(map[string]any)
-		if !ok || resultMessage["role"] != "tool" || resultMessage["tool_call_id"] != "<normalized:id>" || resultMessage["content"] != "<redacted:string>" {
-			http.Error(writer, "custom result was changed", http.StatusBadRequest)
-			return
-		}
+		providerRequests = append(providerRequests, body)
 		writer.Header().Set("Content-Type", "text/event-stream")
 		writer.WriteHeader(http.StatusOK)
+		if len(providerRequests) == 1 {
+			_, _ = io.WriteString(writer, strings.Join([]string{
+				`data: {"id":"provider-first","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"deep reasoning"},"finish_reason":null}]}`,
+				`data: {"id":"provider-first","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"provider-call","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}}]},"finish_reason":null}]}`,
+				`data: {"id":"provider-first","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				`data: [DONE]`,
+			}, "\n\n")+"\n\n")
+			return
+		}
+		messages, ok := body["messages"].([]any)
+		if !ok || len(messages) != 3 {
+			http.Error(writer, "continuation messages were not reconstructed", http.StatusBadRequest)
+			return
+		}
+		assistant, ok := messages[1].(map[string]any)
+		if !ok || assistant["role"] != "assistant" || assistant["content"] != "" || assistant["reasoning_content"] != "deep reasoning" {
+			http.Error(writer, "assistant reasoning turn was not replayed", http.StatusBadRequest)
+			return
+		}
+		calls, ok := assistant["tool_calls"].([]any)
+		if !ok || len(calls) != 1 {
+			http.Error(writer, "assistant tool call was not replayed", http.StatusBadRequest)
+			return
+		}
+		call := calls[0].(map[string]any)
+		function := call["function"].(map[string]any)
+		if call["id"] != "provider-call" || function["name"] != "lookup" || function["arguments"] != `{"query":"x"}` {
+			http.Error(writer, "assistant tool call changed during replay", http.StatusBadRequest)
+			return
+		}
+		result := messages[2].(map[string]any)
+		if result["role"] != "tool" || result["tool_call_id"] != "provider-call" || result["content"] != "exact tool output" {
+			http.Error(writer, "tool result changed during replay", http.StatusBadRequest)
+			return
+		}
 		_, _ = io.WriteString(writer, strings.Join([]string{
-			`data: {"id":"provider-result","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"continued"},"finish_reason":null}]}`,
-			`data: {"id":"provider-result","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: {"id":"provider-second","object":"chat.completion.chunk","created":1700000001,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"final answer"},"finish_reason":null}]}`,
+			`data: {"id":"provider-second","object":"chat.completion.chunk","created":1700000001,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 			`data: [DONE]`,
 		}, "\n\n")+"\n\n")
 	}))
 	defer provider.Close()
 	client, err := opencodego.NewClient(opencodego.ClientConfig{
-		APIKey:     "custom-result-provider-key",
+		APIKey:     "continuation-provider-key",
 		BaseURL:    provider.URL,
 		HTTPClient: provider.Client(),
-		UserAgent:  "opencode-go-gateway/custom-result-test",
+		UserAgent:  "opencode-go-gateway/continuation-test",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), nil)
-	response := postRequest(t, gateway, checkedFixtureRequestBody(t, "custom-tool-result-request.json"))
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", response.StatusCode, readBody(t, response.Body))
+	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
+	firstResponse := postRequest(t, gateway, initial)
+	firstEvents := readResponseEvents(t, firstResponse.Body)
+	firstResponse.Body.Close()
+	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("initial tool response = %#v", firstEvents)
 	}
-	events := readResponseEvents(t, response.Body)
-	if len(events) == 0 || events[len(events)-1]["type"] != "response.completed" {
-		t.Fatalf("custom result response = %#v", events)
+	if strings.Contains(string(mustJSON(t, firstEvents)), "deep reasoning") {
+		t.Fatal("reasoning content leaked to Responses")
+	}
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"provider-call","name":"lookup","arguments":"{\"query\":\"x\"}","status":"completed"},{"type":"function_call_output","call_id":"provider-call","output":"exact tool output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
+	secondResponse := postRequest(t, gateway, continuation)
+	secondEvents := readResponseEvents(t, secondResponse.Body)
+	secondResponse.Body.Close()
+	if len(secondEvents) == 0 || secondEvents[len(secondEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("continued response = %#v", secondEvents)
+	}
+	if len(providerRequests) != 2 {
+		t.Fatalf("provider request count = %d", len(providerRequests))
+	}
+}
+
+func TestResponsesRetriesContinuationAfterUpstreamBadRequest(t *testing.T) {
+	var upstreamCalls int
+	var continuationRequests int
+	upstream := UpstreamClientFunc(func(_ context.Context, request bridge.Request) (*UpstreamResponse, error) {
+		upstreamCalls++
+		if request.Continuation != nil {
+			continuationRequests++
+		}
+		switch upstreamCalls {
+		case 1:
+			return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(providerToolStream(t, "lookup", "retry-call", `{"x":1}`)))}, nil
+		case 2:
+			return &UpstreamResponse{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":"provider rejected retry"}`))}, nil
+		default:
+			return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`data: {"id":"retry-success","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"retried"},"finish_reason":null}]}`,
+				`data: {"id":"retry-success","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+				`data: [DONE]`,
+			}, "\n\n") + "\n\n"))}, nil
+		}
+	})
+	gateway := newIntegrationGateway(t, upstream, nil)
+	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	first := postRequest(t, gateway, initial)
+	firstEvents := readResponseEvents(t, first.Body)
+	first.Body.Close()
+	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("initial response = %#v", firstEvents)
+	}
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	failed := postRequest(t, gateway, continuation)
+	failedBody := readBody(t, failed.Body)
+	failed.Body.Close()
+	if failed.StatusCode != http.StatusBadRequest || !strings.Contains(failedBody, `"upstream_bad_request"`) {
+		t.Fatalf("upstream rejection = %d %s", failed.StatusCode, failedBody)
+	}
+	retried := postRequest(t, gateway, continuation)
+	retriedEvents := readResponseEvents(t, retried.Body)
+	retried.Body.Close()
+	if len(retriedEvents) == 0 || retriedEvents[len(retriedEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("retried response = %#v", retriedEvents)
+	}
+	if upstreamCalls != 3 || continuationRequests != 2 {
+		t.Fatalf("upstream calls = %d, continuation requests = %d", upstreamCalls, continuationRequests)
+	}
+}
+
+func TestResponsesReleasesContinuationBeforeFirstAcceptedUpstreamEvent(t *testing.T) {
+	const initial = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const continuation = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	tests := []struct {
+		name   string
+		stream string
+		cancel bool
+	}{
+		{name: "malformed SSE", stream: "data: {not-json\n\n"},
+		{name: "immediate EOF", stream: ""},
+		{name: "provider stream error", stream: "data: {\"error\":{\"type\":\"server_error\"}}\n\n"},
+		{name: "client cancellation", cancel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var continuationAttempts int
+			entered := make(chan struct{})
+			var blocked *blockingBody
+			upstream := UpstreamClientFunc(func(_ context.Context, request bridge.Request) (*UpstreamResponse, error) {
+				if request.Continuation == nil {
+					return &UpstreamResponse{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       io.NopCloser(strings.NewReader(providerToolStream(t, "lookup", "retry-call", `{"x":1}`))),
+					}, nil
+				}
+				continuationAttempts++
+				if continuationAttempts == 1 {
+					if test.cancel {
+						blocked = &blockingBody{closed: make(chan struct{})}
+						close(entered)
+						return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: blocked}, nil
+					}
+					return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(test.stream))}, nil
+				}
+				success := strings.Join([]string{
+					`data: {"id":"retry-success","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"retried"},"finish_reason":null}]}`,
+					`data: {"id":"retry-success","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+					`data: [DONE]`,
+				}, "\n\n") + "\n\n"
+				return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(success))}, nil
+			})
+			server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, upstream, nil)
+
+			initialRecorder := httptest.NewRecorder()
+			initialRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(initial))
+			initialRequest.Header.Set("Content-Type", "application/json")
+			server.ServeHTTP(initialRecorder, initialRequest)
+			if initialRecorder.Code != http.StatusOK || !strings.Contains(initialRecorder.Body.String(), `"response.completed"`) {
+				t.Fatalf("initial response = %d %s", initialRecorder.Code, initialRecorder.Body.String())
+			}
+
+			firstRecorder := httptest.NewRecorder()
+			firstRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
+			firstRequest.Header.Set("Content-Type", "application/json")
+			if test.cancel {
+				requestContext, cancel := context.WithCancel(firstRequest.Context())
+				firstRequest = firstRequest.WithContext(requestContext)
+				done := make(chan struct{})
+				go func() {
+					server.ServeHTTP(firstRecorder, firstRequest)
+					close(done)
+				}()
+				select {
+				case <-entered:
+					cancel()
+				case <-time.After(time.Second):
+					t.Fatal("cancellation upstream was not reached")
+				}
+				select {
+				case <-blocked.closed:
+				case <-time.After(time.Second):
+					t.Fatal("cancellation did not close the upstream body")
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("cancelled response handler did not finish")
+				}
+			} else {
+				server.ServeHTTP(firstRecorder, firstRequest)
+			}
+			if !strings.Contains(firstRecorder.Body.String(), `"response.failed"`) {
+				t.Fatalf("pre-acceptance response = %s", firstRecorder.Body.String())
+			}
+
+			retryRecorder := httptest.NewRecorder()
+			retryRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
+			retryRequest.Header.Set("Content-Type", "application/json")
+			server.ServeHTTP(retryRecorder, retryRequest)
+			if retryRecorder.Code != http.StatusOK || !strings.Contains(retryRecorder.Body.String(), `"response.completed"`) {
+				t.Fatalf("retry response = %d %s", retryRecorder.Code, retryRecorder.Body.String())
+			}
+			if continuationAttempts != 2 {
+				t.Fatalf("continuation attempts = %d, want 2", continuationAttempts)
+			}
+		})
+	}
+
+}
+
+func TestResponsesConsumesContinuationAfterFirstAcceptedEvent(t *testing.T) {
+	const initial = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const continuation = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"accepted-call","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"accepted-call","output":"result"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	var continuationAttempts int
+	upstream := UpstreamClientFunc(func(_ context.Context, request bridge.Request) (*UpstreamResponse, error) {
+		if request.Continuation == nil {
+			return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(providerToolStream(t, "lookup", "accepted-call", `{}`)))}, nil
+		}
+		continuationAttempts++
+		if continuationAttempts == 1 {
+			acceptedThenEOF := "data: {\"id\":\"accepted\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+			return &UpstreamResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(acceptedThenEOF))}, nil
+		}
+		return nil, errors.New("provider must not be retried after acceptance")
+	})
+	server := newTestServerWithConfigAndUpstream(t, Config{ListenAddr: "127.0.0.1:0"}, upstream, nil)
+
+	initialRecorder := httptest.NewRecorder()
+	initialRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(initial))
+	initialRequest.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(initialRecorder, initialRequest)
+
+	firstRecorder := httptest.NewRecorder()
+	firstRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
+	firstRequest.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(firstRecorder, firstRequest)
+	if !strings.Contains(firstRecorder.Body.String(), `"response.failed"`) {
+		t.Fatalf("accepted upstream failure response = %s", firstRecorder.Body.String())
+	}
+
+	secondRecorder := httptest.NewRecorder()
+	secondRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
+	secondRequest.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(secondRecorder, secondRequest)
+	if secondRecorder.Code != http.StatusBadRequest || !strings.Contains(secondRecorder.Body.String(), `"continuation_consumed"`) {
+		t.Fatalf("accepted continuation retry = %d %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+	if continuationAttempts != 1 {
+		t.Fatalf("provider continuation attempts = %d, want 1", continuationAttempts)
+	}
+}
+
+func TestResponsesReplaysCustomApplyPatchContinuationThroughProvider(t *testing.T) {
+	var providerRequests []map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		providerRequests = append(providerRequests, body)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		if len(providerRequests) == 1 {
+			_, _ = io.WriteString(writer, providerToolStream(t, opencodego.ApplyPatchUpstreamName, "custom-retry-call", `{"input":"patch"}`))
+			return
+		}
+		messages := body["messages"].([]any)
+		assistant := messages[1].(map[string]any)
+		calls := assistant["tool_calls"].([]any)
+		call := calls[0].(map[string]any)
+		function := call["function"].(map[string]any)
+		if assistant["content"] != "" || assistant["reasoning_content"] != "" || call["id"] != "custom-retry-call" || function["name"] != opencodego.ApplyPatchUpstreamName || function["arguments"] != `{"input":"patch"}` {
+			http.Error(writer, "custom continuation was not reconstructed", http.StatusBadRequest)
+			return
+		}
+		result := messages[2].(map[string]any)
+		if result["role"] != "tool" || result["tool_call_id"] != "custom-retry-call" || result["content"] != "applied exactly" {
+			http.Error(writer, "custom result was not reconstructed", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(writer, strings.Join([]string{
+			`data: {"id":"custom-second","object":"chat.completion.chunk","created":1700000001,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}`,
+			`data: {"id":"custom-second","object":"chat.completion.chunk","created":1700000001,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}, "\n\n")+"\n\n")
+	}))
+	defer provider.Close()
+	client, err := opencodego.NewClient(opencodego.ClientConfig{APIKey: "custom-continuation-key", BaseURL: provider.URL, HTTPClient: provider.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), nil)
+	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"}],"tools":[],"stream":true}`
+	first := postRequest(t, gateway, initial)
+	firstEvents := readResponseEvents(t, first.Body)
+	first.Body.Close()
+	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("custom initial response = %#v", firstEvents)
+	}
+	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"},{"type":"custom_tool_call","call_id":"custom-retry-call","name":"apply_patch","input":"patch","status":"completed"},{"type":"custom_tool_call_output","call_id":"custom-retry-call","output":"applied exactly"}],"tools":[],"stream":true}`
+	second := postRequest(t, gateway, continuation)
+	secondEvents := readResponseEvents(t, second.Body)
+	second.Body.Close()
+	if len(secondEvents) == 0 || secondEvents[len(secondEvents)-1]["type"] != "response.completed" {
+		t.Fatalf("custom continuation response = %#v", secondEvents)
+	}
+	if len(providerRequests) != 2 {
+		t.Fatalf("provider requests = %d", len(providerRequests))
 	}
 }
 

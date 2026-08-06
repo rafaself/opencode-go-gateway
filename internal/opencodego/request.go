@@ -60,7 +60,16 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 			return ChatCompletionRequest{}, err
 		}
 	}
-	messages, err := mapInputItems(request.Input, registry)
+	var messages []ChatMessage
+	if request.Continuation != nil {
+		continuation, ok := request.Continuation.(*ContinuationRequest)
+		if !ok || continuation == nil || continuation.lease == nil {
+			return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+		}
+		messages, err = mapContinuationInputItems(request.Input, continuation.lease, model)
+	} else {
+		messages, err = mapInputItems(request.Input, registry)
+	}
 	if err != nil {
 		return ChatCompletionRequest{}, err
 	}
@@ -208,6 +217,144 @@ func mapInputItem(item bridge.InputItem) (ChatMessage, error) {
 	default:
 		return ChatMessage{}, providerError(ErrorInvalidRequest, nil)
 	}
+}
+
+func mapContinuationInputItems(items []bridge.InputItem, lease *ContinuationLease, model string) ([]ChatMessage, error) {
+	if lease == nil {
+		return nil, providerError(ErrorInvalidRequest, nil)
+	}
+	turn := lease.Turn()
+	if turn.Provider != ProviderName || (turn.Model != "" && turn.Model != model) || len(turn.ToolCalls) == 0 {
+		return nil, providerError(ErrorInvalidRequest, nil)
+	}
+	results := lease.Results()
+	if len(results) != len(turn.ToolCalls) {
+		return nil, providerError(ErrorInvalidRequest, nil)
+	}
+	callKinds := make(map[string]bridge.ToolKind, len(turn.ToolCalls))
+	callNames := make(map[string]string, len(turn.ToolCalls))
+	callArguments := make(map[string]string, len(turn.ToolCalls))
+	providerIDs := make(map[string]string, len(turn.ToolCalls))
+	for _, call := range turn.ToolCalls {
+		callKinds[call.CallID] = call.Kind
+		providerIDs[call.CallID] = call.ProviderCallID
+		if call.Kind == bridge.ToolCustom {
+			callNames[call.CallID] = ApplyPatchToolName
+			callArguments[call.CallID] = call.Arguments
+		} else {
+			callNames[call.CallID] = call.Name
+			callArguments[call.CallID] = call.Arguments
+		}
+	}
+	seenCalls := make(map[string]struct{}, len(turn.ToolCalls))
+	seenResults := make(map[string]struct{}, len(results))
+	messages := make([]ChatMessage, 0, len(items)+1+len(results))
+	replayed := false
+	for _, item := range items {
+		switch value := item.(type) {
+		case bridge.FunctionCall:
+			if err := validateContinuationCall(value.CallID, bridge.ToolFunction, value.Name, value.Arguments, callKinds, callNames, callArguments, seenCalls); err != nil {
+				return nil, err
+			}
+			if !replayed {
+				messages = append(messages, continuationMessages(turn, results, providerIDs)...)
+				replayed = true
+			}
+		case bridge.CustomToolCall:
+			wrapped, err := wrapApplyPatchInput(value.Input)
+			if err != nil {
+				return nil, providerError(ErrorInvalidRequest, err)
+			}
+			if err := validateContinuationCall(value.CallID, bridge.ToolCustom, value.Name, wrapped, callKinds, callNames, callArguments, seenCalls); err != nil {
+				return nil, err
+			}
+			if !replayed {
+				messages = append(messages, continuationMessages(turn, results, providerIDs)...)
+				replayed = true
+			}
+		case bridge.FunctionCallOutput:
+			if err := validateContinuationResult(value.CallID, bridge.ToolFunction, callKinds, seenResults); err != nil {
+				return nil, err
+			}
+		case bridge.CustomToolCallOutput:
+			if err := validateContinuationResult(value.CallID, bridge.ToolCustom, callKinds, seenResults); err != nil {
+				return nil, err
+			}
+		default:
+			message, err := mapInputItem(item)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
+		}
+	}
+	if !replayed || len(seenCalls) != len(turn.ToolCalls) || len(seenResults) != len(results) {
+		return nil, providerError(ErrorInvalidRequest, nil)
+	}
+	return messages, nil
+}
+
+func validateContinuationCall(callID string, kind bridge.ToolKind, name, arguments string, callKinds map[string]bridge.ToolKind, callNames, callArguments map[string]string, seen map[string]struct{}) error {
+	wantKind, ok := callKinds[callID]
+	if !ok {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	if wantKind != kind || callNames[callID] != name {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	if kind == bridge.ToolCustom {
+		storedInput, storedErr := unwrapApplyPatchArguments(callArguments[callID])
+		incomingInput, incomingErr := unwrapApplyPatchArguments(arguments)
+		if storedErr != nil || incomingErr != nil || storedInput != incomingInput {
+			return providerError(ErrorInvalidRequest, nil)
+		}
+	} else if callArguments[callID] != arguments {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	if _, exists := seen[callID]; exists {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	seen[callID] = struct{}{}
+	return nil
+}
+
+func validateContinuationResult(callID string, kind bridge.ToolKind, callKinds map[string]bridge.ToolKind, seen map[string]struct{}) error {
+	wantKind, ok := callKinds[callID]
+	if !ok || wantKind != kind {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	if _, exists := seen[callID]; exists {
+		return providerError(ErrorInvalidRequest, nil)
+	}
+	seen[callID] = struct{}{}
+	return nil
+}
+
+func continuationMessages(turn PendingTurn, results []bridge.ToolResult, providerIDs map[string]string) []ChatMessage {
+	content := turn.AssistantContent
+	reasoning := turn.ReasoningContent
+	calls := make([]ToolCall, 0, len(turn.ToolCalls))
+	for _, call := range turn.ToolCalls {
+		providerID := call.ProviderCallID
+		if mapped := providerIDs[call.CallID]; mapped != "" {
+			providerID = mapped
+		}
+		calls = append(calls, ToolCall{
+			ID:   providerID,
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      call.Name,
+				Arguments: call.Arguments,
+			},
+		})
+	}
+	messages := []ChatMessage{{Role: "assistant", Content: &content, ReasoningContent: &reasoning, ToolCalls: calls}}
+	for _, result := range results {
+		providerID := providerIDs[result.CallID]
+		output := result.Output
+		messages = append(messages, ChatMessage{Role: "tool", Content: &output, ToolCallID: providerID})
+	}
+	return messages
 }
 
 func mapToolCallInput(item bridge.InputItem, registry *bridge.ToolRegistry) (ToolCall, error) {
