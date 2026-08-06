@@ -27,7 +27,7 @@ func TestRoutesReturnStableJSONContracts(t *testing.T) {
 	}{
 		{name: "live", method: http.MethodGet, path: "/health/live", wantStatus: http.StatusOK, wantStatusField: "ok"},
 		{name: "ready", method: http.MethodGet, path: "/health/ready", wantStatus: http.StatusOK, wantStatusField: "ready"},
-		{name: "responses placeholder", method: http.MethodPost, path: "/v1/responses", body: `{"model":"deepseek-v4-flash","prompt":"private prompt"}`, wantStatus: http.StatusNotImplemented, wantType: "not_implemented"},
+		{name: "responses without provider", method: http.MethodPost, path: "/v1/responses", body: textRequestBodyForServerTest(), wantStatus: http.StatusInternalServerError, wantType: "upstream_not_configured"},
 		{name: "unknown path", method: http.MethodGet, path: "/unknown", wantStatus: http.StatusNotFound, wantType: "not_found"},
 		{name: "live method", method: http.MethodPost, path: "/health/live", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodGet, wantType: "method_not_allowed"},
 		{name: "responses method", method: http.MethodGet, path: "/v1/responses", wantStatus: http.StatusMethodNotAllowed, wantAllow: http.MethodPost, wantType: "method_not_allowed"},
@@ -37,6 +37,9 @@ func TestRoutesReturnStableJSONContracts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(test.method, "http://127.0.0.1"+test.path, strings.NewReader(test.body))
+			if test.path == "/v1/responses" {
+				request.Header.Set("Content-Type", "application/json")
+			}
 			server.ServeHTTP(recorder, request)
 
 			if recorder.Code != test.wantStatus {
@@ -44,6 +47,9 @@ func TestRoutesReturnStableJSONContracts(t *testing.T) {
 			}
 			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
 				t.Fatalf("content type = %q", got)
+			}
+			if got := recorder.Header().Get("X-Request-ID"); !strings.HasPrefix(got, "req-") {
+				t.Fatalf("request ID = %q", got)
 			}
 			if test.wantAllow != "" && recorder.Header().Get("Allow") != test.wantAllow {
 				t.Fatalf("allow = %q, want %q", recorder.Header().Get("Allow"), test.wantAllow)
@@ -78,7 +84,7 @@ func TestResponsesEnforceBodyLimit(t *testing.T) {
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), `"code":"request_entity_too_large"`) {
+	if !strings.Contains(recorder.Body.String(), `"code":"request_too_large"`) {
 		t.Fatalf("body = %s", recorder.Body.String())
 	}
 }
@@ -87,17 +93,18 @@ func TestLogsContainRequestMetadataButNoSensitiveValues(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	server := newTestServer(t, logger)
-	secretBody := `{"prompt":"private prompt","api_key":"sk-request-secret"}`
+	secretBody := `{"model":"gpt-5.3-codex","instructions":"private prompt","input":[{"type":"message","role":"user","content":"private prompt"}],"stream":true}`
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses?secret=query", strings.NewReader(secretBody))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer header-secret")
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusNotImplemented {
+	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", recorder.Code)
 	}
 	logOutput := logs.String()
-	for _, expected := range []string{"component=server", "request_id=", "method=POST", "route=responses", "status=501", "error_code=not_implemented"} {
+	for _, expected := range []string{"component=server", "request_id=", "method=POST", "route=responses", "status=500", "error_code=upstream_not_configured"} {
 		if !strings.Contains(logOutput, expected) {
 			t.Fatalf("logs do not contain %q: %s", expected, logOutput)
 		}
@@ -107,6 +114,10 @@ func TestLogsContainRequestMetadataButNoSensitiveValues(t *testing.T) {
 			t.Fatalf("logs contain forbidden value %q: %s", forbidden, logOutput)
 		}
 	}
+}
+
+func textRequestBodyForServerTest() string {
+	return `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"stream":true}`
 }
 
 func TestLogsClassifyUnknownRoutesWithoutLoggingTheRawPath(t *testing.T) {

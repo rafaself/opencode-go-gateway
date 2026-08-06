@@ -786,7 +786,7 @@ func (session *StreamSession) finishToolItemLocked(item *streamItem, status stri
 }
 
 func (session *StreamSession) writeTerminalLocked(status string, responseError map[string]any, incompleteReason string) error {
-	if session.terminalAt.IsZero() {
+	if status == "completed" && session.terminalAt.IsZero() {
 		if session.clock != nil {
 			session.terminalAt = session.clock().UTC()
 		}
@@ -814,11 +814,15 @@ func (session *StreamSession) responseObjectLocked(status string, responseError 
 		response["model"] = session.Model
 	}
 	if status != "in_progress" {
-		terminalAt := session.terminalAt
-		if terminalAt.IsZero() {
-			terminalAt = session.CreatedAt
+		if status == "completed" {
+			terminalAt := session.terminalAt
+			if terminalAt.IsZero() {
+				terminalAt = session.CreatedAt
+			}
+			response["completed_at"] = terminalAt.Unix()
+		} else {
+			response["completed_at"] = nil
 		}
-		response["completed_at"] = terminalAt.Unix()
 	}
 	if responseError != nil {
 		response["error"] = responseError

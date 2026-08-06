@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
 
 const (
@@ -32,6 +34,7 @@ const (
 type Config struct {
 	ListenAddr        string
 	AllowNonLoopback  bool
+	Upstream          UpstreamClient
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
@@ -40,15 +43,20 @@ type Config struct {
 	MaxHeaderBytes    int
 }
 
-// Server owns the loopback HTTP listener and the small M1 route surface.
+// Server owns the loopback HTTP listener and the Codex-facing route surface.
 type Server struct {
-	config Config
-	ln     net.Listener
-	http   *http.Server
-	logger *slog.Logger
-	ready  atomic.Bool
+	config   Config
+	ln       net.Listener
+	http     *http.Server
+	logger   *slog.Logger
+	upstream UpstreamClient
+	ready    atomic.Bool
 
 	requestID uint64
+
+	activeRequestsMu sync.Mutex
+	activeRequests   map[uint64]context.CancelFunc
+	shuttingDown     bool
 
 	shutdownOnce sync.Once
 	shutdownErr  error
@@ -75,7 +83,19 @@ func New(config Config, logger *slog.Logger) (*Server, error) {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	server := &Server{config: config, ln: listener, logger: logger}
+	upstream := config.Upstream
+	if upstream == nil {
+		upstream = UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+			return nil, &UpstreamError{Code: upstreamErrorNotConfigured}
+		})
+	}
+	server := &Server{
+		config:         config,
+		ln:             listener,
+		logger:         logger,
+		upstream:       upstream,
+		activeRequests: make(map[uint64]context.CancelFunc),
+	}
 	server.http = &http.Server{
 		Handler:           server,
 		ReadHeaderTimeout: config.ReadHeaderTimeout,
@@ -142,6 +162,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.shutdownOnce.Do(func() {
 		s.ready.Store(false)
+		s.cancelActiveRequests()
 		s.shutdownErr = s.http.Shutdown(ctx)
 	})
 	return s.shutdownErr
@@ -152,13 +173,25 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.ready.Store(false)
+	s.markShuttingDown()
+	s.cancelActiveRequests()
 	return s.http.Close()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := atomic.AddUint64(&s.requestID, 1)
+	requestContext, cancel := context.WithCancel(r.Context())
+	unregister := s.trackRequest(requestID, cancel)
+	defer func() {
+		unregister()
+		cancel()
+	}()
+	r = r.WithContext(requestContext)
+
 	started := time.Now()
 	response := &statusWriter{ResponseWriter: w}
+	requestIDValue := fmt.Sprintf("req-%06d", requestID)
+	response.Header().Set("X-Request-ID", requestIDValue)
 	route := routeForPath(r.URL.Path)
 
 	s.route(response, r)
@@ -168,13 +201,53 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("http request",
 		slog.String("component", "server"),
-		slog.String("request_id", fmt.Sprintf("req-%06d", requestID)),
+		slog.String("request_id", requestIDValue),
 		slog.String("method", r.Method),
 		slog.String("route", route),
 		slog.Int("status", response.status),
 		slog.Int64("latency_ms", time.Since(started).Milliseconds()),
 		slog.String("error_code", response.errorCode),
+		slog.String("response_model", response.responseModel),
+		slog.String("response_terminal", response.responseTerminal),
 	)
+}
+
+func (s *Server) trackRequest(requestID uint64, cancel context.CancelFunc) func() {
+	s.activeRequestsMu.Lock()
+	if s.shuttingDown {
+		s.activeRequestsMu.Unlock()
+		cancel()
+		return func() {}
+	}
+	s.activeRequests[requestID] = cancel
+	s.activeRequestsMu.Unlock()
+	return func() {
+		s.activeRequestsMu.Lock()
+		delete(s.activeRequests, requestID)
+		s.activeRequestsMu.Unlock()
+	}
+}
+
+func (s *Server) markShuttingDown() {
+	s.activeRequestsMu.Lock()
+	s.shuttingDown = true
+	s.activeRequestsMu.Unlock()
+}
+
+func (s *Server) cancelActiveRequests() {
+	s.activeRequestsMu.Lock()
+	if !s.shuttingDown {
+		s.shuttingDown = true
+	}
+	cancels := make([]context.CancelFunc, 0, len(s.activeRequests))
+	for _, cancel := range s.activeRequests {
+		cancels = append(cancels, cancel)
+	}
+	s.activeRequestsMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 func (s *Server) route(w *statusWriter, r *http.Request) {
@@ -220,8 +293,10 @@ func routeForPath(path string) string {
 
 type statusWriter struct {
 	http.ResponseWriter
-	status    int
-	errorCode string
+	status           int
+	errorCode        string
+	responseModel    string
+	responseTerminal string
 }
 
 func (w *statusWriter) WriteHeader(status int) {

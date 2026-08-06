@@ -96,9 +96,9 @@ func runGateway(ctx context.Context, lookup config.LookupEnv, stdout, stderr io.
 		return err
 	}
 	logger := app.NewLogger(stderr, settings.LogLevel)
-	return app.Run(ctx, settings, logger, func(address string) {
+	return app.RunWithBuildMetadata(ctx, settings, logger, func(address string) {
 		fmt.Fprintf(stdout, "opencode-gateway listening on http://%s\n", address)
-	})
+	}, app.BuildMetadata{Version: version, Commit: commit, BuildDate: buildDate})
 }
 
 func signalContext(parent context.Context) (context.Context, context.CancelFunc) {

@@ -15,7 +15,8 @@ Observed input item types are `message`, `function_call`, `function_call_output`
 The command is deliberately development-only and binds to a resolved loopback IP. It refuses wildcard or non-loopback listener addresses, limits request bodies, never logs the raw body, and writes fixture files with restrictive permissions.
 
 ```bash
-go run ./cmd/opencode-gateway dev capture-codex \
+make build
+./bin/opencode-gateway dev capture-codex \
   --name simple \
   --output-dir /tmp/opencode-codex-capture
 ```
@@ -155,4 +156,6 @@ The fixture tests intentionally fail if a request field is not classified or if 
 The incremental provider decoder and per-request Responses session introduced
 by M4 are documented in [Streaming boundaries](codex-streaming.md). They keep
 provider chunks, bridge semantics, and Responses wire state in separate
-packages so issue #7 can orchestrate them without generic map plumbing.
+packages. Issue #7 wires the first text-only vertical slice through those
+boundaries; its manual smoke workflow is documented in the
+[project README](../README.md#first-text-only-smoke-test).

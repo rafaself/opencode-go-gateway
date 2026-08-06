@@ -234,15 +234,17 @@ func TestStreamSessionAggregateLimitCoversReasoningAndToolState(t *testing.T) {
 	}
 }
 
-func TestStreamSessionUsesTerminalClockForEveryTerminalStatus(t *testing.T) {
+func TestStreamSessionUsesTerminalClockOnlyForCompletedResponses(t *testing.T) {
 	statuses := []struct {
-		name  string
-		event bridge.StreamEvent
-		type_ string
+		name             string
+		event            bridge.StreamEvent
+		type_            string
+		wantCompletedAt  any
+		wantTimestampKey bool
 	}{
-		{name: "completed", event: bridge.Completed{Reason: "stop"}, type_: "response.completed"},
-		{name: "incomplete", event: bridge.Incomplete{Reason: "max_output_tokens"}, type_: "response.incomplete"},
-		{name: "failed", event: bridge.Failed{Code: "upstream", Message: "The response stream failed."}, type_: "response.failed"},
+		{name: "completed", event: bridge.Completed{Reason: "stop"}, type_: "response.completed", wantCompletedAt: float64(11), wantTimestampKey: true},
+		{name: "incomplete", event: bridge.Incomplete{Reason: "max_output_tokens"}, type_: "response.incomplete", wantCompletedAt: nil, wantTimestampKey: true},
+		{name: "failed", event: bridge.Failed{Code: "upstream", Message: "The response stream failed."}, type_: "response.failed", wantCompletedAt: nil, wantTimestampKey: true},
 	}
 	for _, test := range statuses {
 		t.Run(test.name, func(t *testing.T) {
@@ -264,8 +266,11 @@ func TestStreamSessionUsesTerminalClockForEveryTerminalStatus(t *testing.T) {
 				t.Fatalf("terminal type = %v", terminal["type"])
 			}
 			response := terminal["response"].(map[string]any)
-			if response["created_at"] != float64(10) || response["completed_at"] != float64(11) {
+			if response["created_at"] != float64(10) || response["completed_at"] != test.wantCompletedAt {
 				t.Fatalf("terminal timestamps = created %v completed %v", response["created_at"], response["completed_at"])
+			}
+			if _, ok := response["completed_at"]; ok != test.wantTimestampKey {
+				t.Fatalf("completed_at presence = %v, want %v", ok, test.wantTimestampKey)
 			}
 		})
 	}

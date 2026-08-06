@@ -10,13 +10,33 @@ import (
 	"unicode"
 
 	"github.com/rafaself/opencode-go-gateway/internal/config"
+	"github.com/rafaself/opencode-go-gateway/internal/opencodego"
 	"github.com/rafaself/opencode-go-gateway/internal/server"
 )
+
+// BuildMetadata is supplied by the CLI's linker-injected build variables and
+// is used only for safe diagnostics and the upstream User-Agent.
+type BuildMetadata struct {
+	Version   string
+	Commit    string
+	BuildDate string
+}
 
 // Run starts the local gateway and owns its bounded graceful-shutdown
 // lifecycle. Signal wiring belongs to the CLI so this function stays easy to
 // exercise with a cancellable context in integration tests.
 func Run(ctx context.Context, settings config.Config, logger *slog.Logger, onReady func(string)) error {
+	return RunWithBuildMetadata(ctx, settings, logger, onReady, BuildMetadata{
+		Version:   "dev",
+		Commit:    "unknown",
+		BuildDate: "unknown",
+	})
+}
+
+// RunWithBuildMetadata constructs the configured OpenCode Go client and wires
+// it into the gateway. The API key crosses this boundary only into the
+// provider client; it is never passed to the Codex-facing server.
+func RunWithBuildMetadata(ctx context.Context, settings config.Config, logger *slog.Logger, onReady func(string), metadata BuildMetadata) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -26,10 +46,20 @@ func Run(ctx context.Context, settings config.Config, logger *slog.Logger, onRea
 	if logger == nil {
 		logger = NewLogger(io.Discard, settings.LogLevel)
 	}
+	upstreamClient, err := opencodego.NewClient(opencodego.ClientConfig{
+		APIKey:    settings.APIKey(),
+		BaseURL:   settings.BaseURL,
+		Model:     opencodego.DefaultModel,
+		UserAgent: buildUserAgent(metadata),
+	})
+	if err != nil {
+		return fmt.Errorf("configure upstream client: %w", err)
+	}
 
 	runtimeServer, err := server.New(server.Config{
 		ListenAddr:        settings.ListenAddr(),
 		AllowNonLoopback:  settings.AllowNonLoopback,
+		Upstream:          server.NewOpenCodeUpstreamClient(upstreamClient),
 		ReadHeaderTimeout: settings.ReadHeaderTimeout,
 		ReadTimeout:       settings.ReadTimeout,
 		WriteTimeout:      settings.WriteTimeout,
@@ -73,6 +103,33 @@ func Run(ctx context.Context, settings config.Config, logger *slog.Logger, onRea
 		}
 		return nil
 	}
+}
+
+func buildUserAgent(metadata BuildMetadata) string {
+	return "opencode-go-gateway/" + safeMetadataPart(metadata.Version) +
+		" commit/" + safeMetadataPart(metadata.Commit) +
+		" build/" + safeMetadataPart(metadata.BuildDate)
+}
+
+func safeMetadataPart(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	var result strings.Builder
+	for _, runeValue := range value {
+		if (runeValue >= 'a' && runeValue <= 'z') || (runeValue >= 'A' && runeValue <= 'Z') || (runeValue >= '0' && runeValue <= '9') || runeValue == '.' || runeValue == '-' || runeValue == '_' {
+			result.WriteRune(runeValue)
+			continue
+		}
+		result.WriteByte('-')
+	}
+	if result.Len() == 0 {
+		return "unknown"
+	}
+	if result.Len() > 64 {
+		return result.String()[:64]
+	}
+	return result.String()
 }
 
 // NewLogger creates the process logger. Attribute-level redaction is a

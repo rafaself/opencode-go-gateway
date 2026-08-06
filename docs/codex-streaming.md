@@ -91,7 +91,9 @@ The session generates and owns the public Responses response ID. A provider
 the downstream response. `StreamSessionOptions.Clock` controls terminal
 timestamps in deterministic tests, and `MaxAggregateBytes` bounds retained
 text, reasoning, tool IDs/names/arguments, and session state. Terminal
-responses record their terminal timestamp separately from `created_at`.
+successful responses record their terminal timestamp separately from
+`created_at`; incomplete and failed responses serialize `completed_at` as
+`null` because they did not complete successfully.
 
 The session mutex serializes concurrent `Handle` calls. If a downstream write
 or flush fails, `Handle`/`Start` returns `ErrStreamWrite`, `WriteFailure()`
@@ -99,3 +101,27 @@ exposes the stable error, and `Done()` is closed exactly once. Issue #7 owns
 the upstream response body and request context: it must observe `Done()` and
 cancel/close that upstream resource. The session deliberately does not own or
 close the provider body.
+
+## Issue #7 request orchestration
+
+`internal/server` composes these boundaries for `POST /v1/responses`:
+
+1. `codex.Decoder.DecodeRequest` validates the request media type, body size,
+   UTF-8, duplicate keys, trailing values, and field policy.
+2. The server rejects tools, tool-call/result inputs, structured output formats,
+   and continuation state before calling the provider.
+3. The injected `server.UpstreamClient` returns only a provider-neutral status,
+   headers, and body. Status and `text/event-stream` are validated before the
+   downstream session commits headers.
+4. A child context is passed to the upstream client. A downstream write/flush
+   failure or inbound cancellation cancels that context and closes the body;
+   the watcher is joined before the handler returns.
+5. The bridge decoder and Responses session process one semantic event at a
+   time. Provider errors, malformed JSON, and truncated streams become one
+   terminal `response.failed` event when downstream delivery is still possible;
+   `finish_reason=length` becomes `response.incomplete`.
+
+The application constructs the OpenCode Go client from `OPENCODE_GO_API_KEY`
+and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or included in
+logs, errors, or Responses bytes. See the [text-only smoke test](../README.md#first-text-only-smoke-test)
+for the manual verification record.

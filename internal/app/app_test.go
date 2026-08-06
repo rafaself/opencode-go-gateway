@@ -84,7 +84,7 @@ func TestRunWaitsForActiveRequestDuringGracefulShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if _, err := fmt.Fprintf(connection, "POST /v1/responses HTTP/1.1\r\nHost: %s\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{", address); err != nil {
+	if _, err := fmt.Fprintf(connection, "POST /v1/responses HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{", address); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,8 +103,8 @@ func TestRunWaitsForActiveRequestDuringGracefulShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNotImplemented)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusBadRequest)
 	}
 
 	select {
@@ -186,5 +186,19 @@ func TestNewLoggerRedactsNestedStructuredValues(t *testing.T) {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("logger omitted expected safe metadata or redaction marker %q: %s", expected, output)
 		}
+	}
+}
+
+func TestBuildUserAgentUsesOnlySafeBuildMetadata(t *testing.T) {
+	got := buildUserAgent(BuildMetadata{
+		Version:   "v1.2.3; drop-header",
+		Commit:    "abc/def",
+		BuildDate: "2026-08-06T12:34:56Z",
+	})
+	if strings.ContainsAny(got, "\r\n;") {
+		t.Fatalf("user agent contains unsafe characters: %q", got)
+	}
+	if !strings.Contains(got, "opencode-go-gateway/v1.2.3") || !strings.Contains(got, "commit/abc-def") {
+		t.Fatalf("user agent does not preserve safe metadata: %q", got)
 	}
 }
