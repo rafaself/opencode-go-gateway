@@ -31,8 +31,11 @@ OpenCode Go credential is used only for the outbound provider request.
 - An OpenCode Go subscription and API key. Keep the key in the gateway process
   environment; never put it in Codex TOML or a checked-in file.
 - For source builds: Go `1.22+`, GNU Make, and a POSIX shell.
-- For the opt-in live smoke only: `curl`, `git`, `jq`, `rg`, Codex CLI, and
-  network access. CI never sends a paid inference request.
+- For the existing text smoke: `curl`, `git`, `jq`, `rg`, Codex CLI, and
+  network access.
+- For the opt-in scenario suite: Bash, `curl`, `git`, `jq` with
+  `--unbuffered`, `mkfifo`, Codex CLI, and network access. CI and release
+  workflows never send a paid inference request.
 
 ## Install and run
 
@@ -222,6 +225,57 @@ Contract/integration/fuzz checks are available through `make contract`,
 `make integration`, and `make fuzz-smoke FUZZTIME=1s`. `make release-check`
 adds all required release gates; `make package-self-test` builds and verifies
 the cross-platform archives locally.
+
+### Opt-in live scenario suite
+
+The deterministic tests cannot prove behavior against a live Codex CLI and
+provider. The paid scenario suite is never part of CI or the release
+workflow, and it requires deliberate authorization through
+`RUN_LIVE_SCENARIOS=1`. The full suite makes one isolated request for each of
+seven scenarios, so it can incur provider charges and model/tool behavior can
+make a scenario take up to its bounded timeout. Run it only when you accept
+that cost and have reviewed the temporary-workspace safety conditions:
+
+```bash
+make build
+RUN_LIVE_SCENARIOS=1 OPENCODE_GO_API_KEY='your-key' \
+  ./scripts/live-scenarios.sh --all
+```
+
+Individual scenarios can be selected (`text`, `inspect`, `shell`, `function`,
+`apply-patch`, `parallel`, or `cancel`), for example:
+
+```bash
+RUN_LIVE_SCENARIOS=1 OPENCODE_GO_API_KEY='your-key' \
+  ./scripts/live-scenarios.sh text apply-patch
+```
+
+The suite starts the built gateway on an ephemeral loopback port and invokes
+Codex with `--ignore-user-config`, `--ephemeral`, and a generated temporary
+Codex home and Git repository. The key is supplied only to the gateway child
+process and is explicitly unset for Codex. Codex never runs in this project
+worktree. The suite uses fixed harmless prompts and validates the generated
+repository after tool scenarios; it does not execute arbitrary incoming tool
+text itself. During a run, Codex stdout is reduced to structural JSONL event
+records; after success the temporary home, repository, events, logs, and
+diagnostics are removed. Failed runs retain a private diagnostics directory
+containing structural events and safe gateway diagnostics; raw Codex stderr
+and the temporary home/repository are discarded.
+
+The suite fails with a named scenario when the model does not produce the
+required event shape, patch, parallel attempt, or cancellation lifecycle. It
+also checks health after cancellation and scans gateway logs, the Codex home,
+and repository for the credential, prompt marker, authorization values, or
+source paths. Use the credential-free argument/static path while developing:
+
+```bash
+make live-scenarios-test
+./scripts/live-scenarios.sh --validate --all
+```
+
+The older `RUN_LIVE_SMOKE=1 ./scripts/live-smoke.sh` command remains the
+small text-only incremental-output smoke. It is intentionally not evidence
+for the tool, patch, parallel, or cancellation scenarios.
 
 Read [docs/architecture.md](docs/architecture.md) for contribution and
 release checklists, [docs/codex-compatibility.md](docs/codex-compatibility.md)

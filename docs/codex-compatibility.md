@@ -80,21 +80,59 @@ in `testdata/codex/field-policy.json`.
 
 ## Paid smoke policy
 
-`scripts/live-smoke.sh` is the only automated real-provider smoke currently
-enabled. It is text-only, opt-in, uses a temporary Codex home and repository,
-and keeps the OpenCode Go key in the gateway process environment. Its offline
-event-shape checks are run by `scripts/live-smoke-test.sh` and do not make a
-network request.
+The real-provider scenarios are deliberately opt-in and are never run by CI,
+the release workflow, or `make release-check`. They require explicit
+authorization and can incur one or more billable model/tool turns per selected
+scenario:
 
-The function-tool, `apply_patch`, and continuation paths have deterministic
-full-handler integration coverage in `internal/server` and real redacted
-fixtures. They are not invoked automatically by CI or by a generic paid
-script: an unattended tool request could change a user's workspace or retain
-provider state unexpectedly. A maintainer may add a scenario-specific,
-temporary-workspace smoke after recording its safety conditions and expected
-tool-result lifecycle in this matrix. Never treat the text smoke as proof of
-those other scenarios.
+```bash
+make build
+RUN_LIVE_SCENARIOS=1 OPENCODE_GO_API_KEY='your-key' \
+  ./scripts/live-scenarios.sh --all
+```
 
-No GitHub Actions workflow in this repository sends a paid inference request
-or receives an API credential. Failures in the real smoke retain diagnostics
-only in its temporary directory, as documented in the README.
+Use scenario names to limit cost (`text`, `inspect`, `shell`, `function`,
+`apply-patch`, `parallel`, and `cancel`). The suite covers:
+
+| Scenario | Required live evidence |
+| --- | --- |
+| `text` | completed text turn and assistant-message event |
+| `inspect` | command execution against the generated repository, with no edits |
+| `shell` | one fixed harmless shell command |
+| `function` | one standard function/tool event and completed turn |
+| `apply-patch` | an apply-patch/file-change event and exact generated-file edit |
+| `parallel` | two tool starts before the first tool completion |
+| `cancel` | a started long-running streamed response, client cancellation, and healthy gateway afterward |
+
+The script starts the built binary on an ephemeral loopback port and uses a
+temporary, owner-only Codex home and Git repository. It runs Codex with
+`--ignore-user-config`, `--ephemeral`, and explicit provider overrides. The
+OpenCode Go key is assigned only to the gateway child and is explicitly unset
+for Codex. Codex runs in the generated repository, never in the project
+worktree. Prompts and tool text are fixed by the script; the script never
+executes arbitrary incoming tool text.
+
+Codex stdout is read through a FIFO and reduced immediately to structural
+JSONL containing only allowlisted event types, item types, phases, statuses,
+and booleans. Text, arguments, outputs, IDs, paths, usage, and raw Codex
+stderr are not retained. Bounded timeouts, low-rate one-second checks, cleanup,
+health checks, and leak scans cover the safety boundary. A model or provider
+that does not produce the required behavior fails the named scenario; it is
+never reported as a pass. Failed runs retain only private structural events
+and safe gateway diagnostics, while the generated home, repository, and raw
+Codex stderr are discarded.
+
+The credential-free validation path checks shell syntax, scenario names,
+opt-in gating, process isolation markers, and structural redaction:
+
+```bash
+make live-scenarios-test
+./scripts/live-scenarios.sh --validate --all
+```
+
+The existing `RUN_LIVE_SMOKE=1 ./scripts/live-smoke.sh` command remains the
+small text-only incremental-output smoke. Its offline tests are
+`scripts/live-smoke-test.sh`; it is not evidence for the tool, patch,
+parallel, or cancellation scenarios. The compatibility matrix must record the
+Codex version, OS, architecture, selected scenarios, and whether each paid
+run actually completed.

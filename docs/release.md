@@ -87,19 +87,37 @@ safe output and that logs contain neither the key nor request content.
 
 ## Paid smoke policy
 
-Paid inference is never part of CI or the release workflow. The opt-in text
-smoke is:
+Paid inference is never part of CI, the release workflow, or
+`make release-check`. The existing opt-in text smoke is:
 
 ```bash
 RUN_LIVE_SMOKE=1 ./scripts/live-smoke.sh
 ```
 
-It requires a user-supplied `OPENCODE_GO_API_KEY`, Codex CLI, and network
-access, and uses a temporary Codex home/repository. The text smoke does not
-prove function-tool, `apply_patch`, or continuation behavior. Those paths have
-deterministic contract/integration coverage, but an operator must explicitly
-approve and run a scenario-specific paid smoke before claiming that gate. A
-release must never claim those unavailable live scenarios were run.
+The required issue #13 live-validation suite is:
+
+```bash
+RUN_LIVE_SCENARIOS=1 OPENCODE_GO_API_KEY='your-key' \
+  ./scripts/live-scenarios.sh --all
+```
+
+It makes one isolated paid request per selected scenario: text, temporary
+repository inspection, a harmless shell command, one standard function/tool
+turn, `apply_patch` editing, a parallel-tool attempt, and cancellation of a
+long-running request. The full suite can therefore incur seven billable
+requests plus provider-side tool/continuation usage. Select scenario names to
+limit cost. The suite requires a built binary, Codex CLI, network access, and
+explicit operator authorization; `./scripts/live-scenarios.sh --validate --all`
+and `make live-scenarios-test` are credential-free checks.
+
+The suite creates an owner-only temporary Codex home and Git repository,
+starts the gateway on an ephemeral loopback port, keeps the key only in the
+gateway child environment, and unsets it for Codex. It never uses the project
+worktree or executes arbitrary incoming tool text. It retains only structural
+JSONL and safe diagnostics on failure, cleans up on success, and fails clearly
+when the live model/provider does not produce a required scenario. It is not a
+CI or release gate. Record the exact Codex version, OS, architecture, selected
+scenarios, and actual result before treating the paid gate as complete.
 
 ## Publishing
 
