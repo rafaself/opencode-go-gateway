@@ -5,7 +5,7 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf 'unknown')
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS ?= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: fmt vet test race build check
+.PHONY: fmt vet test contract integration race fuzz-smoke build check
 
 fmt:
 	$(GO) fmt ./...
@@ -16,8 +16,19 @@ vet:
 test:
 	$(GO) test -count=1 ./...
 
+contract:
+	$(GO) test -count=1 ./internal/capture ./internal/codex ./internal/server
+
+integration:
+	$(GO) test -count=1 ./internal/server
+
 race:
 	$(GO) test -race ./...
+
+FUZZTIME ?= 1s
+
+fuzz-smoke:
+	FUZZTIME=$(FUZZTIME) ./scripts/fuzz-smoke.sh
 
 build:
 	mkdir -p bin

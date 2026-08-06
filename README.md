@@ -15,7 +15,10 @@ the Go standard library.
 make fmt
 make vet
 make test
+make contract
+make integration
 make race
+make fuzz-smoke FUZZTIME=1s
 make build
 ```
 
@@ -158,6 +161,14 @@ No live smoke request runs in CI. Failed runs retain their temporary directory
 and print its path for diagnostics; successful runs remove it automatically. For
 a length limit, the terminal event is `response.incomplete`; a provider or
 transport failure after SSE starts is `response.failed`.
+
+The contract and integration layers also run every checked-in Codex request
+and Responses fixture through executable structural assertions. SSE decoders
+are tested across exhaustive single-boundary splits and deterministic random
+partitions. Bounded fuzz smoke covers SSE, provider chunks, request decoding,
+custom-tool parsing, fragmented arguments, continuation correlation, and error
+serialization. See [docs/codex-compatibility.md](docs/codex-compatibility.md)
+for the Codex-version matrix and safe recapture procedure.
 
 This milestone accepts standard function definitions with bounded JSON Schema
 parameters, reconstructs fragmented/parallel provider tool calls, and adapts
