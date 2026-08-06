@@ -26,6 +26,8 @@ This file applies to the whole repository. Read it before making changes. If a m
 - Use `apply_patch` for hand-edited files. Run `gofmt` on changed Go files.
 - Keep changes focused and update implementation, tests, documentation, and fixtures together when they describe the same behavior.
 - Use TDD whenever it is practical: start with a focused failing test, implement the smallest correct change, then refactor and keep the test as regression coverage. Do not force TDD for documentation-only, configuration-only, or otherwise trivial changes where it adds no value.
+- Treat tests as executable expressions of the application domain, not merely as a gate to turn green. When changing tests or the test suite, derive expected behavior primarily from project documentation, the contract, and domain semantics; when documentation is incomplete or ambiguous, use sound judgment to choose and document the best domain-aligned approach.
+- Never weaken assertions, remove meaningful coverage, add tautological tests, or distort production behavior solely to satisfy the current suite. A correction is complete only when both code and tests preserve the project's quality criteria and the real behavior of the application domain.
 - Prefer deterministic outputs: normalize IDs and timestamps in fixtures, avoid clock- or network-dependent tests, and use temporary directories for generated captures.
 - Keep production code dependency-free unless the user explicitly approves a new dependency.
 
