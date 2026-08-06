@@ -407,6 +407,12 @@ func (s *Server) streamAndPersistFixture(ctx context.Context, w http.ResponseWri
 			CodexVersion: fixture.CodexVersion,
 		})
 	}
+	if streamErr == nil {
+		return fixtureErr
+	}
+	if fixtureErr == nil {
+		return streamErr
+	}
 	return errors.Join(streamErr, fixtureErr)
 }
 
