@@ -139,7 +139,7 @@ func TestMapRequestGroupsContiguousFunctionCallsAndPreservesBoundaries(t *testin
 	}
 }
 
-func TestMapRequestSupportsThinkingPolicyAndForcedChoices(t *testing.T) {
+func TestMapRequestSupportsThinkingPolicyAndRejectsForcedChoices(t *testing.T) {
 	base := bridge.Request{
 		Input:      []bridge.InputItem{bridge.Message{Role: bridge.RoleUser, Content: []bridge.ContentPart{bridge.TextContent{Text: "hello"}}}},
 		Tools:      []bridge.Tool{bridge.FunctionTool{Name: "lookup", Parameters: mustSchema(t, `{"type":"object"}`)}},
@@ -154,11 +154,11 @@ func TestMapRequestSupportsThinkingPolicyAndForcedChoices(t *testing.T) {
 		wantError  ErrorCode
 	}{
 		{name: "thinking none", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceNone}, mode: ThinkingEnabled, wantChoice: "none"},
-		{name: "thinking required preserved", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceRequired}, mode: ThinkingEnabled, wantChoice: "required"},
-		{name: "thinking named preserved", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceFunction, FunctionName: "lookup"}, mode: ThinkingEnabled, wantChoice: ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: "lookup"}}},
+		{name: "thinking required rejected", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceRequired}, mode: ThinkingEnabled, wantError: ErrorUnsupportedToolChoice},
+		{name: "thinking named rejected", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceFunction, FunctionName: "lookup"}, mode: ThinkingEnabled, wantError: ErrorUnsupportedToolChoice},
 		{name: "non-thinking auto", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceAuto}, mode: ThinkingDisabled, wantChoice: "auto"},
-		{name: "non-thinking required", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceRequired}, mode: ThinkingDisabled, wantChoice: "required"},
-		{name: "non-thinking named", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceFunction, FunctionName: "lookup"}, mode: ThinkingDisabled, wantChoice: ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: "lookup"}}},
+		{name: "non-thinking required rejected", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceRequired}, mode: ThinkingDisabled, wantError: ErrorUnsupportedToolChoice},
+		{name: "non-thinking named rejected", choice: bridge.ToolChoice{Kind: bridge.ToolChoiceFunction, FunctionName: "lookup"}, mode: ThinkingDisabled, wantError: ErrorUnsupportedToolChoice},
 		{name: "unsupported choice rejected", choice: bridge.ToolChoice{Kind: "future_choice"}, mode: ThinkingEnabled, wantError: ErrorUnsupportedToolChoice},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -58,15 +58,26 @@ func MapRequestWithThinking(request bridge.Request, model string, mode ThinkingM
 		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
 
+	if len(request.Tools) > bridge.DefaultMaxFunctionTools {
+		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+	}
+	toolNames := make(map[string]struct{}, len(request.Tools))
+	schemaBytes := 0
 	for _, tool := range request.Tools {
 		mapped, err := mapTool(tool)
 		if err != nil {
 			return ChatCompletionRequest{}, err
 		}
+		name := mapped.Function.Name
+		if _, exists := toolNames[name]; exists {
+			return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+		}
+		toolNames[name] = struct{}{}
+		if len(mapped.Function.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
+			return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
+		}
+		schemaBytes += len(mapped.Function.Parameters)
 		result.Tools = append(result.Tools, mapped)
-	}
-	if len(result.Tools) > 128 {
-		return ChatCompletionRequest{}, providerError(ErrorInvalidRequest, nil)
 	}
 
 	if request.Generation.Reasoning.Effort != "" {
@@ -255,20 +266,9 @@ func mapToolChoice(choice bridge.ToolChoice, tools []ChatCompletionTool, mode Th
 	case bridge.ToolChoiceNone:
 		return &ToolChoice{String: "none"}, nil
 	case bridge.ToolChoiceRequired:
-		if len(tools) == 0 {
-			return nil, providerError(ErrorInvalidRequest, nil)
-		}
-		return &ToolChoice{String: "required"}, nil
+		return nil, providerError(ErrorUnsupportedToolChoice, nil)
 	case bridge.ToolChoiceFunction:
-		if !validFunctionName(choice.FunctionName) {
-			return nil, providerError(ErrorInvalidRequest, nil)
-		}
-		for _, tool := range tools {
-			if tool.Function.Name == choice.FunctionName {
-				return &ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: choice.FunctionName}}, nil
-			}
-		}
-		return nil, providerError(ErrorInvalidRequest, nil)
+		return nil, providerError(ErrorUnsupportedToolChoice, nil)
 	default:
 		return nil, providerError(ErrorUnsupportedToolChoice, nil)
 	}

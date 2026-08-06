@@ -8,10 +8,16 @@ terminal state.
 ## Provider-to-bridge API
 
 `internal/opencodego.NewBridgeStreamDecoder(reader, options)` returns a
-per-response decoder. Call `Next()` until it returns `io.EOF`:
+per-response decoder. The HTTP adapter passes the request's declared
+function names in `BridgeStreamDecoderOptions.AllowedToolNames`; that
+per-request allowlist is copied and checked only after fragmented names have
+been reconstructed. Call `Next()` until it returns `io.EOF`:
 
 ```go
-decoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.SSEDecoderOptions{})
+decoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.BridgeStreamDecoderOptions{
+    SSE:              opencodego.SSEDecoderOptions{},
+    AllowedToolNames: []string{"lookup"},
+})
 for {
     event, err := decoder.Next()
     if errors.Is(err, io.EOF) {
@@ -35,8 +41,19 @@ Provider response IDs, creation time, model, choice indexes, tool indexes,
 fragmented IDs/names/arguments, finish reasons, usage, and typed provider
 errors remain available at the provider boundary without importing Codex wire
 types. The bridge rejects a truncated SSE event, missing/negative tool index,
-and any choice delta after that choice has reported a finish reason. Provider
+and incoherent deltas after a choice has reported a finish reason. Provider
 reconstruction is bounded by `SSEDecoderOptions.MaxAggregateBytes`.
+
+Provider reconstruction also enforces `MaxToolCallArgumentBytes`. A missing
+provider tool-call ID receives the deterministic `call_<choice>_<tool>`
+mapping. The downstream `call_id` is fixed before its output item is emitted;
+later provider ID fragments are retained privately through `ProviderCallID`
+for a future provider-specific continuation adapter and never rewrite
+Responses event identity. Repeated tool indexes within one provider chunk and
+duplicate completed call IDs are treated as stream inconsistencies, while the
+same index remains valid across argument fragments. A `tool_calls` finish
+reason may precede trailing fragments for already-started calls, but trailing
+text, reasoning, new indexes, or contradictory terminal reasons are rejected.
 
 For tests or specialized adapters, `NewChatCompletionStreamDecoder` exposes
 typed `ChatCompletionChunk` and `ProviderStreamError` values directly. The
@@ -83,8 +100,8 @@ the session records that failure and never attempts a second response.
 
 `StreamSessionOptions.CustomTools` registers typed custom-tool event hooks by
 bridge tool kind. The default `bridge.ToolCustom` hook produces the captured
-`custom_tool_call` event names. Function-call serialization is built in, while
-custom wrapper/translation policy remains in issues #8 and #9.
+`custom_tool_call` event names. Function-call serialization is built in for
+#8; custom wrapper/translation policy remains in #9.
 
 The session generates and owns the public Responses response ID. A provider
 `ResponseStarted.ID` is private correlation metadata and is never copied into
@@ -108,8 +125,9 @@ close the provider body.
 
 1. `codex.Decoder.DecodeRequest` validates the request media type, body size,
    UTF-8, duplicate keys, trailing values, and field policy.
-2. The server rejects tools, tool-call/result inputs, structured output formats,
-   and continuation state before calling the provider.
+2. The server accepts standard function tools, but rejects custom/deferred
+   tools, tool-call/result inputs, structured output formats, and continuation
+   state before calling the provider.
 3. The injected `server.UpstreamClient` returns only a provider-neutral status,
    headers, and body. Status and `text/event-stream` are validated before the
    downstream session commits headers.
@@ -123,5 +141,5 @@ close the provider body.
 
 The application constructs the OpenCode Go client from `OPENCODE_GO_API_KEY`
 and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or included in
-logs, errors, or Responses bytes. See the [text-only smoke test](../README.md#first-text-only-smoke-test)
+logs, errors, or Responses bytes. See the [provider smoke test](../README.md#first-text-only-smoke-test)
 for the manual verification record.

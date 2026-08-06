@@ -10,14 +10,17 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
 
 const (
-	DefaultSSEMaxLineBytes         = 256 << 10
-	DefaultSSEMaxEventBytes        = 4 << 20
-	DefaultSSEMaxBufferedBytes     = 8 << 20
-	DefaultStreamMaxAggregateBytes = 16 << 20
-	defaultSSEReadBufferBytes      = 32 << 10
+	DefaultSSEMaxLineBytes          = 256 << 10
+	DefaultSSEMaxEventBytes         = 4 << 20
+	DefaultSSEMaxBufferedBytes      = 8 << 20
+	DefaultStreamMaxAggregateBytes  = 16 << 20
+	DefaultMaxToolCallArgumentBytes = bridge.DefaultMaxToolCallArgumentBytes
+	defaultSSEReadBufferBytes       = 32 << 10
 )
 
 var (
@@ -37,7 +40,11 @@ type SSEDecoderOptions struct {
 	// state across a complete provider stream. SSEDecoder itself applies the
 	// per-line, per-event, and buffered-byte limits above.
 	MaxAggregateBytes int
-	ReadBufferBytes   int
+	// MaxToolCallArgumentBytes bounds the accumulated argument string for one
+	// provider tool-call index. It is separate from MaxAggregateBytes so one
+	// model call cannot consume the entire response budget.
+	MaxToolCallArgumentBytes int
+	ReadBufferBytes          int
 }
 
 func (options SSEDecoderOptions) withDefaults() SSEDecoderOptions {
@@ -52,6 +59,9 @@ func (options SSEDecoderOptions) withDefaults() SSEDecoderOptions {
 	}
 	if options.MaxAggregateBytes <= 0 {
 		options.MaxAggregateBytes = DefaultStreamMaxAggregateBytes
+	}
+	if options.MaxToolCallArgumentBytes <= 0 {
+		options.MaxToolCallArgumentBytes = DefaultMaxToolCallArgumentBytes
 	}
 	if options.ReadBufferBytes <= 0 {
 		options.ReadBufferBytes = defaultSSEReadBufferBytes

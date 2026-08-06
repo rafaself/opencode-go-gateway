@@ -16,7 +16,7 @@ import (
 
 const (
 	featureNotImplementedCode = "feature_not_implemented"
-	featureNotImplementedText = "This Responses feature is not implemented in the text-only milestone."
+	featureNotImplementedText = "This Responses feature is not implemented in the current milestone."
 	requestInvalidText        = "The request could not be processed."
 	requestUnsupportedText    = "The request uses an unsupported feature."
 	requestTooLargeText       = "The request body exceeds the configured limit."
@@ -42,7 +42,12 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		writeRequestDecodeError(w, err)
 		return
 	}
-	if err := validateTextOnlyRequest(request); err != nil {
+	if err := validateResponsesRequest(request); err != nil {
+		var decodeError *codex.Error
+		if errors.As(err, &decodeError) {
+			writeRequestDecodeError(w, err)
+			return
+		}
 		writeJSONError(w, http.StatusNotImplemented, featureNotImplementedCode, err.Error())
 		return
 	}
@@ -83,8 +88,11 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		<-watcherDone
 	}()
 
-	streamDecoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.SSEDecoderOptions{
-		MaxAggregateBytes: opencodego.DefaultStreamMaxAggregateBytes,
+	streamDecoder := opencodego.NewBridgeStreamDecoder(response.Body, opencodego.BridgeStreamDecoderOptions{
+		SSE: opencodego.SSEDecoderOptions{
+			MaxAggregateBytes: opencodego.DefaultStreamMaxAggregateBytes,
+		},
+		AllowedToolNames: declaredFunctionToolNames(request),
 	})
 	for {
 		event, decodeErr := streamDecoder.Next()
@@ -128,30 +136,48 @@ func responseTerminalType(event bridge.StreamEvent) string {
 	}
 }
 
-func validateTextOnlyRequest(request bridge.Request) error {
+func validateResponsesRequest(request bridge.Request) error {
 	if request.PreviousResponseID != "" {
-		return errors.New("continuation state is not implemented in the text-only milestone")
+		return errors.New("continuation state is not implemented in the current milestone")
 	}
-	if len(request.Tools) > 0 {
-		return errors.New(featureNotImplementedText)
+	for _, tool := range request.Tools {
+		if tool == nil {
+			return errors.New(featureNotImplementedText)
+		}
+		if _, ok := tool.(bridge.FunctionTool); !ok {
+			return errors.New(featureNotImplementedText)
+		}
 	}
 	for _, item := range request.Input {
 		if item == nil {
 			return errors.New(featureNotImplementedText)
 		}
 		if item.Kind() != bridge.InputMessage {
-			return errors.New(featureNotImplementedText)
+			return errors.New("tool results and prior tool calls are not implemented in the current milestone")
 		}
 	}
 	switch request.ToolChoice.Kind {
 	case bridge.ToolChoiceUnset, bridge.ToolChoiceAuto, bridge.ToolChoiceNone:
+	case bridge.ToolChoiceRequired, bridge.ToolChoiceFunction:
+		return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "tool_choice", Message: "forced and named tool choices are not supported"}
 	default:
-		return errors.New(featureNotImplementedText)
+		return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "tool_choice", Message: "tool choice is not supported"}
 	}
 	if format := request.Generation.Text.Format.Kind; format != "" && format != bridge.TextFormatText {
-		return errors.New("structured response formats are not implemented in the text-only milestone")
+		return errors.New("structured response formats are not implemented in the current milestone")
 	}
 	return nil
+}
+
+func declaredFunctionToolNames(request bridge.Request) []string {
+	names := make([]string, 0, len(request.Tools))
+	for _, tool := range request.Tools {
+		function, ok := tool.(bridge.FunctionTool)
+		if ok {
+			names = append(names, function.Name)
+		}
+	}
+	return names
 }
 
 func writeRequestDecodeError(w *statusWriter, err error) {

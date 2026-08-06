@@ -3,6 +3,7 @@ package opencodego
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -14,6 +15,8 @@ var (
 	ErrDuplicateStreamTerminal = errors.New("duplicate upstream stream terminal")
 	ErrMalformedStream         = errors.New("malformed upstream stream")
 	ErrStreamAggregateLimit    = errors.New("stream aggregate limit exceeded")
+	ErrToolCallArgumentLimit   = errors.New("tool call argument limit exceeded")
+	ErrUndeclaredToolCall      = errors.New("upstream tool call was not declared")
 )
 
 // ChatCompletionStreamEvent is the provider-owned result of decoding one SSE
@@ -107,6 +110,16 @@ func (err *streamDecodeError) Error() string { return ErrMalformedStream.Error()
 
 func (err *streamDecodeError) Unwrap() error { return errors.Join(ErrMalformedStream, err.cause) }
 
+// BridgeStreamDecoderOptions configures provider-to-bridge stream translation.
+// AllowedToolNames is copied when the decoder is constructed and is scoped to
+// one upstream request. Provider tool names are checked only after their full
+// fragmented name has been reconstructed; an empty allowlist rejects every
+// provider function tool call.
+type BridgeStreamDecoderOptions struct {
+	SSE              SSEDecoderOptions
+	AllowedToolNames []string
+}
+
 // BridgeStreamDecoder translates provider chunks into semantic events. It
 // owns only provider reconstruction state (choice/tool indexes and fragments);
 // Responses IDs, output indexes, and sequence numbers remain in internal/codex.
@@ -115,31 +128,58 @@ type BridgeStreamDecoder struct {
 	pending  []bridge.StreamEvent
 	calls    map[bridge.ToolCallKey]*providerToolCall
 
-	started           bool
-	terminal          bool
-	finishReason      string
-	finishConflict    bool
-	finishedChoices   map[int]bool
-	aggregateBytes    int
-	maxAggregateBytes int
+	started                  bool
+	terminal                 bool
+	finishReason             string
+	finishConflict           bool
+	choiceFinishReasons      map[int]string
+	allowedToolNames         map[string]struct{}
+	aggregateBytes           int
+	maxAggregateBytes        int
+	maxToolCallArgumentBytes int
 }
 
 type providerToolCall struct {
-	key       bridge.ToolCallKey
-	callID    []byte
-	name      []byte
-	arguments []byte
-	completed bool
+	key            bridge.ToolCallKey
+	callID         []byte // immutable downstream Responses call_id
+	providerCallID []byte // private provider ID/fragments for continuation
+	name           []byte
+	arguments      []byte
+	completed      bool
 }
 
-func NewBridgeStreamDecoder(reader io.Reader, options SSEDecoderOptions) *BridgeStreamDecoder {
-	options = options.withDefaults()
-	return &BridgeStreamDecoder{
-		provider:          NewChatCompletionStreamDecoder(reader, options),
-		calls:             make(map[bridge.ToolCallKey]*providerToolCall),
-		finishedChoices:   make(map[int]bool),
-		maxAggregateBytes: options.MaxAggregateBytes,
+func NewBridgeStreamDecoder(reader io.Reader, options BridgeStreamDecoderOptions) *BridgeStreamDecoder {
+	options.SSE = options.SSE.withDefaults()
+	allowedToolNames := make(map[string]struct{}, len(options.AllowedToolNames))
+	for _, name := range options.AllowedToolNames {
+		if name != "" {
+			allowedToolNames[name] = struct{}{}
+		}
 	}
+	return &BridgeStreamDecoder{
+		provider:                 NewChatCompletionStreamDecoder(reader, options.SSE),
+		calls:                    make(map[bridge.ToolCallKey]*providerToolCall),
+		choiceFinishReasons:      make(map[int]string),
+		allowedToolNames:         allowedToolNames,
+		maxAggregateBytes:        options.SSE.MaxAggregateBytes,
+		maxToolCallArgumentBytes: options.SSE.MaxToolCallArgumentBytes,
+	}
+}
+
+// ProviderCallID returns the private provider identifier reconstructed for a
+// downstream call. It is intentionally separate from bridge events: the
+// Responses call_id is immutable and safe to expose, while this value is
+// retained for a future provider-specific continuation adapter.
+func (decoder *BridgeStreamDecoder) ProviderCallID(callID string) (string, bool) {
+	if decoder == nil || callID == "" {
+		return "", false
+	}
+	for _, state := range decoder.calls {
+		if string(state.callID) == callID && len(state.providerCallID) > 0 {
+			return string(state.providerCallID), true
+		}
+	}
+	return "", false
 }
 
 func (decoder *BridgeStreamDecoder) Next() (bridge.StreamEvent, error) {
@@ -206,6 +246,12 @@ func (decoder *BridgeStreamDecoder) bridgeFailure(err error) bridge.Failed {
 	if errors.Is(err, ErrStreamAggregateLimit) {
 		return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}
 	}
+	if errors.Is(err, ErrToolCallArgumentLimit) {
+		return bridge.Failed{Code: "stream_limit_exceeded", Message: "The upstream stream exceeded its limit."}
+	}
+	if errors.Is(err, ErrUndeclaredToolCall) {
+		return bridge.Failed{Code: "upstream_tool_not_declared", Message: "The upstream provider returned an undeclared function tool."}
+	}
 	return bridge.Failed{Code: "upstream_stream_error", Message: "upstream stream could not be decoded"}
 }
 
@@ -225,11 +271,39 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 		}
 	}
 	for _, choice := range chunk.Choices {
-		if choice.Index < 0 || decoder.finishedChoices[choice.Index] {
+		if choice.Index < 0 {
 			return ErrMalformedStream
 		}
-		if choice.FinishReason != nil && *choice.FinishReason != "" {
-			decoder.recordFinishReason(*choice.FinishReason)
+		finishReason := ""
+		if choice.FinishReason != nil {
+			finishReason = *choice.FinishReason
+		}
+		previousFinishReason, choiceFinished := decoder.choiceFinishReasons[choice.Index]
+		if choiceFinished {
+			if finishReason != "" && finishReason != previousFinishReason {
+				return ErrMalformedStream
+			}
+			if previousFinishReason != "tool_calls" {
+				return ErrMalformedStream
+			}
+			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
+				return ErrMalformedStream
+			}
+			if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
+				return ErrMalformedStream
+			}
+			for _, tool := range choice.Delta.ToolCalls {
+				if tool.Index == nil || *tool.Index < 0 {
+					return ErrMalformedStream
+				}
+				key := bridge.ToolCallKey{ChoiceIndex: choice.Index, ToolIndex: *tool.Index}
+				if _, exists := decoder.calls[key]; !exists {
+					return ErrMalformedStream
+				}
+			}
+		}
+		if finishReason != "" {
+			decoder.recordFinishReason(finishReason)
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 			if err := decoder.queue(bridge.TextDelta{ChoiceIndex: choice.Index, Text: *choice.Delta.Content}, len(*choice.Delta.Content)); err != nil {
@@ -241,13 +315,21 @@ func (decoder *BridgeStreamDecoder) consumeChunk(chunk ChatCompletionChunk) erro
 				return err
 			}
 		}
+		seenToolIndexes := make(map[int]struct{}, len(choice.Delta.ToolCalls))
 		for _, tool := range choice.Delta.ToolCalls {
+			if tool.Index == nil || *tool.Index < 0 {
+				return ErrMalformedStream
+			}
+			if _, exists := seenToolIndexes[*tool.Index]; exists {
+				return ErrMalformedStream
+			}
+			seenToolIndexes[*tool.Index] = struct{}{}
 			if err := decoder.consumeToolCall(choice.Index, tool); err != nil {
 				return err
 			}
 		}
-		if choice.FinishReason != nil && *choice.FinishReason != "" {
-			decoder.finishedChoices[choice.Index] = true
+		if finishReason != "" {
+			decoder.choiceFinishReasons[choice.Index] = finishReason
 		}
 	}
 	if chunk.Usage != nil {
@@ -275,31 +357,46 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 	if tool.Index == nil || *tool.Index < 0 {
 		return ErrMalformedStream
 	}
+	if tool.Type != "" && tool.Type != "function" {
+		return ErrMalformedStream
+	}
 	toolIndex := *tool.Index
 	key := bridge.ToolCallKey{ChoiceIndex: choiceIndex, ToolIndex: toolIndex}
 	state, exists := decoder.calls[key]
 	if !exists {
 		state = &providerToolCall{key: key}
+		callID := tool.ID
+		if callID == "" {
+			callID = syntheticToolCallID(key)
+		}
+		state.callID = append(state.callID, callID...)
+		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
 		decoder.calls[key] = state
 		if err := decoder.queue(bridge.ToolCallStarted{
 			Key:    key,
 			Kind:   bridge.ToolFunction,
-			CallID: tool.ID,
+			CallID: callID,
 			Name:   tool.Function.Name,
-		}, len(tool.ID)+len(tool.Function.Name)); err != nil {
+		}, len(callID)+len(tool.Function.Name)); err != nil {
 			return err
 		}
 	} else if tool.ID != "" || tool.Function.Name != "" {
+		state.providerCallID = appendProviderCallID(state.providerCallID, tool.ID)
 		if err := decoder.queue(bridge.ToolCallMetadataDelta{
-			Key:    key,
-			CallID: tool.ID,
+			Key: key,
+			// Provider IDs may be fragmented or delayed. The downstream call
+			// ID was fixed in ToolCallStarted; later provider fragments remain
+			// private continuation state and never mutate Responses identity.
+			CallID: "",
 			Name:   tool.Function.Name,
 		}, len(tool.ID)+len(tool.Function.Name)); err != nil {
 			return err
 		}
 	}
-	state.callID = append(state.callID, tool.ID...)
 	state.name = append(state.name, tool.Function.Name...)
+	if len(tool.Function.Arguments) > decoder.maxToolCallArgumentBytes-len(state.arguments) {
+		return ErrToolCallArgumentLimit
+	}
 	state.arguments = append(state.arguments, tool.Function.Arguments...)
 	if tool.Function.Arguments != "" {
 		if err := decoder.queue(bridge.ToolCallArgumentsDelta{Key: key, Arguments: tool.Function.Arguments}, len(tool.Function.Arguments)); err != nil {
@@ -307,6 +404,27 @@ func (decoder *BridgeStreamDecoder) consumeToolCall(choiceIndex int, tool ToolCa
 		}
 	}
 	return nil
+}
+
+func appendProviderCallID(existing []byte, fragment string) []byte {
+	if fragment == "" {
+		return existing
+	}
+	current := string(existing)
+	switch {
+	case current == "":
+		return append(existing, fragment...)
+	case current == fragment:
+		return existing
+	case strings.HasPrefix(fragment, current):
+		return append(existing[:0], fragment...)
+	default:
+		return append(existing, fragment...)
+	}
+}
+
+func syntheticToolCallID(key bridge.ToolCallKey) string {
+	return fmt.Sprintf("call_%d_%d", key.ChoiceIndex, key.ToolIndex)
 }
 
 const bridgeStreamEventOverhead = 64
@@ -339,11 +457,32 @@ func (decoder *BridgeStreamDecoder) finish() error {
 		if state.completed {
 			continue
 		}
+		name := string(state.name)
+		if name == "" {
+			return ErrMalformedStream
+		}
+		if _, allowed := decoder.allowedToolNames[name]; !allowed {
+			return ErrUndeclaredToolCall
+		}
+	}
+	callIDs := make(map[string]bridge.ToolCallKey, len(decoder.calls))
+	for _, key := range sortedToolKeys(decoder.calls) {
+		state := decoder.calls[key]
+		if state.completed {
+			continue
+		}
+		callID := string(state.callID)
+		if _, exists := callIDs[callID]; exists && callID != "" {
+			return ErrMalformedStream
+		}
+		if callID != "" {
+			callIDs[callID] = key
+		}
 		state.completed = true
 		if err := decoder.queue(bridge.ToolCallCompleted{
 			Key:       state.key,
 			Kind:      bridge.ToolFunction,
-			CallID:    string(state.callID),
+			CallID:    callID,
 			Name:      string(state.name),
 			Arguments: string(state.arguments),
 		}, len(state.callID)+len(state.name)+len(state.arguments)); err != nil {

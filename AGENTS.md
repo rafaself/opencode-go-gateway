@@ -7,7 +7,7 @@ This file applies to the whole repository. Read it before making changes. If a m
 ## Project context
 
 - This is a Go 1.22+ project and currently uses only the Go standard library.
-- The current vertical slice captures and documents the Codex CLI Responses contract. It is not a complete OpenAI Responses implementation.
+- The current vertical slice captures and documents the Codex CLI Responses contract and supports streamed standard function tools. It is not a complete OpenAI Responses implementation.
 - The capture command is development-only: `./bin/opencode-gateway dev capture-codex` after `make build`.
 - The contract, field policy, and checked-in fixtures are maintained together under `docs/` and `testdata/codex/`.
 

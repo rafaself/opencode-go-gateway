@@ -31,7 +31,10 @@ const (
 	StreamErrorLimit      StreamErrorCode = "stream_limit"
 )
 
-const DefaultStreamMaxAggregateBytes = 16 << 20
+const (
+	DefaultStreamMaxAggregateBytes  = 16 << 20
+	DefaultMaxToolCallArgumentBytes = bridge.DefaultMaxToolCallArgumentBytes
+)
 
 type StreamError struct {
 	Code  StreamErrorCode
@@ -95,8 +98,11 @@ type StreamSessionOptions struct {
 	// arguments, and per-session state. A stream crossing the cap fails with a
 	// stable stream-limit error.
 	MaxAggregateBytes int
-	IDGenerator       IDGenerator
-	CustomTools       map[bridge.ToolKind]CustomToolHook
+	// MaxToolCallArgumentBytes bounds one function/custom tool argument string
+	// independently of the total retained stream state.
+	MaxToolCallArgumentBytes int
+	IDGenerator              IDGenerator
+	CustomTools              map[bridge.ToolKind]CustomToolHook
 }
 
 // StreamSession owns all Responses-specific stream state for one request. It
@@ -115,19 +121,20 @@ type StreamSession struct {
 	idGenerator IDGenerator
 	customTools map[bridge.ToolKind]CustomToolHook
 
-	mu                sync.Mutex
-	started           bool
-	headersSent       bool
-	writeFailure      error
-	downstreamDone    chan struct{}
-	clock             func() time.Time
-	terminalAt        time.Time
-	aggregateBytes    int
-	maxAggregateBytes int
-	reasoning         []byte
-	items             map[streamItemKey]*streamItem
-	itemOrder         []*streamItem
-	usage             *bridge.Usage
+	mu                       sync.Mutex
+	started                  bool
+	headersSent              bool
+	writeFailure             error
+	downstreamDone           chan struct{}
+	clock                    func() time.Time
+	terminalAt               time.Time
+	aggregateBytes           int
+	maxAggregateBytes        int
+	maxToolCallArgumentBytes int
+	reasoning                []byte
+	items                    map[streamItemKey]*streamItem
+	itemOrder                []*streamItem
+	usage                    *bridge.Usage
 }
 
 type streamItemKey struct {
@@ -149,7 +156,6 @@ type streamItem struct {
 	toolKind    bridge.ToolKind
 	hook        CustomToolHook
 	callID      []byte
-	callIDSynth bool
 	name        []byte
 	text        []byte
 	arguments   []byte
@@ -194,18 +200,23 @@ func NewStreamSession(writer http.ResponseWriter, options StreamSessionOptions) 
 	if maxAggregateBytes <= 0 {
 		maxAggregateBytes = DefaultStreamMaxAggregateBytes
 	}
+	maxToolCallArgumentBytes := options.MaxToolCallArgumentBytes
+	if maxToolCallArgumentBytes <= 0 {
+		maxToolCallArgumentBytes = DefaultMaxToolCallArgumentBytes
+	}
 	return &StreamSession{
-		ResponseID:        responseID,
-		CreatedAt:         createdAt,
-		Model:             options.Model,
-		writer:            writer,
-		controller:        http.NewResponseController(writer),
-		idGenerator:       idGenerator,
-		customTools:       customTools,
-		clock:             clock,
-		maxAggregateBytes: maxAggregateBytes,
-		downstreamDone:    make(chan struct{}),
-		items:             make(map[streamItemKey]*streamItem),
+		ResponseID:               responseID,
+		CreatedAt:                createdAt,
+		Model:                    options.Model,
+		writer:                   writer,
+		controller:               http.NewResponseController(writer),
+		idGenerator:              idGenerator,
+		customTools:              customTools,
+		clock:                    clock,
+		maxAggregateBytes:        maxAggregateBytes,
+		maxToolCallArgumentBytes: maxToolCallArgumentBytes,
+		downstreamDone:           make(chan struct{}),
+		items:                    make(map[streamItemKey]*streamItem),
 	}, nil
 }
 
@@ -547,7 +558,6 @@ func (session *StreamSession) toolCallStartedLocked(event bridge.ToolCallStarted
 	item.callID = []byte(event.CallID)
 	if len(item.callID) == 0 {
 		item.callID = []byte(session.idGenerator("call", item.outputIndex))
-		item.callIDSynth = true
 	}
 	if !validStreamValue(string(item.callID), 256) {
 		return session.invalidTransitionLocked("invalid generated call ID")
@@ -576,13 +586,8 @@ func (session *StreamSession) toolCallMetadataLocked(event bridge.ToolCallMetada
 	if err := session.reserveAggregateLocked(len(event.CallID) + len(event.Name)); err != nil {
 		return session.limitLocked()
 	}
-	if event.CallID != "" {
-		if item.callIDSynth {
-			item.callID = append(item.callID[:0], event.CallID...)
-			item.callIDSynth = false
-		} else {
-			item.callID = append(item.callID, event.CallID...)
-		}
+	if event.CallID != "" && string(item.callID) != event.CallID {
+		return session.invalidTransitionLocked("tool call ID changed after item creation")
 	}
 	item.name = append(item.name, event.Name...)
 	return nil
@@ -598,6 +603,9 @@ func (session *StreamSession) toolCallArgumentsLocked(event bridge.ToolCallArgum
 	}
 	if event.Arguments == "" {
 		return nil
+	}
+	if len(event.Arguments) > session.maxToolCallArgumentBytes-len(item.arguments) {
+		return session.limitLocked()
 	}
 	if err := session.reserveAggregateLocked(len(event.Arguments)); err != nil {
 		return session.limitLocked()
@@ -625,12 +633,14 @@ func (session *StreamSession) toolCallCompletedLocked(event bridge.ToolCallCompl
 	if !validOptionalStreamValue(event.CallID, 256) || !validOptionalStreamValue(event.Name, 256) || !utf8.ValidString(event.Arguments) {
 		return session.invalidTransitionLocked("invalid tool completion")
 	}
+	if len(event.Arguments) > session.maxToolCallArgumentBytes {
+		return session.limitLocked()
+	}
 	if err := session.reserveAggregateLocked(len(event.CallID) + len(event.Name) + len(event.Arguments)); err != nil {
 		return session.limitLocked()
 	}
-	if event.CallID != "" {
-		item.callID = append(item.callID[:0], event.CallID...)
-		item.callIDSynth = false
+	if event.CallID != "" && string(item.callID) != event.CallID {
+		return session.invalidTransitionLocked("tool call ID changed after item creation")
 	}
 	if event.Name != "" {
 		item.name = append(item.name[:0], event.Name...)

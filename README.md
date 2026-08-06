@@ -1,9 +1,10 @@
 # opencode-go-gateway
 
 This repository is a standard-library-first Go gateway. The current vertical
-slice accepts streaming, text-only Codex Responses requests and forwards them
-to OpenCode Go's `deepseek-v4-flash` Chat Completions stream. The development-
-only Codex Responses capture server remains available for contract work.
+slice accepts streaming Codex Responses requests with standard function tools
+and forwards them to OpenCode Go's `deepseek-v4-flash` Chat Completions stream.
+The development-only Codex Responses capture server remains available for
+contract work.
 
 ## Requirements and developer commands
 
@@ -52,14 +53,15 @@ runtime metadata. Configuration is loaded from these environment variables:
 | `OPENCODE_GATEWAY_MAX_HEADER_BYTES` | `65536` | request header limit |
 | `OPENCODE_GATEWAY_ALLOW_NON_LOOPBACK` | `false` | explicit opt-in for non-loopback binding |
 
-The HTTP contract for the text-only milestone is:
+The HTTP contract for the function-tool milestone is:
 
 ```text
 GET  /health/live   -> 200 {"status":"ok"}
 GET  /health/ready  -> 200 {"status":"ready"}
-POST /v1/responses  -> 200 text/event-stream (text-only requests)
+POST /v1/responses  -> 200 text/event-stream (messages and function tools)
                          4xx/5xx JSON error envelope before streaming
-                         501 feature_not_implemented for tools/continuation
+                         501 feature_not_implemented for custom tools,
+                             tool results, and continuation
 ```
 
 Unknown paths return a JSON `not_found` error and unsupported methods return a
@@ -100,9 +102,11 @@ and print its path for diagnostics; successful runs remove it automatically. For
 a length limit, the terminal event is `response.incomplete`; a provider or
 transport failure after SSE starts is `response.failed`.
 
-This milestone intentionally rejects tools, tool results, and continuation
-state with a stable `feature_not_implemented` response. Function tools,
-custom tools, continuation, setup, and doctor flows belong to later issues.
+This milestone accepts standard function definitions with bounded JSON Schema
+parameters and reconstructs fragmented/parallel provider tool calls. Thinking
+mode omits upstream `tool_choice: auto` for DeepSeek compatibility. Forced or
+named choices, custom tools, tool results, and continuation state return an
+explicit unsupported/invalid request response until their own milestones.
 
 ## Capture the Codex contract
 

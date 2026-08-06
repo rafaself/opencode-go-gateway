@@ -736,8 +736,12 @@ func decodeCustomToolCallOutput(fields map[string]json.RawMessage, path string) 
 }
 
 func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
+	if len(tools) > bridge.DefaultMaxFunctionTools {
+		return nil, invalidRequest("tools", "too many tools")
+	}
 	result := make([]toolWire, 0, len(tools))
 	names := make(map[string]struct{})
+	schemaBytes := 0
 	for index, raw := range tools {
 		path := fmt.Sprintf("tools[%d]", index)
 		fields, err := rawObject(raw, path)
@@ -759,6 +763,10 @@ func decodeTools(tools []json.RawMessage) ([]toolWire, error) {
 			if parseErr != nil {
 				return nil, parseErr
 			}
+			if len(parsed.Parameters) > bridge.DefaultMaxFunctionSchemaBytes-schemaBytes {
+				return nil, invalidRequest("tools", "aggregate function schema bytes exceed the configured limit")
+			}
+			schemaBytes += len(parsed.Parameters)
 			tool = parsed
 		case string(bridge.ToolNamespace):
 			parsed, parseErr := decodeNamespaceTool(fields, path)

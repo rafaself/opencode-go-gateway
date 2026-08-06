@@ -285,10 +285,10 @@ func TestStreamSessionWritesFragmentedFunctionAndCustomToolItems(t *testing.T) {
 	key := bridge.ToolCallKey{ChoiceIndex: 0, ToolIndex: 2}
 	for _, event := range []bridge.StreamEvent{
 		bridge.ToolCallStarted{Key: key, Kind: bridge.ToolFunction, CallID: "call-", Name: "exec"},
-		bridge.ToolCallMetadataDelta{Key: key, CallID: "1", Name: "_command"},
+		bridge.ToolCallMetadataDelta{Key: key, Name: "_command"},
 		bridge.ToolCallArgumentsDelta{Key: key, Arguments: `{"cmd":`},
 		bridge.ToolCallArgumentsDelta{Key: key, Arguments: `"true"}`},
-		bridge.ToolCallCompleted{Key: key, Kind: bridge.ToolFunction, CallID: "call-1", Name: "exec_command", Arguments: `{"cmd":"true"}`},
+		bridge.ToolCallCompleted{Key: key, Kind: bridge.ToolFunction, CallID: "call-", Name: "exec_command", Arguments: `{"cmd":"true"}`},
 		bridge.Completed{Reason: "tool_calls"},
 	} {
 		if err := session.Handle(event); err != nil {
@@ -310,7 +310,8 @@ func TestStreamSessionWritesFragmentedFunctionAndCustomToolItems(t *testing.T) {
 	}
 	added := events[2]["item"].(map[string]any)
 	done := events[5]
-	if added["id"] != "fc_test_0" || done["item_id"] != "fc_test_0" || done["name"] != "exec_command" || done["arguments"] != `{"cmd":"true"}` {
+	finalItem := events[6]["item"].(map[string]any)
+	if added["id"] != "fc_test_0" || added["call_id"] != "call-" || done["item_id"] != "fc_test_0" || done["name"] != "exec_command" || done["arguments"] != `{"cmd":"true"}` || finalItem["call_id"] != "call-" {
 		t.Fatalf("function identity = added %#v done %#v", added, done)
 	}
 	if events[2]["output_index"] != float64(0) || events[3]["output_index"] != float64(0) || events[5]["output_index"] != float64(0) {

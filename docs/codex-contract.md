@@ -156,6 +156,6 @@ The fixture tests intentionally fail if a request field is not classified or if 
 The incremental provider decoder and per-request Responses session introduced
 by M4 are documented in [Streaming boundaries](codex-streaming.md). They keep
 provider chunks, bridge semantics, and Responses wire state in separate
-packages. Issue #7 wires the first text-only vertical slice through those
-boundaries; its manual smoke workflow is documented in the
+packages. Issues #7 and #8 wire the text and standard function-tool vertical
+slices through those boundaries; the manual smoke workflow is documented in the
 [project README](../README.md#first-text-only-smoke-test).

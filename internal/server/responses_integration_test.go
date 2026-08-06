@@ -193,12 +193,178 @@ func TestResponsesUsesTheRealOpenCodeGoHTTPAdapter(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T) {
+	const providerKey = "function-provider-key"
+	var providerRequest map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&providerRequest); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		tools, ok := providerRequest["tools"].([]any)
+		if !ok || len(tools) != 2 {
+			http.Error(writer, "function tools missing", http.StatusBadRequest)
+			return
+		}
+		seenNames := map[string]bool{}
+		for _, rawTool := range tools {
+			tool := rawTool.(map[string]any)
+			function := tool["function"].(map[string]any)
+			name, _ := function["name"].(string)
+			seenNames[name] = true
+			if tool["type"] != "function" || (name != "lookup" && name != "other_tool") {
+				http.Error(writer, "function tool changed", http.StatusBadRequest)
+				return
+			}
+			if name == "lookup" {
+				if function["description"] != "look up a value" || function["strict"] != true {
+					http.Error(writer, "function tool changed", http.StatusBadRequest)
+					return
+				}
+				parameters, parametersOK := function["parameters"].(map[string]any)
+				required, requiredOK := parameters["required"].([]any)
+				if !parametersOK || parameters["type"] != "object" || !requiredOK || len(required) != 1 || required[0] != "q" {
+					http.Error(writer, "function schema changed", http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		if !seenNames["lookup"] || !seenNames["other_tool"] {
+			http.Error(writer, "function tools changed", http.StatusBadRequest)
+			return
+		}
+		if _, exists := providerRequest["tool_choice"]; exists {
+			http.Error(writer, "thinking-mode auto choice was not omitted", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		providerStream := strings.Join([]string{
+			`data: {"id":"provider-id","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"prefix","tool_calls":[{"index":0,"id":"provider-call-","type":"function","function":{"name":"look","arguments":"[1"}}]},"finish_reason":null}]}`,
+			`data: {"id":"provider-id","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"other","arguments":"not"}}]},"finish_reason":null}]}`,
+			`data: {"id":"provider-id","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"suffix","tool_calls":[{"index":0,"id":"id","function":{"name":"up","arguments":"]"}},{"index":1,"function":{"name":"_tool","arguments":"-json"}}]},"finish_reason":null}]}`,
+			`data: {"id":"provider-id","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`,
+		}, "\n\n") + "\n\n"
+		_, _ = io.WriteString(writer, providerStream)
+	}))
+	defer provider.Close()
+
+	client, err := opencodego.NewClient(opencodego.ClientConfig{
+		APIKey:     providerKey,
+		BaseURL:    provider.URL,
+		HTTPClient: provider.Client(),
+		UserAgent:  "opencode-go-gateway/function-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), slog.New(slog.NewTextHandler(&logs, nil)))
+	requestBody := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"look up"}],"tools":[{"type":"function","name":"lookup","description":"look up a value","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]},"strict":true},{"type":"function","name":"other_tool","parameters":{"type":"object"}}],"tool_choice":"auto","parallel_tool_calls":true,"stream":true}`
+	response := postRequest(t, gateway, requestBody)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, readBody(t, response.Body))
+	}
+	events := readResponseEvents(t, response.Body)
+	if got := responseEventTypes(events); !equalStrings(got, []string{
+		"response.created", "response.in_progress",
+		"response.output_item.added", "response.content_part.added", "response.output_text.delta",
+		"response.output_item.added", "response.function_call_arguments.delta",
+		"response.output_item.added", "response.function_call_arguments.delta",
+		"response.output_text.delta", "response.function_call_arguments.delta",
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done", "response.output_item.done",
+		"response.function_call_arguments.done", "response.output_item.done",
+		"response.output_text.done", "response.content_part.done", "response.output_item.done",
+		"response.completed",
+	}) {
+		t.Fatalf("event types = %v", got)
+	}
+	var output strings.Builder
+	var calls []map[string]any
+	var addedCalls []map[string]any
+	for _, event := range events {
+		if event["type"] == "response.output_text.delta" {
+			output.WriteString(event["delta"].(string))
+		}
+		if event["type"] == "response.output_item.done" {
+			item := event["item"].(map[string]any)
+			if item["type"] == "function_call" {
+				calls = append(calls, item)
+			}
+		}
+		if event["type"] == "response.output_item.added" {
+			item := event["item"].(map[string]any)
+			if item["type"] == "function_call" {
+				addedCalls = append(addedCalls, item)
+			}
+		}
+	}
+	if output.String() != "prefixsuffix" || len(calls) != 2 || len(addedCalls) != len(calls) {
+		t.Fatalf("output=%q calls=%#v added=%#v", output.String(), calls, addedCalls)
+	}
+	for index := range calls {
+		if calls[index]["call_id"] != addedCalls[index]["call_id"] || calls[index]["id"] != addedCalls[index]["id"] {
+			t.Fatalf("function identity changed between added and done: added=%#v done=%#v", addedCalls[index], calls[index])
+		}
+	}
+	if calls[0]["call_id"] != "provider-call-" || calls[0]["name"] != "lookup" || calls[0]["arguments"] != `[1]` {
+		t.Fatalf("first function call = %#v", calls[0])
+	}
+	if calls[1]["call_id"] != "call_0_1" || calls[1]["name"] != "other_tool" || calls[1]["arguments"] != "not-json" {
+		t.Fatalf("second function call = %#v", calls[1])
+	}
+	if calls[0]["id"] == calls[1]["id"] || calls[0]["id"] == nil || calls[1]["id"] == nil || calls[0]["status"] != "completed" || calls[1]["status"] != "completed" {
+		t.Fatalf("function item identity/status = %#v", calls)
+	}
+	if strings.Contains(logs.String(), "not-json") || strings.Contains(logs.String(), providerKey) {
+		t.Fatalf("tool data or provider credential appeared in logs: %s", logs.String())
+	}
+}
+
+func TestResponsesFailsWhenProviderReturnsUndeclaredFunctionTool(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"provider-id","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"other_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	gateway := newIntegrationGateway(t, staticUpstream(stream), nil)
+	requestBody := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	response := postRequest(t, gateway, requestBody)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	events := readResponseEvents(t, response.Body)
+	if len(events) == 0 || events[len(events)-1]["type"] != "response.failed" {
+		t.Fatalf("events = %#v", events)
+	}
+	for _, event := range events {
+		if event["type"] == "response.completed" {
+			t.Fatal("undeclared provider tool produced a successful response")
+		}
+		if event["type"] != "response.output_item.done" {
+			continue
+		}
+		item, _ := event["item"].(map[string]any)
+		if item["type"] == "function_call" && item["status"] == "completed" {
+			t.Fatalf("undeclared provider tool produced a completed function item: %#v", item)
+		}
+	}
+	terminalResponse := events[len(events)-1]["response"].(map[string]any)
+	responseError := terminalResponse["error"].(map[string]any)
+	if responseError["code"] != "upstream_tool_not_declared" {
+		t.Fatalf("provider tool failure = %#v", responseError)
+	}
+}
+
 func TestResponsesRejectsToolBearingRequestsBeforeCallingUpstream(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		body string
 	}{
-		{name: "tool definition", body: `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"secret_tool","parameters":{"type":"object"}}],"stream":true}`},
+		{name: "deferred tool definition", body: `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"namespace","name":"secret_tool"}],"stream":true}`},
 		{name: "prior tool call", body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"secret-call","name":"secret_tool","arguments":"{}"}],"stream":true}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -218,6 +384,33 @@ func TestResponsesRejectsToolBearingRequestsBeforeCallingUpstream(t *testing.T) 
 			}
 			if called {
 				t.Fatal("upstream was called for a tool-bearing request")
+			}
+		})
+	}
+}
+
+func TestResponsesRejectsForcedAndNamedToolChoicesExplicitly(t *testing.T) {
+	for _, choice := range []string{
+		`"required"`,
+		`{"type":"function","name":"lookup"}`,
+	} {
+		t.Run(choice, func(t *testing.T) {
+			called := false
+			gateway := newIntegrationGateway(t, UpstreamClientFunc(func(_ context.Context, _ bridge.Request) (*UpstreamResponse, error) {
+				called = true
+				return nil, errors.New("upstream must not be called")
+			}), nil)
+			body := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":` + choice + `,"stream":true}`
+			response := postRequest(t, gateway, body)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", response.StatusCode)
+			}
+			if got := readBody(t, response.Body); !strings.Contains(got, `"invalid_request"`) || strings.Contains(got, "lookup") {
+				t.Fatalf("choice rejection = %s", got)
+			}
+			if called {
+				t.Fatal("upstream was called for a forced/named tool choice")
 			}
 		})
 	}

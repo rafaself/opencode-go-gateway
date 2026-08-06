@@ -1,0 +1,11 @@
+data: {"id":"provider-fragmented","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"prefix","tool_calls":[{"index":0,"id":"call-","type":"function","function":{"name":"look","arguments":"[1"}}]},"finish_reason":null}]}
+
+data: {"id":"provider-fragmented","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"other","arguments":"not"}}]},"finish_reason":null}]}
+
+data: {"id":"provider-fragmented","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"suffix","tool_calls":[{"index":0,"id":"0","function":{"name":"_up","arguments":"]"}},{"index":1,"function":{"name":"_tool","arguments":"-json"}}]},"finish_reason":null}]}
+
+data: {"id":"provider-fragmented","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+: fixture terminator

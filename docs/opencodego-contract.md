@@ -76,10 +76,16 @@ Unknown efforts are rejected.
 
 The client sends the provider `thinking` extension explicitly. In thinking
 mode, `tool_choice: auto` is omitted so the provider's documented default can
-select tools, `none` is preserved, and forced (`required`) or named choices are
-forwarded unchanged. The same forced-choice behavior applies when thinking is
-disabled; a provider rejection is surfaced rather than rewriting the choice to
-`auto`. A reasoning effort combined with disabled thinking is rejected.
+select tools, and `none` is preserved. Forced (`required`) and named choices
+are rejected explicitly in this milestone in every thinking mode; they are
+never silently rewritten to `auto`. A reasoning effort combined with disabled
+thinking is rejected.
+
+Function tools are bounded to 128 declarations and 256 KiB of aggregate raw
+JSON Schema bytes. The stream adapter bounds each accumulated call argument to
+1 MiB and the complete retained stream to its configured aggregate limit.
+Schemas and model argument strings are transported without semantic rewriting;
+invalid model JSON is left for Codex/tool execution to handle.
 
 Provider `reasoning_content` is present in `ChatCompletionResponse` and
 `ChatCompletionChunk` message structs. It remains provider metadata for the

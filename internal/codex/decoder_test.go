@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -388,6 +389,21 @@ func TestDecodePreservesFunctionSchemaRawJSONAndDoesNotExposeBody(t *testing.T) 
 	if strings.Contains(err.Error(), "do not expose") {
 		t.Fatalf("decoder error exposed request body: %v", err)
 	}
+}
+
+func TestDecodeEnforcesFunctionToolCountAndSchemaLimits(t *testing.T) {
+	tooMany := make([]string, bridge.DefaultMaxFunctionTools+1)
+	for index := range tooMany {
+		tooMany[index] = `{"type":"function","name":"tool_` + strconv.Itoa(index) + `","parameters":{"type":"object"}}`
+	}
+	body := `{"model":"gpt-5.3-codex","stream":true,"tools":[` + strings.Join(tooMany, ",") + `]}`
+	_, err := mustDecoder(t, 2<<20).Decode(strings.NewReader(body), "application/json")
+	assertDecodeError(t, err, ErrorInvalidRequest, "tools")
+
+	largeSchema := `{"type":"object","description":"` + strings.Repeat("x", bridge.DefaultMaxFunctionSchemaBytes) + `"}`
+	body = `{"model":"gpt-5.3-codex","stream":true,"tools":[{"type":"function","name":"large","parameters":` + largeSchema + `}]}`
+	_, err = mustDecoder(t, 2<<20).Decode(strings.NewReader(body), "application/json")
+	assertDecodeError(t, err, ErrorInvalidRequest, "tools")
 }
 
 func TestDecodeRejectsUnknownFieldsInsideKnownObjects(t *testing.T) {
