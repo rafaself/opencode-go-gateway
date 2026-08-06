@@ -1,11 +1,18 @@
-# Generated Codex v0.1 local profile for the loopback gateway.
-# Start the gateway before using this provider configuration.
-model = "gpt-5.3-codex"
-model_provider = "gateway"
+# Optional Codex v0.1 profile for the loopback gateway.
+# Start the gateway before using this provider configuration. If the Codex
+# version in use does not expand `~` in model_catalog_json, replace it with the
+# absolute path printed by `opencode-gateway setup codex`.
+model = "deepseek-v4-flash"
+model_provider = "opencode-gateway"
+model_catalog_json = "~/.codex/models.json"
+model_reasoning_effort = "high"
+model_supports_reasoning_summaries = false
+model_reasoning_summary = "none"
 
-[model_providers.gateway]
-name = "OpenCode Go Gateway"
+[model_providers.opencode-gateway]
+name = "OpenCode Gateway"
 base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
+supports_websockets = false
 request_max_retries = 0
 stream_max_retries = 0

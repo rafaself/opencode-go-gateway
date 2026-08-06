@@ -37,6 +37,50 @@ func TestVersionPrintsBuildMetadata(t *testing.T) {
 	}
 }
 
+func TestHelpAndVersionAliasesAreSuccessfulAndSafe(t *testing.T) {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"-v"}, {"--version"}} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := commandExitCode(args, &stdout, &stderr); got != 0 {
+				t.Fatalf("commandExitCode(%v) = %d; stdout=%s stderr=%s", args, got, stdout.String(), stderr.String())
+			}
+			if strings.ContainsAny(stdout.String(), "\r\n") && args[0] != "help" && args[0] != "-h" && args[0] != "--help" {
+				// Version output is expected to contain one newline, but no metadata
+				// value may inject an additional line.
+				if strings.Count(stdout.String(), "\n") != 1 {
+					t.Fatalf("version output contains injected lines: %q", stdout.String())
+				}
+			}
+			if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+				if !strings.Contains(stdout.String(), "Exit status: 0 success/help") {
+					t.Fatalf("help output = %s", stdout.String())
+				}
+			} else if !strings.Contains(stdout.String(), "opencode-gateway version=") {
+				t.Fatalf("version output = %s", stdout.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("successful command wrote stderr: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestVersionSanitizesInjectedBuildMetadata(t *testing.T) {
+	previousVersion, previousCommit, previousBuildDate := version, commit, buildDate
+	version, commit, buildDate = "v0.1.0\nsecret", "commit\rvalue", "date\tvalue"
+	t.Cleanup(func() {
+		version, commit, buildDate = previousVersion, previousCommit, previousBuildDate
+	})
+
+	var stdout bytes.Buffer
+	if err := execute([]string{"version"}, &stdout, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "\nsecret") || strings.Contains(stdout.String(), "\r") || strings.Contains(stdout.String(), "\t") || strings.Count(stdout.String(), "\n") != 1 {
+		t.Fatalf("version output was not safely normalized: %q", stdout.String())
+	}
+}
+
 func TestInvalidRunArgumentsUseUsageExitCode(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "-unknown"},
@@ -50,6 +94,17 @@ func TestInvalidRunArgumentsUseUsageExitCode(t *testing.T) {
 				t.Fatalf("commandExitCode(%v) = %d, want 2; stderr=%s", args, got, stderr.String())
 			}
 		})
+	}
+}
+
+func TestOperationalFailureUsesExitCodeOne(t *testing.T) {
+	t.Setenv("OPENCODE_GO_API_KEY", "")
+	var stdout, stderr bytes.Buffer
+	if got := commandExitCode([]string{"run"}, &stdout, &stderr); got != 1 {
+		t.Fatalf("commandExitCode(run) = %d, want 1; stdout=%s stderr=%s", got, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "OPENCODE_GO_API_KEY is required") {
+		t.Fatalf("stderr = %s", stderr.String())
 	}
 }
 

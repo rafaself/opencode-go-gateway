@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, package, and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run the complete release check suite
+        env:
+          FUZZTIME: 1s
+        run: make release-check
+
+      - name: Confirm formatting did not change the tagged source
+        run: git diff --exit-code
+
+      - name: Build and self-test release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          build_date="$(date -u -d "@${source_date_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          ./scripts/package-release.sh \
+            --output-dir dist \
+            --version "$VERSION" \
+            --commit "${COMMIT:0:12}" \
+            --build-date "$build_date" \
+            --source-date-epoch "$source_date_epoch" \
+            --self-test
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          notes="docs/releases/${TAG}.md"
+          if [[ ! -f "$notes" ]]; then
+            notes_file="$(mktemp)"
+            printf 'OpenCode Gateway %s\n\nSee the repository documentation for this build.\n' "$TAG" > "$notes_file"
+            notes="$notes_file"
+          fi
+          gh release create "$TAG" dist/* \
+            --title "OpenCode Gateway $TAG" \
+            --notes-file "$notes"

@@ -20,7 +20,10 @@ func TestGeneratedCodexV01ProfileDisablesRequestAndStreamRetries(t *testing.T) {
 	}
 	profile := string(data)
 	for _, line := range []string{
-		`model_provider = "gateway"`,
+		`model = "deepseek-v4-flash"`,
+		`model_provider = "opencode-gateway"`,
+		`model_supports_reasoning_summaries = false`,
+		`supports_websockets = false`,
 		`wire_api = "responses"`,
 		`request_max_retries = 0`,
 		`stream_max_retries = 0`,

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/rafaself/opencode-go-gateway/internal/app"
@@ -47,6 +48,19 @@ func execute(args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "help", "-h", "--help":
+		if len(args) != 1 {
+			usage(stderr)
+			return errUsage
+		}
+		usage(stdout)
+		return nil
+	case "-v", "--version":
+		if len(args) != 1 {
+			usage(stderr)
+			return errUsage
+		}
+		return printVersion(stdout)
 	case "run":
 		return runServer(args[1:], stdout, stderr)
 	case "version":
@@ -115,8 +129,32 @@ func signalContext(parent context.Context) (context.Context, context.CancelFunc)
 }
 
 func printVersion(w io.Writer) error {
-	_, err := fmt.Fprintf(w, "opencode-gateway version=%s commit=%s build_date=%s go=%s\n", version, commit, buildDate, runtime.Version())
+	_, err := fmt.Fprintf(w, "opencode-gateway version=%s commit=%s build_date=%s go=%s\n", safeOutputMetadata(version), safeOutputMetadata(commit), safeOutputMetadata(buildDate), safeOutputMetadata(runtime.Version()))
 	return err
+}
+
+func safeOutputMetadata(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	var result strings.Builder
+	for _, runeValue := range value {
+		if (runeValue >= 'a' && runeValue <= 'z') ||
+			(runeValue >= 'A' && runeValue <= 'Z') ||
+			(runeValue >= '0' && runeValue <= '9') ||
+			runeValue == '.' || runeValue == '-' || runeValue == '_' || runeValue == '+' || runeValue == ':' {
+			result.WriteRune(runeValue)
+			continue
+		}
+		result.WriteByte('-')
+	}
+	if result.Len() == 0 {
+		return "unknown"
+	}
+	if result.Len() > 128 {
+		return result.String()[:128]
+	}
+	return result.String()
 }
 
 func runCodexSetup(args []string, stdout, stderr io.Writer) error {
@@ -255,12 +293,16 @@ func runCapture(args []string, stdout, stderr io.Writer) error {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: opencode-gateway <command>")
+	fmt.Fprintln(w, "Usage: opencode-gateway <command> [options]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  run                    Start the local gateway server")
 	fmt.Fprintln(w, "  version                Print version and build metadata")
+	fmt.Fprintln(w, "  help                   Print this help")
 	fmt.Fprintln(w, "  setup codex            Configure the user-level Codex provider safely")
 	fmt.Fprintln(w, "  doctor                 Diagnose gateway, Codex, and provider setup")
 	fmt.Fprintln(w, "  dev capture-codex      Start the development-only contract capture server")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Aliases: -h/--help print help; -v/--version print version metadata.")
+	fmt.Fprintln(w, "Exit status: 0 success/help, 1 operational failure, 2 invalid usage.")
 }
