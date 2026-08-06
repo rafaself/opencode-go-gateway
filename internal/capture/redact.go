@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -19,10 +20,12 @@ func codexVersionFromUserAgent(userAgent string) string {
 }
 
 func Redact(value any) any {
-	return redactValue(value, "", "")
+	return redactValue(value, "", "", false)
 }
 
-func redactValue(value any, key, parent string) any {
+func redactValue(value any, key, parent string, sensitive bool) any {
+	sensitive = sensitive || isSensitiveContainer(key) || isSensitiveContainer(parent)
+
 	switch typed := value.(type) {
 	case map[string]any:
 		result := make(map[string]any, len(typed))
@@ -35,35 +38,84 @@ func redactValue(value any, key, parent string) any {
 			if isCredentialKey(name) {
 				continue
 			}
-			result[name] = redactValue(typed[name], name, key)
+			childSensitive := sensitive || isSensitiveContainer(name)
+			result[name] = redactValue(typed[name], name, key, childSensitive)
 		}
 		return result
 	case []any:
 		result := make([]any, len(typed))
 		for index, item := range typed {
-			result[index] = redactValue(item, key, parent)
+			result[index] = redactValue(item, key, parent, sensitive)
 		}
 		return result
 	case string:
-		if isSensitiveContainer(key) || isSensitiveContainer(parent) {
-			return "<redacted:string>"
+		if sensitive {
+			return normalizeSensitiveScalar(typed)
 		}
 		return redactString(typed, key, parent)
 	case float64:
-		if isSensitiveContainer(key) || isSensitiveContainer(parent) {
-			return float64(0)
+		if sensitive {
+			return normalizeSensitiveScalar(typed)
 		}
 		if isTimestampKey(key) {
 			return float64(0)
 		}
 		return typed
 	case bool:
-		if isSensitiveContainer(key) || isSensitiveContainer(parent) {
-			return false
+		if sensitive {
+			return normalizeSensitiveScalar(value)
 		}
-		return typed
-	default:
 		return value
+	default:
+		if sensitive {
+			return normalizeSensitiveScalar(value)
+		}
+		return value
+	}
+}
+
+func normalizeSensitiveScalar(value any) any {
+	switch value.(type) {
+	case nil:
+		return nil
+	case string:
+		return "<redacted:string>"
+	case json.Number:
+		return json.Number("0")
+	case bool:
+		return false
+	case float32:
+		return float32(0)
+	case float64:
+		return float64(0)
+	case complex64:
+		return complex64(0)
+	case complex128:
+		return complex128(0)
+	case int:
+		return int(0)
+	case int8:
+		return int8(0)
+	case int16:
+		return int16(0)
+	case int32:
+		return int32(0)
+	case int64:
+		return int64(0)
+	case uint:
+		return uint(0)
+	case uint8:
+		return uint8(0)
+	case uint16:
+		return uint16(0)
+	case uint32:
+		return uint32(0)
+	case uint64:
+		return uint64(0)
+	case uintptr:
+		return uintptr(0)
+	default:
+		return nil
 	}
 }
 

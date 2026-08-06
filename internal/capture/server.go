@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,7 +184,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sequence := s.nextSequence()
+	sequence, err := s.nextSequence()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not allocate capture sequence")
+		return
+	}
+	defer s.releaseSequence(sequence)
 	version := s.config.CodexVersion
 	if version == "" {
 		version = codexVersionFromUserAgent(r.Header.Get("User-Agent"))
@@ -214,25 +221,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		Response: ResponseFixture{
 			Mode:       mode,
-			EventTypes: eventTypes(events),
 			DoneMarker: false,
 		},
 	}
 
-	path, err := s.writeFixture(fixture)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "could not write redacted fixture")
-		return
-	}
-	if s.config.OnCapture != nil {
-		s.config.OnCapture(CaptureInfo{Path: path, Sequence: sequence, CodexVersion: version})
-	}
-
-	if err := writeResponseStream(w, events); err != nil {
-		return
-	}
+	captureErr := s.streamAndPersistFixture(r.Context(), w, fixture, events)
 	if s.config.OneShot {
 		go s.Close()
+	}
+	if captureErr != nil {
+		return
 	}
 }
 
@@ -260,11 +258,103 @@ func decodeRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 	return body, nil
 }
 
-func (s *Server) nextSequence() int {
+func (s *Server) nextSequence() (int, error) {
+	if s.config.OutputDir != "" {
+		if err := os.MkdirAll(s.config.OutputDir, 0o750); err != nil {
+			return 0, err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sequence++
-	return s.sequence
+
+	sequence := s.sequence + 1
+	if sequence < 1 {
+		sequence = 1
+	}
+	if s.config.OutputDir == "" {
+		s.sequence = sequence
+		return sequence, nil
+	}
+
+	highest, err := highestFixtureSequence(s.config.OutputDir, s.config.FixturePrefix)
+	if err != nil {
+		return 0, fmt.Errorf("scan fixture directory: %w", err)
+	}
+	if highest >= sequence {
+		sequence = highest + 1
+	}
+	for {
+		lockPath := s.fixtureLockPath(sequence)
+		lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			if closeErr := lock.Close(); closeErr != nil {
+				_ = os.Remove(lockPath)
+				return 0, closeErr
+			}
+			s.sequence = sequence
+			return sequence, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return 0, fmt.Errorf("reserve fixture sequence %d: %w", sequence, err)
+		}
+		sequence++
+	}
+}
+
+func (s *Server) fixturePath(sequence int) string {
+	return filepath.Join(s.config.OutputDir, fixtureFilename(s.config.FixturePrefix, sequence))
+}
+
+func (s *Server) fixtureLockPath(sequence int) string {
+	return s.fixturePath(sequence) + ".lock"
+}
+
+func (s *Server) releaseSequence(sequence int) {
+	if s.config.OutputDir != "" {
+		_ = os.Remove(s.fixtureLockPath(sequence))
+	}
+}
+
+func highestFixtureSequence(outputDir, prefix string) (int, error) {
+	entries, err := os.ReadDir(outputDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	highest := 0
+	for _, entry := range entries {
+		sequence, ok := fixtureSequenceFromFilename(entry.Name(), prefix)
+		if ok && sequence > highest {
+			highest = sequence
+		}
+	}
+	return highest, nil
+}
+
+func fixtureSequenceFromFilename(name, prefix string) (int, bool) {
+	base := prefix + "-"
+	if !strings.HasPrefix(name, base) {
+		return 0, false
+	}
+	sequencePart := strings.TrimPrefix(name, base)
+	sequencePart = strings.TrimSuffix(sequencePart, ".lock")
+	sequencePart = strings.TrimSuffix(sequencePart, ".json")
+	if sequencePart == "" {
+		return 0, false
+	}
+	sequence, err := strconv.Atoi(sequencePart)
+	if err != nil || sequence < 1 {
+		return 0, false
+	}
+	return sequence, true
+}
+
+func fixtureFilename(prefix string, sequence int) string {
+	return fmt.Sprintf("%s-%03d.json", prefix, sequence)
 }
 
 func (s *Server) writeFixture(fixture Fixture) (string, error) {
@@ -274,8 +364,7 @@ func (s *Server) writeFixture(fixture Fixture) (string, error) {
 	if err := os.MkdirAll(s.config.OutputDir, 0o750); err != nil {
 		return "", err
 	}
-	filename := fmt.Sprintf("%s-%03d.json", s.config.FixturePrefix, fixture.CaptureNumber)
-	path := filepath.Join(s.config.OutputDir, filename)
+	path := s.fixturePath(fixture.CaptureNumber)
 	temp, err := os.CreateTemp(s.config.OutputDir, s.config.FixturePrefix+"-*.tmp")
 	if err != nil {
 		return "", err
@@ -299,10 +388,54 @@ func (s *Server) writeFixture(fixture Fixture) (string, error) {
 		return "", err
 	}
 	if err := os.Remove(tempName); err != nil {
-		_ = os.Remove(path)
 		return "", err
 	}
 	return path, nil
+}
+
+func (s *Server) streamAndPersistFixture(ctx context.Context, w http.ResponseWriter, fixture Fixture, events []map[string]any) error {
+	writtenEventTypes, streamErr := writeResponseStreamWithContext(ctx, w, events)
+	fixture.Response.EventTypes = writtenEventTypes
+
+	path, fixtureErr := s.writeFixture(fixture)
+	if fixtureErr != nil {
+		fixtureErr = fmt.Errorf("could not write redacted fixture: %w", fixtureErr)
+	} else if s.config.OnCapture != nil {
+		s.config.OnCapture(CaptureInfo{
+			Path:         path,
+			Sequence:     fixture.CaptureNumber,
+			CodexVersion: fixture.CodexVersion,
+		})
+	}
+	return errors.Join(streamErr, fixtureErr)
+}
+
+func writeResponseStreamWithContext(ctx context.Context, w http.ResponseWriter, events []map[string]any) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := w.(http.Flusher); !ok {
+		return nil, fmt.Errorf("response writer does not support streaming")
+	}
+	return writeResponseStream(&contextResponseWriter{ResponseWriter: w, context: ctx}, events)
+}
+
+type contextResponseWriter struct {
+	http.ResponseWriter
+	context context.Context
+}
+
+func (w *contextResponseWriter) Write(payload []byte) (int, error) {
+	if err := w.context.Err(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+func (w *contextResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func resolveLoopbackAddr(address string) (*net.TCPAddr, error) {

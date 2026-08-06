@@ -28,5 +28,5 @@
     "input_item_types": ["message"],
     "tool_types": ["function"]
   },
-  "response": {"mode": "parallel", "event_types": ["response.created", "response.in_progress", "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.completed"], "done_marker": false}
+  "response": {"mode": "parallel", "event_types": ["response.created", "response.in_progress", "response.output_item.added", "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.function_call_arguments.done", "response.output_item.done", "response.output_item.done", "response.completed"], "done_marker": false}
 }

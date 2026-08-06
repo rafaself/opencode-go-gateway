@@ -52,7 +52,7 @@ Request fixtures live in `testdata/codex/requests/`. Each fixture contains:
 
 Response fixtures live in `testdata/codex/responses/` as SSE streams. They are parsed by tests, and all event sequence numbers are normalized to a strictly increasing deterministic sequence. No checked-in SSE fixture contains a `[DONE]` marker.
 
-The transient output directory `testdata/codex/captures/` is ignored by Git. Review generated files before moving any capture into the checked-in fixture directories; redaction is a safety boundary, not a substitute for review.
+The transient output directory `testdata/codex/captures/` is ignored by Git. Review generated files before moving any capture into the checked-in fixture directories; redaction is a safety boundary, not a substitute for review. Reusing a fixture name and output directory is safe: the server skips existing numbered files and allocates the next available sequence.
 
 ## Field policy
 
@@ -133,7 +133,7 @@ The capture run also verifies these ordering rules for the tested CLI:
 4. `response.in_progress` is accepted before output events.
 5. A terminal response is accepted when the HTTP stream ends after `response.completed`; a `[DONE]` marker is not required.
 
-Cancellation is represented by `cancellation-request.json`: the request was recorded, then the client connection ended before a terminal SSE event. A compatibility implementation must treat an interrupted transport as incomplete rather than inventing a successful terminal response.
+Cancellation is represented by `cancellation-request.json`: the request was recorded, then the client connection ended before a terminal SSE event. The capture server finalizes the request fixture after streaming and records only event frames successfully written before the interruption. A compatibility implementation must treat an interrupted transport as incomplete rather than inventing a successful terminal response.
 
 ## Recapture after a Codex upgrade
 

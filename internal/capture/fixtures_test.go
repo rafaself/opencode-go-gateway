@@ -85,12 +85,20 @@ func TestCodexRequestFixturesAreRedactedAndClassified(t *testing.T) {
 				t.Fatalf("%s: unclassified top-level request field %q", entry.Name(), field)
 			}
 		}
-		for _, itemType := range fixture.Request.InputItemTypes {
+		inputItemTypes := itemTypes(body, "input")
+		if !reflect.DeepEqual(fixture.Request.InputItemTypes, inputItemTypes) {
+			t.Fatalf("%s: input item type index does not match body: %v vs %v", entry.Name(), fixture.Request.InputItemTypes, inputItemTypes)
+		}
+		toolTypes := itemTypes(body, "tools")
+		if !reflect.DeepEqual(fixture.Request.ToolTypes, toolTypes) {
+			t.Fatalf("%s: tool type index does not match body: %v vs %v", entry.Name(), fixture.Request.ToolTypes, toolTypes)
+		}
+		for _, itemType := range inputItemTypes {
 			if _, ok := policy.ItemTypes[itemType]; !ok {
 				t.Fatalf("%s: unclassified input item type %q", entry.Name(), itemType)
 			}
 		}
-		for _, toolType := range fixture.Request.ToolTypes {
+		for _, toolType := range toolTypes {
 			if _, ok := policy.ToolTypes[toolType]; !ok {
 				t.Fatalf("%s: unclassified tool type %q", entry.Name(), toolType)
 			}
@@ -112,6 +120,57 @@ func TestCodexRequestFixturesAreRedactedAndClassified(t *testing.T) {
 		if !seen[name] {
 			t.Errorf("missing required request fixture %s", name)
 		}
+	}
+}
+
+func TestResponseFixtureEventTypesMatchGeneratedModes(t *testing.T) {
+	requestFixtures := map[ResponseMode]string{
+		ResponseText:     "simple-request.json",
+		ResponseFunction: "function-tools-request.json",
+		ResponseParallel: "parallel-tools-request.json",
+		ResponseCustom:   "apply-patch-request.json",
+	}
+	requestDir := filepath.Join("..", "..", "testdata", "codex", "requests")
+	for mode, name := range requestFixtures {
+		t.Run(string(mode), func(t *testing.T) {
+			fixture := readFixtureFile(t, filepath.Join(requestDir, name))
+			events, err := responseEvents(mode, "gpt-5.3-codex", "capture acknowledged", fixture.CaptureNumber)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := fixture.Response.EventTypes, eventTypes(events); !reflect.DeepEqual(got, want) {
+				t.Fatalf("fixture event types = %v, generated = %v", got, want)
+			}
+		})
+	}
+
+	responseFixtures := map[ResponseMode]string{
+		ResponseIncomplete: "incomplete.sse",
+		ResponseFailed:     "failed.sse",
+	}
+	responseDir := filepath.Join("..", "..", "testdata", "codex", "responses")
+	for mode, name := range responseFixtures {
+		t.Run(string(mode), func(t *testing.T) {
+			file, err := os.Open(filepath.Join(responseDir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixtureEvents, _, readErr := readSSE(file)
+			closeErr := file.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			generated, err := responseEvents(mode, "gpt-5.3-codex", "capture acknowledged", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := eventTypes(fixtureEvents), eventTypes(generated); !reflect.DeepEqual(got, want) {
+				t.Fatalf("fixture event types = %v, generated = %v", got, want)
+			}
+		})
 	}
 }
 

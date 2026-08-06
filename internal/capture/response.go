@@ -178,24 +178,28 @@ func cloneEvent(event map[string]any) map[string]any {
 	return clone
 }
 
-func writeResponseStream(w http.ResponseWriter, events []map[string]any) error {
+func writeResponseStream(w http.ResponseWriter, events []map[string]any) ([]string, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("response writer does not support streaming")
+		return nil, fmt.Errorf("response writer does not support streaming")
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
+	writtenTypes := make([]string, 0, len(events))
 	for _, event := range events {
 		payload, err := json.Marshal(event)
 		if err != nil {
-			return err
+			return writtenTypes, err
 		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
-			return err
+			return writtenTypes, err
+		}
+		if eventType, ok := event["type"].(string); ok {
+			writtenTypes = append(writtenTypes, eventType)
 		}
 		flusher.Flush()
 	}
-	return nil
+	return writtenTypes, nil
 }
