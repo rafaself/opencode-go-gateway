@@ -46,7 +46,7 @@ func TestServerBehaviorPreservesGenericStreamError(t *testing.T) {
 	writer := &serverBehaviorFailingResponseWriter{failAfter: 1, err: streamErr}
 
 	written, err := writeResponseStreamWithContext(context.Background(), writer, events)
-	if !errors.Is(err, streamErr) {
+	if err != streamErr {
 		t.Fatalf("stream error = %v, want %v", err, streamErr)
 	}
 	if want := []string{"response.created"}; !reflect.DeepEqual(written, want) {
