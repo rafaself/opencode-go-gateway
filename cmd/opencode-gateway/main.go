@@ -13,6 +13,7 @@ import (
 
 	"github.com/rafaself/opencode-go-gateway/internal/app"
 	"github.com/rafaself/opencode-go-gateway/internal/capture"
+	"github.com/rafaself/opencode-go-gateway/internal/codexsetup"
 	"github.com/rafaself/opencode-go-gateway/internal/config"
 )
 
@@ -54,6 +55,14 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return errUsage
 		}
 		return printVersion(stdout)
+	case "setup":
+		if len(args) < 2 || args[1] != "codex" {
+			usage(stderr)
+			return errUsage
+		}
+		return runCodexSetup(args[2:], stdout, stderr)
+	case "doctor":
+		return runDoctor(args[1:], stdout, stderr)
 	case "dev":
 		if len(args) < 2 || args[1] != "capture-codex" {
 			usage(stderr)
@@ -108,6 +117,81 @@ func signalContext(parent context.Context) (context.Context, context.CancelFunc)
 func printVersion(w io.Writer) error {
 	_, err := fmt.Fprintf(w, "opencode-gateway version=%s commit=%s build_date=%s go=%s\n", version, commit, buildDate, runtime.Version())
 	return err
+}
+
+func runCodexSetup(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("setup codex", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
+	gatewayURL := flags.String("gateway-url", codexsetup.DefaultGatewayURL, "gateway Responses base URL")
+	dryRun := flags.Bool("dry-run", false, "show redacted changes without writing files")
+	restore := flags.String("restore", "", "restore a setup backup directory")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	if flags.NArg() != 0 || (*restore != "" && *dryRun) {
+		fmt.Fprintln(stderr, "setup codex: use either --restore or --dry-run, and provide no positional arguments")
+		return errUsage
+	}
+	if *restore != "" {
+		result, err := codexsetup.RestoreBackup(codexsetup.Environment{}, *codexHome, *restore)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Restored Codex setup from backup %s\n", result.BackupPath)
+		return nil
+	}
+	result, err := codexsetup.SetupCodex(codexsetup.SetupOptions{
+		CodexHome:  *codexHome,
+		GatewayURL: *gatewayURL,
+		DryRun:     *dryRun,
+	})
+	if err != nil {
+		return err
+	}
+	if *dryRun && result.Diff != "" {
+		fmt.Fprintln(stdout, result.Diff)
+	}
+	if *dryRun {
+		return nil
+	}
+	if !result.Changed {
+		fmt.Fprintf(stdout, "Codex setup is already current for %s\n", result.ConfigPath)
+		return nil
+	}
+	fmt.Fprintf(stdout, "Codex setup updated %s and %s\n", result.ConfigPath, result.CatalogPath)
+	fmt.Fprintf(stdout, "Backup: %s\n", result.BackupPath)
+	fmt.Fprintf(stdout, "Rollback: opencode-gateway setup codex --restore %s\n", result.BackupPath)
+	return nil
+}
+
+func runDoctor(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
+	gatewayURL := flags.String("gateway-url", "", "gateway Responses base URL; defaults to the configured provider")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "doctor: unexpected arguments: %v\n", flags.Args())
+		return errUsage
+	}
+	report := codexsetup.Diagnose(context.Background(), codexsetup.DoctorOptions{CodexHome: *codexHome, GatewayURL: *gatewayURL})
+	for _, check := range report.Checks {
+		fmt.Fprintf(stdout, "[%s] %s: %s\n", check.Severity, check.Name, check.Message)
+	}
+	fmt.Fprintf(stdout, "Doctor summary: %d failure(s), %d warning(s)\n", report.Failures(), report.Warnings())
+	if report.Failures() > 0 {
+		return &codexsetup.DoctorError{Failures: report.Failures()}
+	}
+	return nil
 }
 
 func runCapture(args []string, stdout, stderr io.Writer) error {
@@ -176,5 +260,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  run                    Start the local gateway server")
 	fmt.Fprintln(w, "  version                Print version and build metadata")
+	fmt.Fprintln(w, "  setup codex            Configure the user-level Codex provider safely")
+	fmt.Fprintln(w, "  doctor                 Diagnose gateway, Codex, and provider setup")
 	fmt.Fprintln(w, "  dev capture-codex      Start the development-only contract capture server")
 }

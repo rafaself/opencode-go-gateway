@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -49,6 +50,38 @@ func TestInvalidRunArgumentsUseUsageExitCode(t *testing.T) {
 				t.Fatalf("commandExitCode(%v) = %d, want 2; stderr=%s", args, got, stderr.String())
 			}
 		})
+	}
+}
+
+func TestSetupCodexCommandWritesUserConfigWithoutGatewayKey(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if err := execute([]string{"setup", "codex", "--codex-home", home}, &stdout, &stderr); err != nil {
+		t.Fatalf("setup codex error = %v; stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Backup:") || strings.Contains(stdout.String(), "OPENCODE_GO_API_KEY") {
+		t.Fatalf("setup output = %s", stdout.String())
+	}
+	for _, name := range []string{"config.toml", "models.json"} {
+		if _, err := os.Stat(filepath.Join(home, name)); err != nil {
+			t.Fatalf("setup did not create %s: %v", name, err)
+		}
+	}
+}
+
+func TestSetupCodexDryRunCommandDoesNotWrite(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if err := execute([]string{"setup", "codex", "--codex-home", home, "--dry-run"}, &stdout, &stderr); err != nil {
+		t.Fatalf("dry-run error = %v; stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "redacted") {
+		t.Fatalf("dry-run output = %s", stdout.String())
+	}
+	if entries, err := os.ReadDir(home); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("dry-run wrote entries: %+v", entries)
 	}
 }
 

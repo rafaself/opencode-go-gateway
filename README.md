@@ -112,6 +112,23 @@ bounded shutdown grace period. Structured logs contain request metadata only;
 bodies, credentials, prompts, source code, reasoning content, and tool data are
 not logged.
 
+## Configure and diagnose Codex
+
+The binary can safely configure the user-level Codex provider and generate the
+DeepSeek V4 Flash model catalog:
+
+```bash
+./bin/opencode-gateway setup codex
+./bin/opencode-gateway doctor
+```
+
+Setup creates a timestamped backup before changing `config.toml`, preserves
+unrelated settings/comments where safe, writes owner-only files atomically,
+and never stores `OPENCODE_GO_API_KEY`. Use `--dry-run` for a redacted preview
+or restore a printed backup with `setup codex --restore <backup-directory>`.
+The full path resolution, catalog schema, rollback, and doctor check behavior
+are documented in [docs/codex-setup.md](docs/codex-setup.md).
+
 ## First text-only smoke test
 
 The real-provider smoke test is opt-in because it makes a paid/network request.
