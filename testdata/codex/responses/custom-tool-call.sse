@@ -1,0 +1,13 @@
+data: {"type":"response.created","response":{"id":"resp_custom","object":"response","created_at":0,"status":"in_progress","output":[]},"sequence_number":0}
+
+data: {"type":"response.in_progress","response":{"id":"resp_custom","object":"response","created_at":0,"status":"in_progress","output":[]},"sequence_number":1}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ctc_0","type":"custom_tool_call","status":"in_progress","call_id":"call_0","name":"apply_patch","input":""},"sequence_number":2}
+
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_0","delta":"*** Begin Patch\n*** End Patch","sequence_number":3}
+
+data: {"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_0","input":"*** Begin Patch\n*** End Patch","sequence_number":4}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ctc_0","type":"custom_tool_call","status":"completed","call_id":"call_0","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},"sequence_number":5}
+
+data: {"type":"response.completed","response":{"id":"resp_custom","object":"response","created_at":0,"status":"completed","completed_at":0,"output":[{"id":"ctc_0","type":"custom_tool_call","status":"completed","call_id":"call_0","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}]},"sequence_number":6}

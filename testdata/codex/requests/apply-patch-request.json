@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "fixture_name": "apply-patch-request",
+  "capture_number": 1,
+  "codex_version": "0.146.0",
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "headers": {"accept": "text/event-stream", "content-type": "application/json", "originator": "codex_exec", "user-agent": "codex_exec/0.146.0"},
+    "body": {
+      "client_metadata": {"session_id": "<normalized:id>", "thread_id": "<normalized:id>", "turn_id": "<normalized:id>"},
+      "include": ["reasoning.encrypted_content"],
+      "input": [{"id": "<normalized:id>", "role": "user", "type": "message", "content": [{"type": "input_text", "text": "<redacted:string>"}]}],
+      "instructions": "<redacted:string>",
+      "model": "gpt-5.3-codex",
+      "parallel_tool_calls": false,
+      "prompt_cache_key": "<redacted:string>",
+      "reasoning": {"summary": "<redacted:string>"},
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "tools": [
+        {"type": "function", "name": "exec_command", "description": "<redacted:string>", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"], "additionalProperties": false}},
+        {"type": "namespace", "name": "mcp", "description": "<redacted:string>", "tools": []},
+        {"type": "web_search", "external_web_access": false}
+      ]
+    },
+    "top_level_fields": ["client_metadata", "include", "input", "instructions", "model", "parallel_tool_calls", "prompt_cache_key", "reasoning", "store", "stream", "tool_choice", "tools"],
+    "input_item_types": ["message"],
+    "tool_types": ["function", "namespace", "web_search"]
+  },
+  "response": {"mode": "custom", "event_types": ["response.created", "response.in_progress", "response.output_item.added", "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", "response.output_item.done", "response.completed"], "done_marker": false}
+}

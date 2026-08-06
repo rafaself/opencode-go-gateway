@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "codex_version": "0.146.0",
+  "unknown_fields": "reject",
+  "top_level": {
+    "model": {"policy": "translate", "observed": true, "notes": "Selects the upstream model."},
+    "instructions": {"policy": "translate", "observed": true, "notes": "Developer/system instruction block; prompt content is always redacted in fixtures."},
+    "input": {"policy": "translate", "observed": true, "notes": "Conversation and tool-result items."},
+    "tools": {"policy": "translate", "observed": true, "notes": "Function, namespace, and web-search tool declarations."},
+    "tool_choice": {"policy": "translate", "observed": true, "notes": "Tool selection policy."},
+    "parallel_tool_calls": {"policy": "translate", "observed": true, "notes": "Controls whether multiple tool calls may be emitted."},
+    "reasoning": {"policy": "translate", "observed": true, "notes": "Reasoning summary/encrypted-content settings."},
+    "text": {"policy": "translate", "observed": false, "notes": "Output format settings; retain only when a tested Codex version sends it."},
+    "stream": {"policy": "translate", "observed": true, "notes": "Must be true for the captured SSE contract."},
+    "stream_options": {"policy": "accept as no-op", "observed": false, "notes": "Record shape, but do not forward unsupported stream controls."},
+    "store": {"policy": "accept as no-op", "observed": true, "notes": "Codex sends false; the gateway does not persist upstream responses."},
+    "include": {"policy": "translate", "observed": true, "notes": "Controls optional reasoning/content fields."},
+    "service_tier": {"policy": "accept as no-op", "observed": false, "notes": "Do not let a client-selected tier change the compatibility path."},
+    "prompt_cache_key": {"policy": "accept as no-op", "observed": true, "notes": "Preserve only as a cache hint; redact the value in fixtures."},
+    "metadata": {"policy": "accept as no-op", "observed": false, "notes": "Never forward arbitrary client metadata without an explicit policy."},
+    "client_metadata": {"policy": "accept as no-op", "observed": true, "notes": "Codex transport metadata is structural context and is redacted."},
+    "previous_response_id": {"policy": "translate", "observed": true, "notes": "Required to preserve continuation semantics when supplied."},
+    "background": {"policy": "defer", "observed": false, "notes": "Not part of the first vertical slice; do not silently emulate it."}
+  },
+  "item_types": {
+    "message": "translate",
+    "function_call": "translate",
+    "function_call_output": "translate",
+    "custom_tool_call": "translate",
+    "custom_tool_call_output": "translate"
+  },
+  "tool_types": {
+    "function": "translate",
+    "namespace": "defer",
+    "web_search": "defer"
+  }
+}
