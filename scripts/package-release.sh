@@ -101,10 +101,14 @@ verify_checksum_file() {
 verify_archive_contents() {
 	local archive="$1"
 	local stem="$2"
-	local binary_name="$3"
+	shift 2
 	local entries
 	entries="$(archive_entries "$archive")"
-	for expected in "$stem/$binary_name" "$stem/LICENSE" "$stem/README.txt"; do
+	for binary_name in "$@"; do
+		printf '%s\n' "$entries" | grep -F -x -- "$stem/$binary_name" >/dev/null || \
+			die "archive $archive is missing $stem/$binary_name"
+	done
+	for expected in "$stem/LICENSE" "$stem/README.txt"; do
 		printf '%s\n' "$entries" | grep -F -x -- "$expected" >/dev/null || \
 			die "archive $archive is missing $expected"
 	done
@@ -194,21 +198,26 @@ for target in "${TARGETS[@]}"; do
 	stage_dir="$temporary_dir/$archive_stem"
 	mkdir -p "$stage_dir"
 	binary_name="opencode-gateway"
+	alias_binary_name="ocgtw"
 	archive_suffix=".tar.gz"
 	if [[ "$goos" == "windows" ]]; then
 		binary_name="opencode-gateway.exe"
+		alias_binary_name="ocgtw.exe"
 		archive_suffix=".zip"
 	fi
 	binary_path="$stage_dir/$binary_name"
+	alias_binary_path="$stage_dir/$alias_binary_name"
 
 	echo "building $goos/$goarch"
 	GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 "$GO_BIN" build \
 		-trimpath -buildvcs=false -ldflags "$ldflags" -o "$binary_path" ./cmd/opencode-gateway
+	cp "$binary_path" "$alias_binary_path"
 	cp "$ROOT_DIR/LICENSE" "$stage_dir/LICENSE"
 	cp "$ROOT_DIR/packaging/README.txt" "$stage_dir/README.txt"
-	chmod 0755 "$binary_path"
+	chmod 0755 "$binary_path" "$alias_binary_path"
 	chmod 0644 "$stage_dir/LICENSE" "$stage_dir/README.txt"
 	set_file_mtime "$binary_path"
+	set_file_mtime "$alias_binary_path"
 	set_file_mtime "$stage_dir/LICENSE"
 	set_file_mtime "$stage_dir/README.txt"
 
@@ -249,12 +258,14 @@ if ((SELF_TEST)); then
 		goarch="${target#*/}"
 		stem="opencode-gateway_${VERSION_VALUE}_${goos}_${goarch}"
 		binary_name="opencode-gateway"
+		alias_binary_name="ocgtw"
 		archive_suffix=".tar.gz"
 		if [[ "$goos" == "windows" ]]; then
 			binary_name="opencode-gateway.exe"
+			alias_binary_name="ocgtw.exe"
 			archive_suffix=".zip"
 		fi
-		verify_archive_contents "$OUTPUT_DIR/${stem}${archive_suffix}" "$stem" "$binary_name"
+		verify_archive_contents "$OUTPUT_DIR/${stem}${archive_suffix}" "$stem" "$binary_name" "$alias_binary_name"
 	done
 	echo "package self-test passed"
 fi

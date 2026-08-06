@@ -172,7 +172,8 @@ the provider body promptly while still emitting one safe timeout
 client receives no fallback JSON and the pending continuation lease is aborted
 so the tool turn can be retried.
 
-The application constructs the OpenCode Go client from `OPENCODE_GO_API_KEY`
-and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or included in
-logs, errors, or Responses bytes. See the [provider smoke test](../README.md#first-text-only-smoke-test)
+The application constructs the OpenCode Go client from the resolved gateway
+credential (the `OPENCODE_GO_API_KEY` environment value or the value saved by
+`ocgtw config`) and `OPENCODE_GO_BASE_URL`. The key is never sent to Codex or
+included in logs, errors, or Responses bytes. See the [provider smoke test](../README.md#first-text-only-smoke-test)
 for the manual verification record.

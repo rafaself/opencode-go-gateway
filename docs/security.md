@@ -6,9 +6,18 @@ credential on the provider side of the process boundary.
 
 ## Data handling
 
-- `OPENCODE_GO_API_KEY` is required at runtime, is sent only as the upstream
-  authorization credential, and is never written to Codex TOML, the model
-  catalog, logs, fixture files, error bodies, or Responses bytes.
+- `OPENCODE_GO_API_KEY` is used only as the upstream authorization credential
+  and is never written to Codex TOML, the model catalog, logs, fixture files,
+  error bodies, or Responses bytes. An environment value takes precedence over
+  the optional credential configured with `ocgtw config set-key`.
+- On Linux, the configured credential is stored in Secret Service when the
+  helper is available. The fallback is an owner-only `0700` directory and
+  `0600` file containing the key in plaintext. That fallback is protected by
+  filesystem permissions, not encryption; use the keyring or the environment
+  workflow when stronger at-rest protection is required.
+- `config status` reports only backend state. `config set-key` reads standard
+  input and rejects command-line key values, reducing shell history and process
+  listing exposure. `config remove-key` deletes the persistent value.
 - Request bodies, prompts, instructions, source code, filesystem paths,
   environment values, client metadata, tool arguments, and provider reasoning
   are not logged. Capture output is redacted and must be reviewed before it is

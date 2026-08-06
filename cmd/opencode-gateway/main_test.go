@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/rafaself/opencode-go-gateway/internal/credentials"
 )
 
 func TestVersionPrintsBuildMetadata(t *testing.T) {
@@ -99,6 +102,8 @@ func TestInvalidRunArgumentsUseUsageExitCode(t *testing.T) {
 
 func TestOperationalFailureUsesExitCodeOne(t *testing.T) {
 	t.Setenv("OPENCODE_GO_API_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
 	var stdout, stderr bytes.Buffer
 	if got := commandExitCode([]string{"run"}, &stdout, &stderr); got != 1 {
 		t.Fatalf("commandExitCode(run) = %d, want 1; stdout=%s stderr=%s", got, stdout.String(), stderr.String())
@@ -137,6 +142,76 @@ func TestSetupCodexDryRunCommandDoesNotWrite(t *testing.T) {
 		t.Fatal(err)
 	} else if len(entries) != 0 {
 		t.Fatalf("dry-run wrote entries: %+v", entries)
+	}
+}
+
+func TestConfigSetKeyStoresWithoutEchoingTheCredential(t *testing.T) {
+	store := credentials.NewFileStore(filepath.Join(t.TempDir(), "opencode-gateway", "credentials"))
+	const key = "sk-main-test-secret"
+	lookup := func(string) (string, bool) { return "", false }
+	var stdout, stderr bytes.Buffer
+	if err := runConfigWithStore([]string{"set-key", "--stdin"}, &stdout, &stderr, store, lookup, strings.NewReader(key+"\n")); err != nil {
+		t.Fatalf("set-key error = %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stdout.String(), key) || strings.Contains(stderr.String(), key) {
+		t.Fatalf("set-key output exposed API key: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "permission-restricted") {
+		t.Fatalf("set-key output did not describe protected storage: %s", stdout.String())
+	}
+
+	settings, err := loadRuntimeConfig(lookup, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.APIKey() != key {
+		t.Fatalf("loaded API key = %q, want stored key", settings.APIKey())
+	}
+
+	stdout.Reset()
+	if err := runConfigWithStore([]string{"status"}, &stdout, &stderr, store, lookup, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), key) || !strings.Contains(stdout.String(), "Stored API key: configured") {
+		t.Fatalf("status output = %q", stdout.String())
+	}
+	if err := runConfigWithStore([]string{"remove-key"}, &stdout, &stderr, store, lookup, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Load(); err == nil {
+		t.Fatal("stored API key remained after remove-key")
+	}
+}
+
+func TestStoredCredentialDoesNotOverrideEnvironment(t *testing.T) {
+	store := credentials.NewFileStore(filepath.Join(t.TempDir(), "opencode-gateway", "credentials"))
+	if _, err := store.Save("stored-key"); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(name string) (string, bool) {
+		if name == "OPENCODE_GO_API_KEY" {
+			return "environment-key", true
+		}
+		return "", false
+	}
+	settings, err := loadRuntimeConfig(lookup, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.APIKey() != "environment-key" {
+		t.Fatalf("API key = %q, want environment value", settings.APIKey())
+	}
+}
+
+func TestConfigSetKeyRejectsCommandLineCredential(t *testing.T) {
+	store := credentials.NewFileStore(filepath.Join(t.TempDir(), "opencode-gateway", "credentials"))
+	var stdout, stderr bytes.Buffer
+	err := runConfigWithStore([]string{"set-key", "sk-command-line-secret"}, &stdout, &stderr, store, func(string) (string, bool) { return "", false }, strings.NewReader(""))
+	if !errors.Is(err, errUsage) {
+		t.Fatalf("error = %v, want usage error", err)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), "sk-command-line-secret") {
+		t.Fatalf("usage output exposed command-line credential: %q", stdout.String()+stderr.String())
 	}
 }
 

@@ -28,8 +28,8 @@ OpenCode Go credential is used only for the outbound provider request.
 
 - A Codex CLI installation. The checked compatibility baseline is Codex
   `0.146.0`.
-- An OpenCode Go subscription and API key. Keep the key in the gateway process
-  environment; never put it in Codex TOML or a checked-in file.
+- An OpenCode Go subscription and API key. The key can stay in the gateway
+  process environment or be stored with `ocgtw config`.
 - For source builds: Go `1.22+`, GNU Make, and a POSIX shell.
 - For the existing text smoke: `curl`, `git`, `jq`, `rg`, Codex CLI, and
   network access.
@@ -40,7 +40,7 @@ OpenCode Go credential is used only for the outbound provider request.
 ## Install and run
 
 For a release, download the archive for your OS/architecture, verify its
-SHA-256 entry in `SHA256SUMS`, and extract it. Archives contain the binary,
+SHA-256 entry in `SHA256SUMS`, and extract it. Archives contain the binaries,
 `LICENSE`, and a minimal `README.txt`. The v0.1.0 release targets Linux
 amd64/arm64, macOS amd64/arm64, and Windows amd64.
 
@@ -48,9 +48,22 @@ From source:
 
 ```bash
 make build
-export OPENCODE_GO_API_KEY='your-key'
-./bin/opencode-gateway run
+make install PREFIX="$HOME/.local"
+
+# Store the key without putting it in command history or an argument list.
+read -r -s key
+printf '%s\n' "$key" | ocgtw config set-key --stdin
+unset key
+
+ocgtw run
 ```
+
+`make install` installs both `opencode-gateway` and the shorter `ocgtw` name
+under `PREFIX/bin`; add that directory to `PATH` if necessary. On Linux,
+`ocgtw config` uses the Secret Service keyring when available. Otherwise it
+writes an owner-only `0600` credential file and clearly reports that the file
+is not encrypted at rest. An explicit `OPENCODE_GO_API_KEY` environment value
+always takes precedence and is never persisted by the gateway.
 
 The default listener is `http://127.0.0.1:8787`. Health endpoints are:
 
@@ -61,13 +74,16 @@ POST /v1/responses -> streaming text/event-stream
 ```
 
 The process stops cleanly on SIGINT/SIGTERM within the configured shutdown
-deadline. `OPENCODE_GO_API_KEY` is required even when the first request has not
-yet been made.
+deadline. A gateway credential is required even when the first request has
+not yet been made.
 
 ## CLI
 
 ```text
 opencode-gateway run
+opencode-gateway config [status]
+opencode-gateway config set-key --stdin
+opencode-gateway config remove-key
 opencode-gateway setup codex [--codex-home DIR] [--gateway-url URL] [--dry-run]
 opencode-gateway setup codex --restore BACKUP_DIR
 opencode-gateway doctor [--codex-home DIR] [--gateway-url URL]
@@ -85,6 +101,12 @@ provider error bodies. Build metadata is normalized before it is printed.
 `version` prints the release version, commit, UTC build date, and Go runtime.
 Release builds inject those values with linker flags; source builds report
 `dev`/`unknown` values. `help` prints the command summary and exit semantics.
+
+`config status` reports only whether the environment or local credential store
+is configured. `config set-key` reads exactly one API key from standard input;
+it never accepts a key as a positional argument. For an interactive Bash
+prompt, use `read -r -s` as shown above. `config remove-key` removes the
+persistent credential while leaving the environment untouched.
 
 ## Configure Codex safely
 
@@ -172,7 +194,7 @@ Common checks:
 
 | Symptom | Check |
 | --- | --- |
-| `OPENCODE_GO_API_KEY is required` | Export the key in the gateway process environment only |
+| `OPENCODE_GO_API_KEY is required` | Run `ocgtw config status`, then use the documented `config set-key` flow, or export it only in the gateway process |
 | Codex cannot connect | Start `run`, verify `/health/live`, and confirm the provider `base_url` ends in `/v1` |
 | `doctor` reports config/catalog failure | Run `setup codex --dry-run`, inspect the isolated home, then apply setup or restore its backup |
 | Provider authentication/model failure | Run `doctor` with the key present; do not paste the credential into a report |

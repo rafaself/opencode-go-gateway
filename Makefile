@@ -1,12 +1,14 @@
 GO ?= go
 BIN ?= bin/opencode-gateway
 OUTPUT_DIR ?= dist
+PREFIX ?= $(HOME)/.local
+INSTALL_DIR ?= $(PREFIX)/bin
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf 'dev')
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf 'unknown')
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS ?= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: fmt vet test contract integration race fuzz-smoke live-scenarios-test build check release-check package package-self-test
+.PHONY: fmt vet test contract integration race fuzz-smoke live-scenarios-test build install check release-check package package-self-test
 
 fmt:
 	$(GO) fmt ./...
@@ -38,6 +40,11 @@ live-scenarios-test:
 build:
 	mkdir -p bin
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/opencode-gateway
+
+install: build
+	install -d "$(INSTALL_DIR)"
+	install -m 0755 "$(BIN)" "$(INSTALL_DIR)/opencode-gateway"
+	install -m 0755 "$(BIN)" "$(INSTALL_DIR)/ocgtw"
 
 check: fmt vet test race build
 	git diff --check

@@ -18,8 +18,9 @@ suite, a trimmed build, bounded fuzz smoke, and `git diff --check`. The release
 workflow additionally requires that formatting leaves the tagged checkout
 unchanged.
 `package-self-test` cross-compiles Linux amd64/arm64, macOS amd64/arm64, and
-Windows amd64, then verifies every archive contains the correctly named binary,
-`LICENSE`, and `README.txt`, and verifies `SHA256SUMS`.
+Windows amd64, then verifies every archive contains the correctly named
+`opencode-gateway` and `ocgtw` binaries, `LICENSE`, and `README.txt`, and
+verifies `SHA256SUMS`.
 
 The package script uses the tagged commit time as its default
 `SOURCE_DATE_EPOCH`. To reproduce an artifact exactly, provide the same
@@ -34,16 +35,17 @@ make package-self-test \
 ```
 
 Archives are named `opencode-gateway_VERSION_GOOS_GOARCH.tar.gz`; Windows uses
-`.zip` and contains `opencode-gateway.exe`. Each archive has one predictable
-top-level directory and includes only the binary, MIT `LICENSE`, and minimal
-`README.txt`. `SHA256SUMS` covers the archives only.
+`.zip` and contains `opencode-gateway.exe` and `ocgtw.exe`. Each archive has
+one predictable top-level directory and includes only the two binaries, MIT
+`LICENSE`, and minimal `README.txt`. `SHA256SUMS` covers the archives only.
 
 ## RC validation procedure
 
-This procedure uses an isolated Codex home and a fixed local port. It does not
-write a provider key to disk. The doctor command performs a network `/models`
-check only when `OPENCODE_GO_API_KEY` is present, so keep the credential in the
-shell environment and do not paste it into logs.
+This procedure uses an isolated Codex home and a fixed local port. The
+credential store is separate from the Codex home and is never included in
+release artifacts. The doctor command performs a network `/models` check only
+when a credential is present, so use an isolated environment variable or
+`ocgtw config status` and do not paste the credential into logs.
 
 ```bash
 set -eu

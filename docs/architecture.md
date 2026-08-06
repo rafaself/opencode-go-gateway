@@ -15,8 +15,9 @@ The boundary packages are intentionally directional:
 
 | Package or area | Responsibility |
 | --- | --- |
-| `cmd/opencode-gateway` | CLI dispatch, exit semantics, signal wiring, safe build metadata output |
+| `cmd/opencode-gateway` | CLI dispatch, credential command surface, exit semantics, signal wiring, safe build metadata output |
 | `internal/config` | Environment parsing, defaults, validation, and finite limits |
+| `internal/credentials` | Keyring-first API credential storage with a permission-restricted fallback |
 | `internal/codex` | Codex request schema, field policy, Responses event state, SSE output |
 | `internal/bridge` | Provider-neutral validated request and event values |
 | `internal/opencodego` | OpenCode Go Chat Completions request/client, SSE decoding, bounded continuation state |

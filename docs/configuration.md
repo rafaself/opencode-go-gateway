@@ -1,9 +1,11 @@
 # Runtime configuration
 
-`opencode-gateway run` reads configuration from the process environment. It
-does not read a dotenv file, a Codex config, or a project configuration file.
-`OPENCODE_GO_API_KEY` is required and remains in memory for the upstream
-request; it is never written to a file, sent to Codex, or included in logs.
+`opencode-gateway run` reads operational configuration from the process
+environment. It does not read a dotenv file, a Codex config, or a project
+configuration file. `OPENCODE_GO_API_KEY` is preferred when present; when it
+is absent, `ocgtw run` loads the credential saved by `ocgtw config set-key`.
+The key remains confined to the gateway process and upstream request; it is
+never sent to Codex or included in logs.
 
 The defaults below are the v0.1.0 contract. Duration values use Go duration
 syntax such as `500ms`, `10s`, or `2m`. Byte values are decimal integer byte
@@ -15,7 +17,7 @@ embedding.
 
 | Variable | Default | Unit | Meaning |
 | --- | ---: | --- | --- |
-| `OPENCODE_GO_API_KEY` | required | string | OpenCode Go credential; never printed |
+| `OPENCODE_GO_API_KEY` | optional when stored | string | OpenCode Go credential; environment value takes precedence and is never printed |
 | `OPENCODE_GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | URL | OpenCode Go Chat Completions base URL |
 | `OPENCODE_GATEWAY_HOST` | `127.0.0.1` | host | Local bind host |
 | `OPENCODE_GATEWAY_PORT` | `8787` | port | Local bind port; `0` selects an ephemeral port |
@@ -84,6 +86,13 @@ defaults rather than environment variables; see
 
 Build metadata is injected only at build time. The supported commands and
 their exit semantics are documented in the [CLI and release guide](release.md).
-Use `opencode-gateway doctor` to validate the environment without printing a
-credential. For Codex user configuration, use
+Use `ocgtw config status` to inspect credential state without printing a
+credential, and use `ocgtw config remove-key` to delete the stored value.
+
+On Linux, `config set-key` prefers the Secret Service keyring. If no keyring
+helper is available, it uses the per-user configuration directory with a
+`0700` directory and `0600` file. That fallback protects the file from other
+ordinary users but is not encrypted at rest; use the keyring or an environment
+variable when disk-level compromise is in scope. The key is never accepted as
+a command-line argument. For Codex user configuration, use
 [`setup codex`](codex-setup.md); never copy the provider key into TOML.

@@ -1,18 +1,21 @@
 OpenCode Gateway release archive
 
-This archive contains the OpenCode Gateway binary, the MIT license, and this
-minimal installation note. The full documentation is available at:
+This archive contains the OpenCode Gateway binaries (`opencode-gateway` and
+the shorter `ocgtw` name), the MIT license, and this minimal installation
+note. The full documentation is available at:
 https://github.com/rafaself/opencode-go-gateway
 
 The gateway lets Codex CLI use models available through an OpenCode Go
-subscription. Keep OPENCODE_GO_API_KEY in the gateway process environment; do
-not put it in Codex configuration files.
+subscription. Configure the credential with `ocgtw config set-key` or keep
+OPENCODE_GO_API_KEY in the gateway process environment; do not put it in Codex
+configuration files.
 
 Quick start:
 
-  export OPENCODE_GO_API_KEY="your-key"
-  ./opencode-gateway run
+  ./ocgtw config set-key
+  ./ocgtw run
 
-Then configure Codex with `opencode-gateway setup codex` and run
-`opencode-gateway doctor`. Use `opencode-gateway version` to inspect the
-embedded release metadata.
+The command reads the key from a hidden terminal prompt. For a non-interactive
+shell, pipe one line to `ocgtw config set-key --stdin` without putting the key
+in an argument. Then configure Codex with `ocgtw setup codex` and run
+`ocgtw doctor`. Use `ocgtw version` to inspect the embedded release metadata.

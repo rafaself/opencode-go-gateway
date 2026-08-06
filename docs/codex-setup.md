@@ -58,10 +58,11 @@ condition without proving that the local configuration is unsafe; malformed
 configuration, unavailable health endpoints, authentication failures, server
 failures, and missing `deepseek-v4-flash` are failures.
 
-The provider probe is deliberately not an inference request. It requires
-`OPENCODE_GO_API_KEY` and uses the configured OpenCode Go base URL. When no
-credential is available, setup and all offline validation remain usable, but a
-real provider authentication/model check cannot pass.
+The provider probe is deliberately not an inference request. It uses the
+configured OpenCode Go credential, preferring `OPENCODE_GO_API_KEY` and then
+the value saved with `ocgtw config set-key`. When no credential is available,
+setup and all offline validation remain usable, but a real provider
+authentication/model check cannot pass.
 
 The generated fields follow the current [Codex configuration
 reference](https://developers.openai.com/codex/config-reference), [custom

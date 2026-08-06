@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/rafaself/opencode-go-gateway/internal/capture"
 	"github.com/rafaself/opencode-go-gateway/internal/codexsetup"
 	"github.com/rafaself/opencode-go-gateway/internal/config"
+	"github.com/rafaself/opencode-go-gateway/internal/credentials"
 )
 
 var (
@@ -77,6 +80,8 @@ func execute(args []string, stdout, stderr io.Writer) error {
 		return runCodexSetup(args[2:], stdout, stderr)
 	case "doctor":
 		return runDoctor(args[1:], stdout, stderr)
+	case "config":
+		return runConfig(args[1:], stdout, stderr)
 	case "dev":
 		if len(args) < 2 || args[1] != "capture-codex" {
 			usage(stderr)
@@ -110,11 +115,15 @@ func runServer(args []string, stdout, stderr io.Writer) error {
 
 	ctx, stop := signalContext(context.Background())
 	defer stop()
-	return runGateway(ctx, os.LookupEnv, stdout, stderr)
+	return runGatewayWithStore(ctx, os.LookupEnv, credentials.Default(), stdout, stderr)
 }
 
 func runGateway(ctx context.Context, lookup config.LookupEnv, stdout, stderr io.Writer) error {
-	settings, err := config.Load(lookup)
+	return runGatewayWithStore(ctx, lookup, credentials.Store{}, stdout, stderr)
+}
+
+func runGatewayWithStore(ctx context.Context, lookup config.LookupEnv, store credentials.Store, stdout, stderr io.Writer) error {
+	settings, err := loadRuntimeConfig(lookup, store)
 	if err != nil {
 		return err
 	}
@@ -122,6 +131,231 @@ func runGateway(ctx context.Context, lookup config.LookupEnv, stdout, stderr io.
 	return app.RunWithBuildMetadata(ctx, settings, logger, func(address string) {
 		fmt.Fprintf(stdout, "opencode-gateway listening on http://%s\n", address)
 	}, app.BuildMetadata{Version: version, Commit: commit, BuildDate: buildDate})
+}
+
+func loadRuntimeConfig(lookup config.LookupEnv, store credentials.Store) (config.Config, error) {
+	runtimeLookup, err := lookupWithStoredCredential(lookup, store)
+	if err != nil {
+		return config.Config{}, err
+	}
+	return config.Load(runtimeLookup)
+}
+
+func lookupWithStoredCredential(lookup config.LookupEnv, store credentials.Store) (config.LookupEnv, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	if value, ok := lookup("OPENCODE_GO_API_KEY"); ok && strings.TrimSpace(value) != "" {
+		return lookup, nil
+	}
+	storedKey, _, err := store.Load()
+	if err == nil {
+		return func(name string) (string, bool) {
+			if name == "OPENCODE_GO_API_KEY" {
+				return storedKey, true
+			}
+			return lookup(name)
+		}, nil
+	}
+	if !errors.Is(err, credentials.ErrNotFound) {
+		return nil, err
+	}
+	return lookup, nil
+}
+
+func runConfig(args []string, stdout, stderr io.Writer) error {
+	return runConfigWithStore(args, stdout, stderr, credentials.Default(), os.LookupEnv, os.Stdin)
+}
+
+func runConfigWithStore(args []string, stdout, stderr io.Writer, store credentials.Store, lookup config.LookupEnv, input io.Reader) error {
+	if len(args) == 0 || args[0] == "status" {
+		if len(args) > 1 {
+			fmt.Fprintln(stderr, "config status: unexpected positional arguments")
+			return errUsage
+		}
+		return showConfigStatus(stdout, store, lookup)
+	}
+
+	switch args[0] {
+	case "set-key":
+		return setStoredAPIKey(args[1:], stdout, stderr, store, input)
+	case "remove-key":
+		if len(args) != 1 {
+			fmt.Fprintf(stderr, "config %s: unexpected positional arguments\n", args[0])
+			return errUsage
+		}
+		if err := store.Remove(); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "Stored API key removed.")
+		return nil
+	case "help", "-h", "--help":
+		if len(args) != 1 {
+			printConfigUsage(stderr)
+			return errUsage
+		}
+		printConfigUsage(stdout)
+		return nil
+	default:
+		printConfigUsage(stderr)
+		return errUsage
+	}
+}
+
+func showConfigStatus(stdout io.Writer, store credentials.Store, lookup config.LookupEnv) error {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	environmentConfigured := false
+	if value, ok := lookup("OPENCODE_GO_API_KEY"); ok {
+		environmentConfigured = strings.TrimSpace(value) != ""
+	}
+	backend, err := store.Status()
+	if err != nil {
+		return err
+	}
+	if environmentConfigured {
+		fmt.Fprintln(stdout, "Environment API key: configured (takes precedence over stored credentials).")
+	} else {
+		fmt.Fprintln(stdout, "Environment API key: not configured.")
+	}
+	switch backend {
+	case credentials.BackendKeyring:
+		fmt.Fprintln(stdout, "Stored API key: configured in the system keyring.")
+	case credentials.BackendFile:
+		fmt.Fprintln(stdout, "Stored API key: configured in a permission-restricted local file (not encrypted at rest).")
+	default:
+		fmt.Fprintln(stdout, "Stored API key: not configured.")
+	}
+	fmt.Fprintln(stdout, "API key values are never printed or passed to Codex.")
+	return nil
+}
+
+func setStoredAPIKey(args []string, stdout, stderr io.Writer, store credentials.Store, input io.Reader) error {
+	flags := flag.NewFlagSet("config set-key", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	stdinMode := flags.Bool("stdin", false, "read the API key from standard input")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "config set-key: unexpected positional arguments")
+		return errUsage
+	}
+	if input == nil {
+		return errors.New("config set-key: standard input is unavailable")
+	}
+	key, err := readAPIKey(input, stdout, *stdinMode)
+	if err != nil {
+		return err
+	}
+	backend, err := store.Save(key)
+	if err != nil {
+		return err
+	}
+	switch backend {
+	case credentials.BackendKeyring:
+		fmt.Fprintln(stdout, "API key stored in the system keyring.")
+	case credentials.BackendFile:
+		fmt.Fprintln(stdout, "API key stored in a permission-restricted local file (not encrypted at rest).")
+	default:
+		return errors.New("API key was not stored")
+	}
+	return nil
+}
+
+func readAPIKey(input io.Reader, output io.Writer, stdinMode bool) (string, error) {
+	if file, ok := input.(*os.File); ok && isTerminal(file) {
+		if stdinMode {
+			return "", errors.New("config set-key --stdin requires piped standard input; use config set-key for a hidden terminal prompt")
+		}
+		return readTerminalAPIKey(file, output)
+	}
+	data, err := io.ReadAll(io.LimitReader(input, 4097))
+	if err != nil {
+		return "", errors.New("read API key from standard input")
+	}
+	if len(data) > 4096 {
+		return "", errors.New("API key input is too long")
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("API key input must contain exactly one non-empty line")
+	}
+	for _, runeValue := range value {
+		if runeValue < 0x20 || runeValue == 0x7f {
+			return "", errors.New("API key input contains control characters")
+		}
+	}
+	return value, nil
+}
+
+func readTerminalAPIKey(terminal *os.File, output io.Writer) (string, error) {
+	if _, err := fmt.Fprint(output, "OpenCode Go API key: "); err != nil {
+		return "", errors.New("write API key prompt")
+	}
+	if err := setTerminalEcho(terminal, false); err != nil {
+		return "", errors.New("cannot disable terminal echo; use --stdin with a secure shell prompt")
+	}
+	echoDisabled := true
+	defer func() {
+		if echoDisabled {
+			_ = setTerminalEcho(terminal, true)
+		}
+	}()
+	line, err := bufio.NewReader(terminal).ReadString('\n')
+	if restoreErr := setTerminalEcho(terminal, true); restoreErr != nil {
+		return "", errors.New("cannot restore terminal echo")
+	}
+	echoDisabled = false
+	_, _ = fmt.Fprintln(output)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", errors.New("read API key from terminal")
+	}
+	value := strings.TrimSpace(line)
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("API key input must contain exactly one non-empty line")
+	}
+	for _, runeValue := range value {
+		if runeValue < 0x20 || runeValue == 0x7f {
+			return "", errors.New("API key input contains control characters")
+		}
+	}
+	return value, nil
+}
+
+func setTerminalEcho(terminal *os.File, enabled bool) error {
+	argument := "-echo"
+	if enabled {
+		argument = "echo"
+	}
+	command := exec.Command("stty", argument)
+	command.Stdin = terminal
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	return command.Run()
+}
+
+func isTerminal(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func printConfigUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: ocgtw config <command>")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  status                 Show credential status without printing the key")
+	fmt.Fprintln(w, "  set-key [--stdin]      Read and store one API key from standard input")
+	fmt.Fprintln(w, "  remove-key             Delete the stored API key")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "The key is never accepted as a command-line argument or written to Codex configuration.")
 }
 
 func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -221,7 +455,15 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "doctor: unexpected arguments: %v\n", flags.Args())
 		return errUsage
 	}
-	report := codexsetup.Diagnose(context.Background(), codexsetup.DoctorOptions{CodexHome: *codexHome, GatewayURL: *gatewayURL})
+	lookup, err := lookupWithStoredCredential(os.LookupEnv, credentials.Default())
+	if err != nil {
+		return err
+	}
+	report := codexsetup.Diagnose(context.Background(), codexsetup.DoctorOptions{
+		Environment: codexsetup.Environment{LookupEnv: lookup},
+		CodexHome:   *codexHome,
+		GatewayURL:  *gatewayURL,
+	})
 	for _, check := range report.Checks {
 		fmt.Fprintf(stdout, "[%s] %s: %s\n", check.Severity, check.Name, check.Message)
 	}
@@ -301,6 +543,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  help                   Print this help")
 	fmt.Fprintln(w, "  setup codex            Configure the user-level Codex provider safely")
 	fmt.Fprintln(w, "  doctor                 Diagnose gateway, Codex, and provider setup")
+	fmt.Fprintln(w, "  config                 Show or manage the stored API key")
 	fmt.Fprintln(w, "  dev capture-codex      Start the development-only contract capture server")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Aliases: -h/--help print help; -v/--version print version metadata.")
