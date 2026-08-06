@@ -1,0 +1,735 @@
+{
+  "apply-patch-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function",
+      "namespace",
+      "web_search"
+    ],
+    "tool_names": [
+      "exec_command",
+      "mcp",
+      ""
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      },
+      {
+        "kind": "namespace",
+        "name": "mcp"
+      },
+      {
+        "kind": "web_search",
+        "name": ""
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "cancellation-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [],
+    "tool_names": [],
+    "tool_details": [],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "continuation-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "function_call",
+      "function_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "function_call",
+        "function_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "exec_command",
+          "arguments": "\u003credacted:string\u003e",
+          "status": ""
+        }
+      },
+      {
+        "kind": "function_call_output",
+        "function_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:string\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": true,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "custom-tool-result-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "custom_tool_call",
+      "custom_tool_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "custom_tool_call",
+        "custom_tool_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "apply_patch",
+          "input": "\u003credacted:string\u003e",
+          "status": "completed"
+        }
+      },
+      {
+        "kind": "custom_tool_call_output",
+        "custom_tool_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:string\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function",
+      "namespace",
+      "web_search"
+    ],
+    "tool_names": [
+      "exec_command",
+      "mcp",
+      ""
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      },
+      {
+        "kind": "namespace",
+        "name": "mcp"
+      },
+      {
+        "kind": "web_search",
+        "name": ""
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "developer-instructions-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "developer",
+          "content": [
+            "\u003credacted:string\u003e",
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [],
+    "tool_names": [],
+    "tool_details": [],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "empty-tool-result-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "function_call",
+      "function_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "function_call",
+        "function_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "exec_command",
+          "arguments": "\u003credacted:string\u003e",
+          "status": ""
+        }
+      },
+      {
+        "kind": "function_call_output",
+        "function_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:empty-output\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "function-tools-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "parallel-tools-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function",
+      "function"
+    ],
+    "tool_names": [
+      "exec_command",
+      "write_stdin"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      },
+      {
+        "kind": "function",
+        "name": "write_stdin",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"session_id\": {\"type\": \"number\"}, \"chars\": {\"type\": \"string\"}}, \"required\": [\"session_id\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "shell-command-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}, \"workdir\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "simple-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function",
+      "namespace",
+      "web_search"
+    ],
+    "tool_names": [
+      "exec_command",
+      "mcp",
+      ""
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      },
+      {
+        "kind": "namespace",
+        "name": "mcp"
+      },
+      {
+        "kind": "web_search",
+        "name": ""
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "tool-error-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "function_call",
+      "function_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "function_call",
+        "function_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "exec_command",
+          "arguments": "\u003credacted:string\u003e",
+          "status": ""
+        }
+      },
+      {
+        "kind": "function_call_output",
+        "function_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:error-output\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "tool-results-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "function_call",
+      "function_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "function_call",
+        "function_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "exec_command",
+          "arguments": "\u003credacted:string\u003e",
+          "status": ""
+        }
+      },
+      {
+        "kind": "function_call_output",
+        "function_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:string\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  },
+  "workspace-file-read-request.json": {
+    "model": "gpt-5.3-codex",
+    "instructions": "\u003credacted:string\u003e",
+    "input_kinds": [
+      "message",
+      "function_call",
+      "function_call_output"
+    ],
+    "inputs": [
+      {
+        "kind": "message",
+        "message": {
+          "id": "\u003cnormalized:id\u003e",
+          "role": "user",
+          "content": [
+            "\u003credacted:string\u003e"
+          ]
+        }
+      },
+      {
+        "kind": "function_call",
+        "function_call": {
+          "id": "\u003cnormalized:id\u003e",
+          "call_id": "\u003cnormalized:id\u003e",
+          "name": "exec_command",
+          "arguments": "\u003credacted:string\u003e",
+          "status": ""
+        }
+      },
+      {
+        "kind": "function_call_output",
+        "function_call_output": {
+          "call_id": "\u003cnormalized:id\u003e",
+          "output": "\u003credacted:string\u003e"
+        }
+      }
+    ],
+    "tool_kinds": [
+      "function"
+    ],
+    "tool_names": [
+      "exec_command"
+    ],
+    "tool_details": [
+      {
+        "kind": "function",
+        "name": "exec_command",
+        "description": "\u003credacted:string\u003e",
+        "parameters": "{\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"additionalProperties\": false}"
+      }
+    ],
+    "parallel_tool_calls": false,
+    "tool_choice": "auto",
+    "tool_choice_name": "",
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "previous_response_id": false,
+    "reasoning_effort": "",
+    "text_format": {
+      "kind": "text"
+    }
+  }
+}

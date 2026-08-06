@@ -81,7 +81,13 @@ The transient output directory `testdata/codex/captures/` is ignored by Git. Rev
 
 Input and tool item types are classified in the `item_types` and `tool_types` maps in `testdata/codex/field-policy.json`. Function calls and their outputs, including the custom `apply_patch` call shape, are translated; Codex namespaces and standalone web search are deferred until a later vertical slice.
 
-The capture server records unknown fields so that they cannot disappear during investigation. The future translation layer must apply the policy; recording a field is not an indication that it is supported upstream.
+The capture server records unknown fields so that they cannot disappear during investigation. The M2 decoder in `internal/codex` applies the same policy before creating `internal/bridge` values: unknown fields and deferred top-level fields fail with stable structured errors, while the observed deferred `namespace` and `web_search` declarations are represented as explicit `bridge.DeferredTool` values rather than untyped provider maps. Compatibility no-op fields are type-checked and then omitted from the bridge model. `stream` must be present and `true` because the initial bridge milestone does not implement non-streaming Responses.
+
+## M2 request boundary
+
+`internal/codex.NewDecoder` requires a positive maximum body size. `Decoder.Decode` accepts only `application/json` (including valid media-type parameters), bounds reads before JSON allocation, rejects invalid UTF-8, malformed or trailing JSON, and rejects duplicate object keys. It validates required model, message, tool-call, and correlation values; function tool names are unique; function parameters and JSON-schema text formats have an object-root schema boundary; and errors expose stable `code`, `param`, and `message` fields without logging the request body. Boundary messages are fixed and safe generic parameters are used for unknown fields, so request values, schema keys, and raw JSON are never echoed in client-facing errors.
+
+The decoder returns the explicit unions in `internal/bridge`: ordered messages with `input_text` content, function/custom calls and outputs, function tools with immutable raw JSON Schema, explicit tool choice, generation options, and known deferred tool markers. The bridge package has no dependency on Responses or OpenAI-specific wire structs, leaving upstream translation and SSE handling to later milestones.
 
 ## Minimum SSE sequences
 
