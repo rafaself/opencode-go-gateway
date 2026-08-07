@@ -147,6 +147,60 @@ custom_setting = "preserve"
 	}
 }
 
+func TestSetupCodexPreservesMultilineCodexCollections(t *testing.T) {
+	home := t.TempDir()
+	original := `[tool_suggest]
+discoverables = [
+  { type = "connector", id = "github" }
+]
+
+[apps.github]
+enabled = true
+`
+	if err := os.WriteFile(filepath.Join(home, ConfigFileName), []byte(original), managedFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := SetupCodex(SetupOptions{CodexHome: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, original) {
+		t.Fatalf("multiline Codex collection was not preserved:\n%s", content)
+	}
+
+	repeated, err := SetupCodex(SetupOptions{CodexHome: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Changed {
+		t.Fatalf("setup after preserving multiline collection changed config: %+v", repeated)
+	}
+}
+
+func TestSetupCodexRejectsUnclosedMultilineCollectionWithoutWrites(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ConfigFileName)
+	malformed := `[tool_suggest]
+discoverables = [
+  { type = "connector", id = "github" }
+`
+	if err := os.WriteFile(configPath, []byte(malformed), managedFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetupCodex(SetupOptions{CodexHome: home}); err == nil {
+		t.Fatal("unclosed multiline collection was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(home, CatalogFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("malformed setup created catalog: %v", err)
+	}
+}
+
 func TestSetupCodexDryRunDoesNotWriteOrRevealSecrets(t *testing.T) {
 	home := t.TempDir()
 	secret := "super-secret-api-key"

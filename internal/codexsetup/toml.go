@@ -17,10 +17,11 @@ type tomlDocument struct {
 }
 
 type tomlAssignment struct {
-	line  int
-	table string
-	key   string
-	value string
+	line    int
+	endLine int
+	table   string
+	key     string
+	value   string
 }
 
 func parseTOML(source string) (tomlDocument, error) {
@@ -35,7 +36,8 @@ func parseTOML(source string) (tomlDocument, error) {
 	currentTable := ""
 	tables := make(map[string]int)
 	arrayTables := make(map[string]int)
-	for lineNumber, raw := range lines {
+	for lineNumber := 0; lineNumber < len(lines); lineNumber++ {
+		raw := lines[lineNumber]
 		line := strings.TrimSuffix(raw, "\n")
 		line = strings.TrimSuffix(line, "\r")
 		withoutComment, err := tomlCommentFree(line)
@@ -76,6 +78,14 @@ func parseTOML(source string) (tomlDocument, error) {
 			return tomlDocument{}, fmt.Errorf("line %d: %w", lineNumber+1, err)
 		}
 		value := strings.TrimSpace(withoutComment[equals+1:])
+		endLine := lineNumber
+		if isCollectionValue(value) {
+			var err error
+			value, endLine, err = collectTOMLCollection(lines, lineNumber, value)
+			if err != nil {
+				return tomlDocument{}, fmt.Errorf("line %d key %q: %w", lineNumber+1, key, err)
+			}
+		}
 		if err := validateTOMLValue(value); err != nil {
 			return tomlDocument{}, fmt.Errorf("line %d key %q: %w", lineNumber+1, key, err)
 		}
@@ -86,7 +96,8 @@ func parseTOML(source string) (tomlDocument, error) {
 		if previous, exists := document.keys[fullKey]; exists {
 			return tomlDocument{}, fmt.Errorf("line %d: duplicate key %q (line %d)", lineNumber+1, fullKey, previous.line+1)
 		}
-		document.keys[fullKey] = tomlAssignment{line: lineNumber, table: currentTable, key: key, value: value}
+		document.keys[fullKey] = tomlAssignment{line: lineNumber, endLine: endLine, table: currentTable, key: key, value: value}
+		lineNumber = endLine
 	}
 	return document, nil
 }
@@ -256,44 +267,106 @@ func validateTOMLValue(value string) error {
 	return nil
 }
 
-func validateBalancedValue(value string) error {
-	stack := make([]rune, 0, 4)
-	var quote rune
-	escaped := false
+func isCollectionValue(value string) bool {
+	return value != "" && (value[0] == '[' || value[0] == '{')
+}
+
+func collectTOMLCollection(lines []string, startLine int, value string) (string, int, error) {
+	complete, err := collectionValueComplete(value)
+	if err != nil {
+		return "", startLine, err
+	}
+	if complete {
+		return value, startLine, nil
+	}
+
+	collected := value
+	for lineNumber := startLine + 1; lineNumber < len(lines); lineNumber++ {
+		line := strings.TrimSuffix(lines[lineNumber], "\n")
+		line = strings.TrimSuffix(line, "\r")
+		withoutComment, err := tomlCommentFree(line)
+		if err != nil {
+			return "", lineNumber, err
+		}
+		collected += "\n" + strings.TrimSpace(withoutComment)
+		complete, err = collectionValueComplete(collected)
+		if err != nil {
+			return "", lineNumber, err
+		}
+		if complete {
+			return collected, lineNumber, nil
+		}
+	}
+	return "", startLine, fmt.Errorf("unbalanced collection value")
+}
+
+type collectionScan struct {
+	stack   []rune
+	quote   rune
+	escaped bool
+}
+
+func scanCollection(value string) (collectionScan, error) {
+	scan := collectionScan{stack: make([]rune, 0, 4)}
 	for _, runeValue := range value {
-		if quote == '"' {
-			if escaped {
-				escaped = false
+		if scan.quote == '"' {
+			if scan.escaped {
+				scan.escaped = false
 				continue
 			}
 			if runeValue == '\\' {
-				escaped = true
+				scan.escaped = true
 				continue
 			}
-			if runeValue == quote {
-				quote = 0
+			if runeValue == scan.quote {
+				scan.quote = 0
 			}
 			continue
 		}
-		if quote == '\'' {
-			if runeValue == quote {
-				quote = 0
+		if scan.quote == '\'' {
+			if runeValue == scan.quote {
+				scan.quote = 0
 			}
 			continue
 		}
 		switch runeValue {
 		case '"', '\'':
-			quote = runeValue
+			scan.quote = runeValue
 		case '[', '{':
-			stack = append(stack, runeValue)
+			scan.stack = append(scan.stack, runeValue)
 		case ']', '}':
-			if len(stack) == 0 || (runeValue == ']' && stack[len(stack)-1] != '[') || (runeValue == '}' && stack[len(stack)-1] != '{') {
-				return fmt.Errorf("unbalanced collection value")
+			if len(scan.stack) == 0 || (runeValue == ']' && scan.stack[len(scan.stack)-1] != '[') || (runeValue == '}' && scan.stack[len(scan.stack)-1] != '{') {
+				return collectionScan{}, fmt.Errorf("unbalanced collection value")
 			}
-			stack = stack[:len(stack)-1]
+			scan.stack = scan.stack[:len(scan.stack)-1]
 		}
 	}
-	if quote != 0 || escaped || len(stack) != 0 {
+	return scan, nil
+}
+
+func collectionValueComplete(value string) (bool, error) {
+	scan, err := scanCollection(value)
+	if err != nil {
+		return false, err
+	}
+	if scan.quote != 0 || scan.escaped {
+		return false, fmt.Errorf("unbalanced collection value")
+	}
+	if len(scan.stack) != 0 {
+		return false, nil
+	}
+	if err := validateBalancedValue(value); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateBalancedValue(value string) error {
+	scan, err := scanCollection(value)
+	if err != nil {
+		return err
+	}
+	if scan.quote != 0 || scan.escaped || len(scan.stack) != 0 {
 		return fmt.Errorf("unbalanced collection value")
 	}
 	if (value[0] == '[' && value[len(value)-1] != ']') || (value[0] == '{' && value[len(value)-1] != '}') {

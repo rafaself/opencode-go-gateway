@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -255,19 +256,30 @@ func renderConfig(document tomlDocument, home, gatewayURL string) ([]byte, error
 func editRoot(document tomlDocument, settings []tomlSetting) ([]byte, error) {
 	lines := append([]string(nil), document.lines...)
 	missing := make([]tomlSetting, 0, len(settings))
+	type assignmentEdit struct {
+		assignment tomlAssignment
+		value      string
+	}
+	edits := make([]assignmentEdit, 0, len(settings))
 	for _, setting := range settings {
 		assignment, ok := document.keys[setting.Key]
 		if !ok {
 			missing = append(missing, setting)
 			continue
 		}
-		lines[assignment.line] = replaceTOMLAssignment(lines[assignment.line], setting.Value)
+		edits = append(edits, assignmentEdit{assignment: assignment, value: setting.Value})
+	}
+	sort.Slice(edits, func(left, right int) bool {
+		return edits[left].assignment.line > edits[right].assignment.line
+	})
+	for _, edit := range edits {
+		lines = replaceTOMLAssignmentLines(lines, edit.assignment, edit.value)
 	}
 	if len(missing) > 0 {
 		firstTable := len(lines)
 		for index, raw := range lines {
 			withoutComment, _ := tomlCommentFree(strings.TrimSuffix(strings.TrimSuffix(raw, "\n"), "\r"))
-			if strings.HasPrefix(strings.TrimSpace(withoutComment), "[") {
+			if isTOMLTableHeader(withoutComment) {
 				firstTable = index
 				break
 			}
@@ -312,7 +324,7 @@ func editProvider(document tomlDocument, settings []tomlSetting) ([]byte, error)
 	sectionEnd := len(lines)
 	for index := tableHeader + 1; index < len(lines); index++ {
 		withoutComment, _ := tomlCommentFree(strings.TrimSuffix(strings.TrimSuffix(lines[index], "\n"), "\r"))
-		if strings.HasPrefix(strings.TrimSpace(withoutComment), "[") {
+		if isTOMLTableHeader(withoutComment) {
 			sectionEnd = index
 			break
 		}
@@ -323,9 +335,13 @@ func editProvider(document tomlDocument, settings []tomlSetting) ([]byte, error)
 	}
 	seen := make(map[string]bool, len(settings))
 	result := make([]string, 0, len(lines)+len(settings))
+	skipUntil := -1
 	for index, raw := range lines {
 		if index <= tableHeader || index >= sectionEnd {
 			result = append(result, raw)
+			continue
+		}
+		if index <= skipUntil {
 			continue
 		}
 		assignment, ok := documentAssignmentAt(document, index)
@@ -334,6 +350,7 @@ func editProvider(document tomlDocument, settings []tomlSetting) ([]byte, error)
 			continue
 		}
 		if forbiddenProviderKeys[assignment.key] {
+			skipUntil = assignment.endLine
 			continue
 		}
 		setting, ok := managed[assignment.key]
@@ -343,6 +360,7 @@ func editProvider(document tomlDocument, settings []tomlSetting) ([]byte, error)
 		}
 		seen[assignment.key] = true
 		result = append(result, replaceTOMLAssignment(raw, setting.Value))
+		skipUntil = assignment.endLine
 	}
 	missing := make([]tomlSetting, 0, len(settings))
 	for _, setting := range settings {
@@ -360,7 +378,7 @@ func editProvider(document tomlDocument, settings []tomlSetting) ([]byte, error)
 				inTarget = true
 				continue
 			}
-			if inTarget && strings.HasPrefix(header, "[") {
+			if inTarget && isTOMLTableHeader(header) {
 				insertion = index
 				break
 			}
@@ -381,6 +399,30 @@ func documentAssignmentAt(document tomlDocument, line int) (tomlAssignment, bool
 		}
 	}
 	return tomlAssignment{}, false
+}
+
+func isTOMLTableHeader(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if !strings.HasPrefix(trimmed, "[") {
+		return false
+	}
+	_, _, err := parseTableHeader(trimmed)
+	return err == nil
+}
+
+func replaceTOMLAssignmentLines(lines []string, assignment tomlAssignment, value string) []string {
+	if assignment.line < 0 || assignment.line >= len(lines) {
+		return lines
+	}
+	endLine := assignment.endLine
+	if endLine < assignment.line || endLine >= len(lines) {
+		endLine = assignment.line
+	}
+	result := make([]string, 0, len(lines)-(endLine-assignment.line))
+	result = append(result, lines[:assignment.line]...)
+	result = append(result, replaceTOMLAssignment(lines[assignment.line], value))
+	result = append(result, lines[endLine+1:]...)
+	return result
 }
 
 func replaceTOMLAssignment(raw, value string) string {
