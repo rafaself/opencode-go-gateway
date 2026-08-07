@@ -257,7 +257,8 @@ func (CustomTool) isTool()        {}
 type CustomToolFormatKind string
 
 const (
-	CustomToolFormatText CustomToolFormatKind = "text"
+	CustomToolFormatText    CustomToolFormatKind = "text"
+	CustomToolFormatGrammar CustomToolFormatKind = "grammar"
 )
 
 type CustomToolFormat struct {

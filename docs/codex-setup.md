@@ -21,7 +21,8 @@ unknown settings, and comments remain in place where the TOML shape permits
 safe editing. The generated `models.json` is written next to the Codex config
 and contains the current DeepSeek V4 Flash catalog metadata used by Codex:
 text-only input, a 1,048,576-token context window, low/high/max reasoning,
-parallel function tools, freeform `apply_patch`, and no WebSocket transport.
+parallel function tools, freeform `apply_patch`, no WebSocket transport, and
+the required `base_instructions` and `experimental_supported_tools` fields.
 
 Before a change, setup creates a timestamped `backup-opencode-gateway-*`
 directory containing the previous managed files and a manifest. Both target

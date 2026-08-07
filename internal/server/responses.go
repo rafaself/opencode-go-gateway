@@ -342,8 +342,8 @@ func validateResponsesRequest(request bridge.Request, continuation bool, maxProv
 		switch tool := tool.(type) {
 		case bridge.FunctionTool:
 		case bridge.CustomTool:
-			if tool.Name != opencodego.ApplyPatchToolName || (tool.Format.Kind != "" && tool.Format.Kind != bridge.CustomToolFormatText) {
-				return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "tools", Message: "only the apply_patch text custom tool is supported"}
+			if tool.Name != opencodego.ApplyPatchToolName || (tool.Format.Kind != "" && tool.Format.Kind != bridge.CustomToolFormatText && tool.Format.Kind != bridge.CustomToolFormatGrammar) {
+				return &codex.Error{Code: codex.ErrorInvalidRequest, Param: "tools", Message: "only the apply_patch custom tool is supported"}
 			}
 		case bridge.DeferredTool:
 			if err := opencodego.ValidateCapturedDeferredTool(tool); err != nil {

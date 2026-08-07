@@ -63,7 +63,7 @@ func validateToolNameCollisions(tools []bridge.Tool) error {
 				return providerError(ErrorInvalidRequest, nil)
 			}
 		case bridge.CustomTool:
-			if tool.Name != ApplyPatchToolName || (tool.Format.Kind != "" && tool.Format.Kind != bridge.CustomToolFormatText) || customDeclarationSeen {
+			if tool.Name != ApplyPatchToolName || (tool.Format.Kind != "" && tool.Format.Kind != bridge.CustomToolFormatText && tool.Format.Kind != bridge.CustomToolFormatGrammar) || customDeclarationSeen {
 				return providerError(ErrorInvalidRequest, nil)
 			}
 			customDeclarationSeen = true

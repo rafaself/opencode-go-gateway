@@ -340,14 +340,24 @@ func TestValidateCatalogRejectsMissingModelAndAcceptsGeneratedCatalog(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ValidateCatalog(data); err != nil {
+	catalog, err := ValidateCatalog(data)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 || catalog.Models[0].BaseInstructions == "" || catalog.Models[0].ExperimentalSupportedTools == nil {
+		t.Fatal("generated catalog is missing the base instructions or experimental tools field")
 	}
 	if _, err := ValidateCatalog([]byte(`{"models":[{"slug":"other","display_name":"Other"}]}`)); err == nil {
 		t.Fatal("catalog without gateway model was accepted")
 	}
 	if _, err := ValidateCatalog([]byte(`{"models":`)); err == nil {
 		t.Fatal("malformed catalog was accepted")
+	}
+	if _, err := ValidateCatalog([]byte(`{"models":[{"slug":"other","display_name":"Other","base_instructions":"x"}]}`)); err == nil {
+		t.Fatal("catalog without gateway model was accepted")
+	}
+	if _, err := ValidateCatalog([]byte(`{"models":[{"slug":"deepseek-v4-flash","display_name":"Flash"}]}`)); err == nil {
+		t.Fatal("catalog entry without base instructions was accepted")
 	}
 }
 

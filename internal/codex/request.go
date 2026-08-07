@@ -992,15 +992,32 @@ func decodeCustomTool(fields map[string]json.RawMessage, path string) (customToo
 		if decodeErr != nil {
 			return customToolWire{}, decodeErr
 		}
-		if decodeErr := rejectUnknown(formatFields, path+".format", "type"); decodeErr != nil {
-			return customToolWire{}, decodeErr
-		}
 		formatType, decodeErr := requiredStringField(formatFields, "type", path+".format")
 		if decodeErr != nil {
 			return customToolWire{}, decodeErr
 		}
-		if bridge.CustomToolFormatKind(formatType) != bridge.CustomToolFormatText {
-			return customToolWire{}, newError(ErrorInvalidRequest, path+".format.type", "only text custom-tool input is supported")
+		switch bridge.CustomToolFormatKind(formatType) {
+		case bridge.CustomToolFormatText:
+			if decodeErr := rejectUnknown(formatFields, path+".format", "type"); decodeErr != nil {
+				return customToolWire{}, decodeErr
+			}
+		case bridge.CustomToolFormatGrammar:
+			formatKind = bridge.CustomToolFormatGrammar
+			if decodeErr := rejectUnknown(formatFields, path+".format", "type", "syntax", "definition"); decodeErr != nil {
+				return customToolWire{}, decodeErr
+			}
+			if _, present := formatFields["syntax"]; present {
+				if _, decodeErr := optionalString(formatFields, "syntax", path+".format.syntax"); decodeErr != nil {
+					return customToolWire{}, decodeErr
+				}
+			}
+			if _, present := formatFields["definition"]; present {
+				if _, decodeErr := optionalString(formatFields, "definition", path+".format.definition"); decodeErr != nil {
+					return customToolWire{}, decodeErr
+				}
+			}
+		default:
+			return customToolWire{}, newError(ErrorInvalidRequest, path+".format.type", "unsupported custom-tool input format")
 		}
 	}
 	return customToolWire{Name: name, Description: description, Format: formatKind}, nil

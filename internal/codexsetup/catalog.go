@@ -46,6 +46,8 @@ type CatalogModel struct {
 	AvailabilityNUX                *string          `json:"availability_nux"`
 	Upgrade                        *string          `json:"upgrade"`
 	Priority                       int              `json:"priority"`
+	BaseInstructions               string           `json:"base_instructions"`
+	ExperimentalSupportedTools     []string         `json:"experimental_supported_tools"`
 }
 
 type TruncationPolicy struct {
@@ -90,15 +92,22 @@ func generatedCatalog() Catalog {
 			{Effort: "high", Description: "Extra high reasoning depth for complex problems"},
 			{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
 		},
-		ShellType:            "shell_command",
-		Visibility:           "list",
-		MinimalClientVersion: "0.144.0",
-		SupportedInAPI:       true,
-		AvailabilityNUX:      nil,
-		Upgrade:              nil,
-		Priority:             1,
+		ShellType:                  "shell_command",
+		Visibility:                 "list",
+		MinimalClientVersion:       "0.144.0",
+		SupportedInAPI:             true,
+		AvailabilityNUX:            nil,
+		Upgrade:                    nil,
+		Priority:                   1,
+		BaseInstructions:           baseInstructions,
+		ExperimentalSupportedTools: []string{},
 	}}}
 }
+
+// baseInstructions is the fixed model-role instruction Codex requires in the
+// catalog. It is deliberately short, generic, and does not claim an OpenAI
+// identity or embed any user, project, or credential content.
+const baseInstructions = "You are an expert coding agent. Work with the user in their workspace to complete their requested task, using the provided tools when they help."
 
 // GenerateCatalog returns stable, indented JSON suitable for an atomic file
 // write. It never reads credentials or provider responses.
@@ -124,6 +133,9 @@ func ValidateCatalog(data []byte) (Catalog, error) {
 	for _, model := range catalog.Models {
 		if model.Slug == "" || model.DisplayName == "" {
 			return Catalog{}, fmt.Errorf("model catalog contains a model without slug or display name")
+		}
+		if model.BaseInstructions == "" {
+			return Catalog{}, fmt.Errorf("model catalog contains a model without base instructions")
 		}
 		if model.Slug != ModelID {
 			continue

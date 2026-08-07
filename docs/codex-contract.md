@@ -145,8 +145,12 @@ the current custom-tool shape is:
 {"type":"custom","name":"apply_patch","description":"<tool description>","format":{"type":"text"}}
 ```
 
-`format.type = "text"` means unconstrained freeform text; grammar formats
-are not part of this apply_patch adapter.
+`format.type = "text"` means unconstrained freeform text. Codex 0.146.0 may
+also declare the capability with the observed grammar shape
+`{"type":"grammar","syntax":"lark","definition":"<lark grammar>"}`. The grammar
+declaration is carried as no-op metadata: the adapter forwards the exact
+freeform patch text through the synthetic wrapper and never interprets the
+grammar against incoming input.
 
 Codex-facing input and result items are exactly these validated unions:
 

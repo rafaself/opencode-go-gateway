@@ -330,9 +330,19 @@ func TestDecodeCustomApplyPatchToolDeclarationUsesResponsesTextFormat(t *testing
 		t.Fatalf("default custom format = %#v", request.Tools[0])
 	}
 
-	body = `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"message","role":"user","content":"patch"}],"tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: \"x\""}}]}`
+	body = `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"message","role":"user","content":"patch"}],"tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: \"x\"","other":true}}]}`
 	if _, err := Decode(strings.NewReader(body), "application/json", DefaultMaxBodyBytes); err == nil || !strings.Contains(err.Error(), "tools[0].format") {
 		t.Fatalf("grammar custom format error = %v", err)
+	}
+
+	body = `{"model":"gpt-5.3-codex","stream":true,"input":[{"type":"message","role":"user","content":"patch"}],"tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: \"x\""}}]}`
+	request, err = Decode(strings.NewReader(body), "application/json", DefaultMaxBodyBytes)
+	if err != nil {
+		t.Fatalf("grammar custom format: %v", err)
+	}
+	custom, ok = request.Tools[0].(bridge.CustomTool)
+	if !ok || custom.Name != "apply_patch" || custom.Format.Kind != bridge.CustomToolFormatGrammar {
+		t.Fatalf("grammar custom tool = %#v", request.Tools[0])
 	}
 }
 
