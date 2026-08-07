@@ -511,6 +511,52 @@ func ValidateModel(model string) error {
 	return validateProviderModel(model)
 }
 
+// ProviderTag identifies which gateway backend a tagged model routes to.
+type ProviderTag string
+
+const (
+	// ProviderTagGo routes to the OpenCode Go backend.
+	ProviderTagGo ProviderTag = "go"
+	// ProviderTagZen routes to the OpenCode Zen backend.
+	ProviderTagZen ProviderTag = "zen"
+)
+
+// TaggedModel joins a client-visible model label with a backend tag. The
+// label is metadata only and is never forwarded to a provider.
+func TaggedModel(model string, tag ProviderTag) string {
+	return model + " (" + string(tag) + ")"
+}
+
+// SplitTaggedModel parses a model of the form "<label> (<tag>)". It returns
+// ok=false when the model is not a valid tagged model: a non-empty label from
+// [A-Za-z0-9._-] followed by exactly one recognized tag in parentheses.
+func SplitTaggedModel(model string) (string, ProviderTag, bool) {
+	const separator = " ("
+	index := strings.LastIndex(model, separator)
+	if index < 0 || !strings.HasSuffix(model, ")") {
+		return "", "", false
+	}
+	label := model[:index]
+	tag := ProviderTag(model[index+len(separator) : len(model)-1])
+	if !validTaggedLabel(label) || (tag != ProviderTagGo && tag != ProviderTagZen) {
+		return "", "", false
+	}
+	return label, tag, true
+}
+
+func validTaggedLabel(label string) bool {
+	if label == "" || len(label) > 256 || !utf8.ValidString(label) {
+		return false
+	}
+	for index := 0; index < len(label); index++ {
+		value := label[index]
+		if !((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '.' || value == '_' || value == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func validFunctionName(name string) bool {
 	if name == "" || len(name) > 64 || !utf8.ValidString(name) {
 		return false

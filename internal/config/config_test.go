@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
+	"github.com/rafaself/opencode-go-gateway/internal/opencodego"
 )
 
 func TestLoadUsesTypedDefaultsAndDoesNotExposeAPIKey(t *testing.T) {
@@ -20,6 +21,15 @@ func TestLoadUsesTypedDefaultsAndDoesNotExposeAPIKey(t *testing.T) {
 
 	if config.BaseURL != DefaultBaseURL {
 		t.Fatalf("base URL = %q, want %q", config.BaseURL, DefaultBaseURL)
+	}
+	if config.ZenBaseURL != DefaultZenBaseURL {
+		t.Fatalf("zen base URL = %q, want %q", config.ZenBaseURL, DefaultZenBaseURL)
+	}
+	if config.Model != opencodego.DefaultModel {
+		t.Fatalf("model = %q, want %q", config.Model, opencodego.DefaultModel)
+	}
+	if config.ZenModel != opencodego.DeepSeekV4FlashFreeModel {
+		t.Fatalf("zen model = %q, want %q", config.ZenModel, opencodego.DeepSeekV4FlashFreeModel)
 	}
 	if config.Host != DefaultHost {
 		t.Fatalf("host = %q, want %q", config.Host, DefaultHost)
@@ -51,6 +61,8 @@ func TestLoadParsesOperationalSettingsWithoutProcessEnvironment(t *testing.T) {
 	config, err := Load(lookupEnv(map[string]string{
 		"OPENCODE_GO_API_KEY":                           "test-key",
 		"OPENCODE_GO_BASE_URL":                          "https://provider.example/v1",
+		"OPENCODE_GO_ZEN_BASE_URL":                      "https://zen.example/v2",
+		"OPENCODE_GO_ZEN_MODEL":                         "deepseek-v4-pro",
 		"OPENCODE_GATEWAY_HOST":                         "127.0.0.1",
 		"OPENCODE_GATEWAY_PORT":                         "9090",
 		"OPENCODE_GATEWAY_LOG_LEVEL":                    "debug",
@@ -88,6 +100,9 @@ func TestLoadParsesOperationalSettingsWithoutProcessEnvironment(t *testing.T) {
 
 	if config.BaseURL != "https://provider.example/v1" || config.Port != 9090 || config.LogLevel.String() != "DEBUG" {
 		t.Fatalf("parsed config = %+v", config)
+	}
+	if config.ZenBaseURL != "https://zen.example/v2" || config.ZenModel != "deepseek-v4-pro" {
+		t.Fatalf("parsed zen settings = %+v", config)
 	}
 	if config.ShutdownTimeout != 3*time.Second || config.ReadHeaderTimeout != 250*time.Millisecond || config.IdleTimeout != 6*time.Second {
 		t.Fatalf("parsed timeouts = %+v", config)
@@ -207,6 +222,46 @@ func TestLoadRejectsNonLoopbackUnlessExplicitlyAllowed(t *testing.T) {
 	}
 	if !config.AllowNonLoopback {
 		t.Fatal("explicit non-loopback opt-in was not retained")
+	}
+}
+
+func TestLoadRejectsInvalidZenSettings(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values map[string]string
+		want   string
+	}{
+		{
+			name: "zen base URL scheme",
+			values: map[string]string{
+				"OPENCODE_GO_API_KEY":      "test-key",
+				"OPENCODE_GO_ZEN_BASE_URL": "http://zen.example/v1",
+			},
+			want: "OPENCODE_GO_ZEN_BASE_URL",
+		},
+		{
+			name: "zen base URL credentials",
+			values: map[string]string{
+				"OPENCODE_GO_API_KEY":      "test-key",
+				"OPENCODE_GO_ZEN_BASE_URL": "https://user:secret@zen.example/v1",
+			},
+			want: "OPENCODE_GO_ZEN_BASE_URL",
+		},
+		{
+			name: "zen model unsupported",
+			values: map[string]string{
+				"OPENCODE_GO_API_KEY":   "test-key",
+				"OPENCODE_GO_ZEN_MODEL": "gpt-5",
+			},
+			want: "OPENCODE_GO_ZEN_MODEL",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(lookupEnv(test.values))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %s rejection", err, test.want)
+			}
+		})
 	}
 }
 

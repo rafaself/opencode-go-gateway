@@ -19,11 +19,19 @@ embedding.
 | --- | ---: | --- | --- |
 | `OPENCODE_GO_API_KEY` | optional when stored | string | OpenCode Go credential; environment value takes precedence and is never printed |
 | `OPENCODE_GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | URL | OpenCode Go Chat Completions base URL |
-| `OPENCODE_GO_MODEL` | `deepseek-v4-flash` | enum | Upstream model; also accepts the free `deepseek-v4-flash-free` for a Zen backend instance (`OPENCODE_GO_BASE_URL=https://opencode.ai/zen/v1`) |
+| `OPENCODE_GO_MODEL` | `deepseek-v4-flash` | enum | Go backend upstream model; accepts `deepseek-v4-flash`, `deepseek-v4-pro`, or `deepseek-v4-flash-free` |
+| `OPENCODE_GO_ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | URL | OpenCode Zen Chat Completions base URL |
+| `OPENCODE_GO_ZEN_MODEL` | `deepseek-v4-flash-free` | enum | Zen backend upstream model; accepts `deepseek-v4-flash`, `deepseek-v4-pro`, or `deepseek-v4-flash-free` |
 | `OPENCODE_GATEWAY_HOST` | `127.0.0.1` | host | Local bind host |
 | `OPENCODE_GATEWAY_PORT` | `8787` | port | Local bind port; `0` selects an ephemeral port |
 | `OPENCODE_GATEWAY_ALLOW_NON_LOOPBACK` | `false` | boolean | Explicitly permits a non-loopback bind; use only with a separately secured network boundary |
 | `OPENCODE_GATEWAY_LOG_LEVEL` | `info` | enum | `debug`, `info`, `warn`, or `error` |
+
+One gateway instance serves both backends. Each Responses request must name a
+tagged model, `"<label> (go)"` or `"<label> (zen)"`; the tag selects the
+backend and the label is client metadata that is never forwarded. An untagged
+model is rejected with `400 invalid_request`. The SSE response echoes the
+selected backend's upstream model.
 
 The provider URL must be absolute HTTPS. A loopback HTTP URL is allowed for
 local deterministic tests. Redirects and ambient proxy settings are disabled.

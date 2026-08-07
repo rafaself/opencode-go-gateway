@@ -8,17 +8,23 @@ tools, or expose provider reasoning as bridge text.
 
 The shipped provider defaults are:
 
-- base URL: `https://opencode.ai/zen/go/v1`;
-- model: `deepseek-v4-flash`;
-- endpoint: `POST /chat/completions` relative to that base URL;
+- Go base URL: `https://opencode.ai/zen/go/v1`;
+- Zen base URL: `https://opencode.ai/zen/v1`;
+- Go model: `deepseek-v4-flash`;
+- Zen model: `deepseek-v4-flash-free`;
+- endpoint: `POST /chat/completions` relative to the selected base URL;
 - streaming: `stream: true`;
 - response media type: `text/event-stream`.
 
-The provider model policy is explicit: `deepseek-v4-flash` is the default and
-`deepseek-v4-pro` is the only other configured model accepted by this MVP.
-Unsupported configured provider models fail before any network request. The
-incoming bridge model (for example, Codex's `gpt-5.3-codex`) is source
-metadata and is intentionally not forwarded as the OpenCode Go model.
+The provider model policy is explicit: the Go backend accepts
+`deepseek-v4-flash`, `deepseek-v4-pro`, or `deepseek-v4-flash-free`, and the
+Zen backend accepts the same set with `deepseek-v4-flash-free` as the
+default. Unsupported configured provider models fail before any network
+request. The incoming Responses model is routing metadata only: the gateway
+splits a tagged model such as `"deepseek-v4-flash (go)"` into a label and a
+backend tag, and the label is intentionally not forwarded as the provider
+model. An untagged or unrecognized model is rejected before any upstream
+call.
 
 The OpenCode Go documentation lists the same model ID and Chat Completions
 endpoint family in its [Go endpoint table](https://opencode.ai/docs/go/). The

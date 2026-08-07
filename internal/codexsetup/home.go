@@ -10,25 +10,34 @@ import (
 )
 
 const (
-	// GoProviderID routes Codex to the gateway instance that talks to OpenCode
-	// Go (`zen/go/v1`) with the paid deepseek-v4-flash model.
+	// GoProviderID routes Codex to the local gateway, which forwards to
+	// OpenCode Go (`zen/go/v1`) with the paid deepseek-v4-flash model.
 	GoProviderID = "opencode-gateway-go"
-	// ZenProviderID routes Codex to the gateway instance that talks to the
-	// OpenCode Zen endpoint (`zen/v1`). The Zen backend serves both paid and
-	// free models; the free models are selected by profile and model ID.
+	// ZenProviderID routes Codex to the same local gateway, which forwards to
+	// the OpenCode Zen endpoint (`zen/v1`). The Zen backend serves both paid
+	// and free models; the free models are selected by profile and model ID.
 	ZenProviderID = "opencode-gateway-zen"
 	// LegacyProviderID is the provider table ID written by the single-provider
 	// setup revision (v0.1.x). Setup removes the superseded table so orphaned
 	// credentials and dead routing paths are not retained.
 	LegacyProviderID = "opencode-gateway"
-	// GoModelID is the paid OpenCode Go model served by the primary gateway.
-	GoModelID = "deepseek-v4-flash"
-	// ZenFreeModelID is the free OpenCode Zen model served by the second
-	// gateway instance. Free models are time-limited and their data may be
-	// used to improve the model; see the OpenCode Zen docs.
-	ZenFreeModelID  = "deepseek-v4-flash-free"
-	ConfigFileName  = "config.toml"
-	CatalogFileName = "models.json"
+	// GoModelID is the tagged paid OpenCode Go model. The `(go)` tag routes
+	// the request to the OpenCode Go backend; the label is client metadata.
+	GoModelID = "deepseek-v4-flash (go)"
+	// ZenFreeModelID is the tagged free OpenCode Zen model. The `(zen)` tag
+	// routes the request to the OpenCode Zen backend. Free models are
+	// time-limited and their data may be used to improve the model; see the
+	// OpenCode Zen docs.
+	ZenFreeModelID = "deepseek-v4-flash (zen)"
+	// UntaggedGoModelID is the Go model value written by the two-gateway setup
+	// revision before routing tags were introduced. Setup and doctor still
+	// recognize it so previously managed configurations migrate cleanly.
+	UntaggedGoModelID = "deepseek-v4-flash"
+	// UntaggedZenFreeModelID is the untagged free model value served by the
+	// OpenCode Zen backend, as reported by the provider models endpoint.
+	UntaggedZenFreeModelID = "deepseek-v4-flash-free"
+	ConfigFileName         = "config.toml"
+	CatalogFileName        = "models.json"
 	// GoProfileFileName is the Codex profile activated with `codex --profile
 	// opencode-gateway-go`. Profile files are session overlays; the default
 	// Codex session keeps its built-in models and providers.
@@ -40,12 +49,9 @@ const (
 	AgentsDirName          = "agents"
 	SubagentFileName       = "deepseek-worker.toml"
 	BackupPrefix           = "backup-opencode-gateway-"
-	// DefaultGoGatewayURL is the local listener for the paid gateway instance.
+	// DefaultGoGatewayURL is the local listener for the single gateway
+	// instance that serves both the Go and Zen backends.
 	DefaultGoGatewayURL = "http://127.0.0.1:8787/v1"
-	// DefaultZenGatewayURL is the local listener for the Zen gateway instance.
-	// Run the second instance with OPENCODE_GO_BASE_URL set to the Zen
-	// endpoint and OPENCODE_GO_MODEL=deepseek-v4-flash-free.
-	DefaultZenGatewayURL = "http://127.0.0.1:8788/v1"
 )
 
 // Environment is the small process boundary needed to resolve Codex's user

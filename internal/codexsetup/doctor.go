@@ -70,16 +70,15 @@ func (report DoctorReport) ExitCode() int {
 }
 
 type DoctorOptions struct {
-	Environment   Environment
-	CodexHome     string
-	GatewayURL    string
-	ZenGatewayURL string
-	HTTPClient    HTTPDoer
-	LookupPath    func(string) (string, error)
-	RunCommand    func(context.Context, string, ...string) ([]byte, error)
-	Dial          func(context.Context, string, string) (net.Conn, error)
-	Listen        func(string, string) (net.Listener, error)
-	Timeout       time.Duration
+	Environment Environment
+	CodexHome   string
+	GatewayURL  string
+	HTTPClient  HTTPDoer
+	LookupPath  func(string) (string, error)
+	RunCommand  func(context.Context, string, ...string) ([]byte, error)
+	Dial        func(context.Context, string, string) (net.Conn, error)
+	Listen      func(string, string) (net.Listener, error)
+	Timeout     time.Duration
 }
 
 type HTTPDoer interface {
@@ -173,8 +172,8 @@ func Diagnose(ctx context.Context, options DoctorOptions) DoctorReport {
 		if options.GatewayURL != "" && goProviderValues.BaseURL != options.GatewayURL {
 			report.add(SeverityFailure, "Gateway provider URL", "Codex provider URL does not match the requested gateway URL")
 		}
-		if options.ZenGatewayURL != "" && zenProviderValues.BaseURL != options.ZenGatewayURL {
-			report.add(SeverityFailure, "Gateway Zen provider URL", "Codex provider URL does not match the requested Zen gateway URL")
+		if zenProviderValues.BaseURL != goProviderValues.BaseURL {
+			report.add(SeverityFailure, "Gateway Zen provider URL", "Codex provider URL differs from the Go provider URL")
 		}
 	}
 
@@ -267,14 +266,16 @@ func diagnoseProviderTable(report *DoctorReport, configData []byte, providerID, 
 }
 
 // configForcesDefaultGateway reports whether the default Codex session still
-// routes through the gateway, which is no longer the managed layout.
+// routes through the gateway, which is no longer the managed layout. The
+// untagged model value written before routing tags existed is still
+// recognized so legacy setups are flagged.
 func configForcesDefaultGateway(data []byte) bool {
 	document, err := parseTOML(string(data))
 	if err != nil {
 		return false
 	}
 	model, err := documentString(document, "", "model")
-	if err != nil || model != GoModelID {
+	if err != nil || (model != GoModelID && model != UntaggedGoModelID) {
 		return false
 	}
 	provider, err := documentString(document, "", "model_provider")
@@ -533,12 +534,12 @@ func diagnoseProvider(ctx context.Context, report *DoctorReport, options DoctorO
 		return
 	}
 	report.add(SeverityPass, "OpenCode Go authentication", "provider accepted the credential for a models check")
-	if providerModelsContain(body, GoModelID) {
+	if providerModelsContain(body, UntaggedGoModelID) {
 		report.add(SeverityPass, "OpenCode Go model", "deepseek-v4-flash is available")
 	} else {
 		report.add(SeverityFailure, "OpenCode Go model", "deepseek-v4-flash was not returned by the provider")
 	}
-	if providerModelsContain(body, ZenFreeModelID) {
+	if providerModelsContain(body, UntaggedZenFreeModelID) {
 		report.add(SeverityPass, "OpenCode Go model", "deepseek-v4-flash-free is available")
 	} else {
 		report.add(SeverityWarning, "OpenCode Go model", "deepseek-v4-flash-free was not returned by the provider")

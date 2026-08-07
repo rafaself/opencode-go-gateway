@@ -1,6 +1,6 @@
 {
   "apply-patch-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -57,7 +57,7 @@
     }
   },
   "cancellation-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -91,7 +91,7 @@
     }
   },
   "continuation-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -155,7 +155,7 @@
     }
   },
   "custom-tool-result-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -231,7 +231,7 @@
     }
   },
   "developer-instructions-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -277,7 +277,7 @@
     }
   },
   "empty-tool-result-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -341,7 +341,7 @@
     }
   },
   "function-tools-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -386,7 +386,7 @@
     }
   },
   "parallel-tools-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -439,7 +439,7 @@
     }
   },
   "shell-command-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -484,7 +484,7 @@
     }
   },
   "simple-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message"
@@ -541,7 +541,7 @@
     }
   },
   "tool-error-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -605,7 +605,7 @@
     }
   },
   "tool-results-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",
@@ -669,7 +669,7 @@
     }
   },
   "workspace-file-read-request.json": {
-    "model": "gpt-5.3-codex",
+    "model": "deepseek-v4-flash (go)",
     "instructions": "\u003credacted:string\u003e",
     "input_kinds": [
       "message",

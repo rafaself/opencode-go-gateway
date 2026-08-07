@@ -54,6 +54,14 @@ func (client UpstreamClientFunc) Do(ctx context.Context, request bridge.Request)
 	return client(ctx, request)
 }
 
+// notConfiguredUpstream is the deterministic placeholder for a backend whose
+// client was not wired by the application.
+func notConfiguredUpstream() UpstreamClient {
+	return UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
+		return nil, &UpstreamError{Code: upstreamErrorNotConfigured}
+	})
+}
+
 // UpstreamError is a stable, provider-neutral pre-stream failure. Its Error
 // method deliberately omits provider payloads, credentials, and causes.
 type UpstreamError struct {

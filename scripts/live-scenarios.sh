@@ -448,7 +448,7 @@ start_codex_scenario() {
 			--ignore-rules \
 			--ephemeral \
 			--skip-git-repo-check \
-			--model deepseek-v4-flash \
+			--model 'deepseek-v4-flash (go)' \
 			--sandbox "$sandbox" \
 			--ask-for-approval never \
 			--color never \

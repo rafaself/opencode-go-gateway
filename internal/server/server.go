@@ -46,7 +46,9 @@ type Config struct {
 	ListenAddr               string
 	AllowNonLoopback         bool
 	Model                    string
+	ZenModel                 string
 	Upstream                 UpstreamClient
+	ZenUpstream              UpstreamClient
 	ReadHeaderTimeout        time.Duration
 	IdleTimeout              time.Duration
 	RequestBodyReadTimeout   time.Duration
@@ -79,12 +81,13 @@ type Config struct {
 
 // Server owns the loopback HTTP listener and the Codex-facing route surface.
 type Server struct {
-	config   Config
-	ln       net.Listener
-	http     *http.Server
-	logger   *slog.Logger
-	upstream UpstreamClient
-	ready    atomic.Bool
+	config      Config
+	ln          net.Listener
+	http        *http.Server
+	logger      *slog.Logger
+	upstream    UpstreamClient
+	zenUpstream UpstreamClient
+	ready       atomic.Bool
 
 	requestID uint64
 
@@ -157,15 +160,18 @@ func New(config Config, logger *slog.Logger) (*Server, error) {
 
 	upstream := config.Upstream
 	if upstream == nil {
-		upstream = UpstreamClientFunc(func(context.Context, bridge.Request) (*UpstreamResponse, error) {
-			return nil, &UpstreamError{Code: upstreamErrorNotConfigured}
-		})
+		upstream = notConfiguredUpstream()
+	}
+	zenUpstream := config.ZenUpstream
+	if zenUpstream == nil {
+		zenUpstream = notConfiguredUpstream()
 	}
 	server := &Server{
 		config:             config,
 		ln:                 listener,
 		logger:             logger,
 		upstream:           upstream,
+		zenUpstream:        zenUpstream,
 		continuations:      continuations,
 		ownsContinuations:  ownsContinuations,
 		activeRequests:     make(map[uint64]activeRequest),
@@ -194,6 +200,9 @@ func withDefaults(config Config) Config {
 	}
 	if config.Model == "" {
 		config.Model = opencodego.DefaultModel
+	}
+	if config.ZenModel == "" {
+		config.ZenModel = opencodego.DeepSeekV4FlashFreeModel
 	}
 	if config.ReadHeaderTimeout == 0 {
 		config.ReadHeaderTimeout = defaultReadHeaderTimeout

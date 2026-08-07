@@ -395,8 +395,7 @@ func runCodexSetup(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("setup codex", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
-	gatewayURL := flags.String("gateway-url", codexsetup.DefaultGoGatewayURL, "gateway Responses base URL for the opencode-gateway-go profile")
-	zenGatewayURL := flags.String("zen-gateway-url", codexsetup.DefaultZenGatewayURL, "gateway Responses base URL for the opencode-gateway-zen provider and the opencode-gateway-zen-free profile")
+	gatewayURL := flags.String("gateway-url", codexsetup.DefaultGoGatewayURL, "gateway Responses base URL for the gateway profiles and providers")
 	dryRun := flags.Bool("dry-run", false, "show redacted changes without writing files")
 	restore := flags.String("restore", "", "restore a setup backup directory")
 	if err := flags.Parse(args); err != nil {
@@ -418,10 +417,9 @@ func runCodexSetup(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	result, err := codexsetup.SetupCodex(codexsetup.SetupOptions{
-		CodexHome:     *codexHome,
-		GatewayURL:    *gatewayURL,
-		ZenGatewayURL: *zenGatewayURL,
-		DryRun:        *dryRun,
+		CodexHome:  *codexHome,
+		GatewayURL: *gatewayURL,
+		DryRun:     *dryRun,
 	})
 	if err != nil {
 		return err
@@ -448,7 +446,6 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
 	gatewayURL := flags.String("gateway-url", "", "gateway Responses base URL; defaults to the configured provider")
-	zenGatewayURL := flags.String("zen-gateway-url", "", "Zen gateway Responses base URL to verify against the configured provider")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -464,10 +461,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	report := codexsetup.Diagnose(context.Background(), codexsetup.DoctorOptions{
-		Environment:   codexsetup.Environment{LookupEnv: lookup},
-		CodexHome:     *codexHome,
-		GatewayURL:    *gatewayURL,
-		ZenGatewayURL: *zenGatewayURL,
+		Environment: codexsetup.Environment{LookupEnv: lookup},
+		CodexHome:   *codexHome,
+		GatewayURL:  *gatewayURL,
 	})
 	for _, check := range report.Checks {
 		fmt.Fprintf(stdout, "[%s] %s: %s\n", check.Severity, check.Name, check.Message)

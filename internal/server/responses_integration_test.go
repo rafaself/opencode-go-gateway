@@ -90,7 +90,7 @@ func TestResponsesStreamsTextIncrementallyThroughTheGateway(t *testing.T) {
 	if responseObject["model"] != "deepseek-v4-flash" {
 		t.Fatalf("response model = %#v, want deepseek-v4-flash", responseObject["model"])
 	}
-	if gotRequest.Model != "gpt-5.3-codex" || !gotRequest.Generation.Stream || gotRequest.Instructions != "system instruction" {
+	if gotRequest.Model != "deepseek-v4-flash (go)" || !gotRequest.Generation.Stream || gotRequest.Instructions != "system instruction" {
 		t.Fatalf("bridge request = %#v", gotRequest)
 	}
 	if len(gotRequest.Input) != 2 {
@@ -284,7 +284,7 @@ func TestResponsesStreamsFunctionToolsThroughTheRealProviderAdapter(t *testing.T
 	}
 	var logs bytes.Buffer
 	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), slog.New(slog.NewTextHandler(&logs, nil)))
-	requestBody := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"look up"}],"tools":[{"type":"function","name":"lookup","description":"look up a value","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]},"strict":true},{"type":"function","name":"other_tool","parameters":{"type":"object"}}],"tool_choice":"auto","parallel_tool_calls":true,"stream":true}`
+	requestBody := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"look up"}],"tools":[{"type":"function","name":"lookup","description":"look up a value","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]},"strict":true},{"type":"function","name":"other_tool","parameters":{"type":"object"}}],"tool_choice":"auto","parallel_tool_calls":true,"stream":true}`
 	response := postRequest(t, gateway, requestBody)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -504,12 +504,12 @@ func TestResponsesPreservesContinuationErrorsForDeferredResultCorrelation(t *tes
 	}{
 		{
 			name: "duplicate result",
-			body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","output":"one"},{"type":"function_call_output","call_id":"call-1","output":"two"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
+			body: `{"model":"deepseek-v4-flash (go)","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","output":"one"},{"type":"function_call_output","call_id":"call-1","output":"two"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
 			code: "continuation_duplicate",
 		},
 		{
 			name: "mismatched result kind",
-			body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"custom_tool_call_output","call_id":"call-1","output":"wrong kind"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
+			body: `{"model":"deepseek-v4-flash (go)","input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"custom_tool_call_output","call_id":"call-1","output":"wrong kind"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`,
 			code: "continuation_kind_mismatch",
 		},
 	}
@@ -544,7 +544,7 @@ func TestResponsesRejectsOutputOnlyContinuationKindMismatch(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(providerToolStream(t, "lookup", "stored-function-call", `{}`))),
 		}, nil
 	}), nil)
-	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	initial := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	first := httptest.NewRecorder()
 	firstRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(initial))
 	firstRequest.Header.Set("Content-Type", "application/json")
@@ -553,7 +553,7 @@ func TestResponsesRejectsOutputOnlyContinuationKindMismatch(t *testing.T) {
 		t.Fatalf("initial response = %d %s", first.Code, first.Body.String())
 	}
 
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"custom_tool_call_output","call_id":"stored-function-call","output":"wrong kind"}],"tools":[],"stream":true}`
+	continuation := `{"model":"deepseek-v4-flash (go)","input":[{"type":"custom_tool_call_output","call_id":"stored-function-call","output":"wrong kind"}],"tools":[],"stream":true}`
 	second := httptest.NewRecorder()
 	secondRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses", strings.NewReader(continuation))
 	secondRequest.Header.Set("Content-Type", "application/json")
@@ -572,7 +572,7 @@ func TestResponsesRejectsOutputOnlyContinuationDuplicate(t *testing.T) {
 		called = true
 		return nil, errors.New("upstream must not be called")
 	}), nil)
-	body := `{"model":"gpt-5.3-codex","input":[{"type":"function_call_output","call_id":"stored-call","output":"one"},{"type":"function_call_output","call_id":"stored-call","output":"two"}],"tools":[],"stream":true}`
+	body := `{"model":"deepseek-v4-flash (go)","input":[{"type":"function_call_output","call_id":"stored-call","output":"one"},{"type":"function_call_output","call_id":"stored-call","output":"two"}],"tools":[],"stream":true}`
 	response := postRequest(t, gateway, body)
 	defer response.Body.Close()
 	responseBody := readBody(t, response.Body)
@@ -590,7 +590,7 @@ func TestResponsesRejectsUnknownOutputOnlyContinuation(t *testing.T) {
 		called = true
 		return nil, errors.New("upstream must not be called")
 	}), nil)
-	body := `{"model":"gpt-5.3-codex","input":[{"type":"custom_tool_call_output","call_id":"missing-call","output":"result"}],"tools":[],"stream":true}`
+	body := `{"model":"deepseek-v4-flash (go)","input":[{"type":"custom_tool_call_output","call_id":"missing-call","output":"result"}],"tools":[],"stream":true}`
 	response := postRequest(t, gateway, body)
 	defer response.Body.Close()
 	responseBody := readBody(t, response.Body)
@@ -665,7 +665,7 @@ func TestResponsesReplaysDeepSeekReasoningAndToolResultsEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), nil)
-	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
+	initial := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
 	firstResponse := postRequest(t, gateway, initial)
 	firstEvents := readResponseEvents(t, firstResponse.Body)
 	firstResponse.Body.Close()
@@ -675,7 +675,7 @@ func TestResponsesReplaysDeepSeekReasoningAndToolResultsEndToEnd(t *testing.T) {
 	if strings.Contains(string(mustJSON(t, firstEvents)), "deep reasoning") {
 		t.Fatal("reasoning content leaked to Responses")
 	}
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call_output","call_id":"provider-call","output":"exact tool output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
+	continuation := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call_output","call_id":"provider-call","output":"exact tool output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"stream":true}`
 	secondResponse := postRequest(t, gateway, continuation)
 	secondEvents := readResponseEvents(t, secondResponse.Body)
 	secondResponse.Body.Close()
@@ -709,14 +709,14 @@ func TestResponsesRetriesContinuationAfterUpstreamBadRequest(t *testing.T) {
 		}
 	})
 	gateway := newIntegrationGateway(t, upstream, nil)
-	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	initial := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	first := postRequest(t, gateway, initial)
 	firstEvents := readResponseEvents(t, first.Body)
 	first.Body.Close()
 	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
 		t.Fatalf("initial response = %#v", firstEvents)
 	}
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	continuation := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	failed := postRequest(t, gateway, continuation)
 	failedBody := readBody(t, failed.Body)
 	failed.Body.Close()
@@ -735,8 +735,8 @@ func TestResponsesRetriesContinuationAfterUpstreamBadRequest(t *testing.T) {
 }
 
 func TestResponsesReleasesContinuationBeforeFirstAcceptedUpstreamEvent(t *testing.T) {
-	const initial = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
-	const continuation = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const initial = `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const continuation = `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"retry-call","name":"lookup","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"retry-call","output":"retry output"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	tests := []struct {
 		name   string
 		stream string
@@ -840,8 +840,8 @@ func TestResponsesReleasesContinuationBeforeFirstAcceptedUpstreamEvent(t *testin
 }
 
 func TestResponsesConsumesContinuationAfterFirstAcceptedEvent(t *testing.T) {
-	const initial = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
-	const continuation = `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"accepted-call","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"accepted-call","output":"result"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const initial = `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	const continuation = `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"},{"type":"function_call","call_id":"accepted-call","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"accepted-call","output":"result"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	var continuationAttempts int
 	upstream := UpstreamClientFunc(func(_ context.Context, request bridge.Request) (*UpstreamResponse, error) {
 		if request.Continuation == nil {
@@ -922,14 +922,14 @@ func TestResponsesReplaysCustomApplyPatchContinuationThroughProvider(t *testing.
 		t.Fatal(err)
 	}
 	gateway := newIntegrationGateway(t, NewOpenCodeUpstreamClient(client), nil)
-	initial := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"}],"tools":[],"stream":true}`
+	initial := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"apply patch"}],"tools":[],"stream":true}`
 	first := postRequest(t, gateway, initial)
 	firstEvents := readResponseEvents(t, first.Body)
 	first.Body.Close()
 	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1]["type"] != "response.completed" {
 		t.Fatalf("custom initial response = %#v", firstEvents)
 	}
-	continuation := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"apply patch"},{"type":"custom_tool_call_output","call_id":"custom-retry-call","output":"applied exactly"}],"tools":[],"stream":true}`
+	continuation := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"apply patch"},{"type":"custom_tool_call_output","call_id":"custom-retry-call","output":"applied exactly"}],"tools":[],"stream":true}`
 	second := postRequest(t, gateway, continuation)
 	secondEvents := readResponseEvents(t, second.Body)
 	second.Body.Close()
@@ -949,7 +949,7 @@ func TestResponsesRejectsApplyPatchSyntheticNameCollisions(t *testing.T) {
 				called = true
 				return nil, errors.New("provider must not be called")
 			}), nil)
-			body := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"` + name + `","parameters":{"type":"object"}}],"stream":true}`
+			body := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"` + name + `","parameters":{"type":"object"}}],"stream":true}`
 			response := postRequest(t, gateway, body)
 			defer response.Body.Close()
 			responseBody := readBody(t, response.Body)
@@ -997,7 +997,7 @@ func TestResponsesFailsWhenProviderReturnsUndeclaredFunctionTool(t *testing.T) {
 		`data: [DONE]`,
 	}, "\n\n") + "\n\n"
 	gateway := newIntegrationGateway(t, staticUpstream(stream), nil)
-	requestBody := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
+	requestBody := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"use lookup"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"stream":true}`
 	response := postRequest(t, gateway, requestBody)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -1031,7 +1031,7 @@ func TestResponsesRejectsToolBearingRequestsBeforeCallingUpstream(t *testing.T) 
 		name string
 		body string
 	}{
-		{name: "prior tool call", body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"secret-call","name":"secret_tool","arguments":"{}"}],"stream":true}`},
+		{name: "prior tool call", body: `{"model":"deepseek-v4-flash (go)","input":[{"type":"function_call","call_id":"secret-call","name":"secret_tool","arguments":"{}"}],"stream":true}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			called := false
@@ -1066,7 +1066,7 @@ func TestResponsesRejectsForcedAndNamedToolChoicesExplicitly(t *testing.T) {
 				called = true
 				return nil, errors.New("upstream must not be called")
 			}), nil)
-			body := `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":` + choice + `,"stream":true}`
+			body := `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":` + choice + `,"stream":true}`
 			response := postRequest(t, gateway, body)
 			defer response.Body.Close()
 			if response.StatusCode != http.StatusBadRequest {
@@ -1554,7 +1554,7 @@ func TestResponsesRejectsImplicitProviderToolOverflowBeforeUpstream(t *testing.T
 		}
 	}
 	body, err := json.Marshal(map[string]any{
-		"model":  "gpt-5.3-codex",
+		"model":  "deepseek-v4-flash (go)",
 		"input":  []map[string]any{{"type": "message", "role": "user", "content": "hello"}},
 		"tools":  tools,
 		"stream": true,
@@ -1595,7 +1595,7 @@ func TestResponsesChargesImplicitApplyPatchSchemaAtExactAggregateBoundary(t *tes
 			const suffix = `"}`
 			schema := prefix + strings.Repeat("x", test.schemaSize-len(prefix)-len(suffix)) + suffix
 			body, err := json.Marshal(map[string]any{
-				"model":  "gpt-5.3-codex",
+				"model":  "deepseek-v4-flash (go)",
 				"input":  []map[string]any{{"type": "message", "role": "user", "content": "hello"}},
 				"tools":  []map[string]any{{"type": "function", "name": wrapperName, "parameters": json.RawMessage(schema)}},
 				"stream": true,
@@ -1886,7 +1886,7 @@ func TestResponsesDoesNotLogSecretsOnFailure(t *testing.T) {
 	gateway := newIntegrationGateway(t, UpstreamClientFunc(func(_ context.Context, _ bridge.Request) (*UpstreamResponse, error) {
 		return nil, &UpstreamError{Code: upstreamErrorServer}
 	}), slog.New(slog.NewTextHandler(&logs, nil)))
-	requestBody := `{"model":"gpt-5.3-codex","instructions":"instruction-secret","input":[{"type":"message","role":"user","content":"prompt-secret"}],"stream":true}`
+	requestBody := `{"model":"deepseek-v4-flash (go)","instructions":"instruction-secret","input":[{"type":"message","role":"user","content":"prompt-secret"}],"stream":true}`
 	response := postRequest(t, gateway, requestBody)
 	defer response.Body.Close()
 	_ = readBody(t, response.Body)
@@ -1952,7 +1952,7 @@ func postRequest(t *testing.T, gateway *httptest.Server, body string) *http.Resp
 }
 
 func textRequestBody() string {
-	return `{"model":"gpt-5.3-codex","instructions":"system instruction","input":[{"type":"message","role":"assistant","content":[{"type":"input_text","text":"prior answer"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"reasoning":{"effort":"medium"},"stream":true}`
+	return `{"model":"deepseek-v4-flash (go)","instructions":"system instruction","input":[{"type":"message","role":"assistant","content":[{"type":"input_text","text":"prior answer"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"reasoning":{"effort":"medium"},"stream":true}`
 }
 
 func readResponseEvents(t *testing.T, body io.Reader) []map[string]any {

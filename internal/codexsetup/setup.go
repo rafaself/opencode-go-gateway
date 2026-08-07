@@ -102,8 +102,10 @@ func (options SetupOptions) withDefaults() SetupOptions {
 	if options.GatewayURL == "" {
 		options.GatewayURL = DefaultGoGatewayURL
 	}
+	// Both managed provider tables point at the same single gateway instance;
+	// routing between the Go and Zen backends happens on the request model.
 	if options.ZenGatewayURL == "" {
-		options.ZenGatewayURL = DefaultZenGatewayURL
+		options.ZenGatewayURL = options.GatewayURL
 	}
 	if options.Now == nil {
 		options.Now = time.Now
@@ -355,7 +357,7 @@ func renderConfig(document tomlDocument, home, gatewayURL, zenGatewayURL string)
 // are kept.
 func stripStaleGatewayRouting(document tomlDocument, home string) (string, error) {
 	model, err := documentString(document, "", "model")
-	if err != nil || model != GoModelID {
+	if err != nil || (model != GoModelID && model != UntaggedGoModelID) {
 		return strings.Join(document.lines, ""), nil
 	}
 	provider, err := documentString(document, "", "model_provider")

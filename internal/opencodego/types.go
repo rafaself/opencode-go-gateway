@@ -13,6 +13,7 @@ import (
 
 const (
 	DefaultBaseURL                   = "https://opencode.ai/zen/go/v1"
+	DefaultZenBaseURL                = "https://opencode.ai/zen/v1"
 	DefaultModel                     = "deepseek-v4-flash"
 	DeepSeekV4ProModel               = "deepseek-v4-pro"
 	DeepSeekV4FlashFreeModel         = "deepseek-v4-flash-free"

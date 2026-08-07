@@ -109,9 +109,15 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		return
 	}
 
+	upstream, upstreamModel, err := s.resolveUpstream(request.Model)
+	if err != nil {
+		writeJSONErrorWithParam(w, http.StatusBadRequest, string(codex.ErrorInvalidRequest), "model", err.Error())
+		return
+	}
+
 	upstreamContext, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	response, err := s.upstream.Do(upstreamContext, request)
+	response, err := upstream.Do(upstreamContext, request)
 	if err != nil {
 		closeUpstreamResponse(response)
 		if r.Context().Err() != nil {
@@ -139,7 +145,7 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		// context is canceled independently by the watcher; inbound client and
 		// shutdown cancellation still cancel this request context immediately.
 		Context:                  r.Context(),
-		Model:                    s.config.Model,
+		Model:                    upstreamModel,
 		MaxAggregateBytes:        s.config.MaxSSEBufferedBytes,
 		MaxToolCallArgumentBytes: s.config.MaxToolCallArgumentBytes,
 		MaxOutputBytes:           s.config.MaxOutputBytes,
@@ -250,6 +256,22 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 			w.responseTerminal = responseTerminalType(event)
 			return
 		}
+	}
+}
+
+// resolveUpstream selects the backend for a tagged request model and returns
+// the client and the upstream model name for the session. The tag is the only
+// routing criterion; the label is client metadata and is never forwarded.
+func (s *Server) resolveUpstream(model string) (UpstreamClient, string, error) {
+	_, tag, ok := opencodego.SplitTaggedModel(model)
+	if !ok {
+		return nil, "", errors.New("the model must identify a gateway backend using a (go) or (zen) tag")
+	}
+	switch tag {
+	case opencodego.ProviderTagGo:
+		return s.upstream, s.config.Model, nil
+	default:
+		return s.zenUpstream, s.config.ZenModel, nil
 	}
 }
 

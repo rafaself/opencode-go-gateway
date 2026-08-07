@@ -34,7 +34,7 @@
         }
       ],
       "instructions": "<redacted:string>",
-      "model": "gpt-5.3-codex",
+      "model": "deepseek-v4-flash (go)",
       "parallel_tool_calls": false,
       "prompt_cache_key": "<redacted:string>",
       "reasoning": {"summary": "<redacted:string>"},

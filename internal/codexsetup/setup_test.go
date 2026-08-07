@@ -78,7 +78,7 @@ func TestSetupCodexCreatesSecureIdempotentFilesAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if zenProvider.Name != "OpenCode Gateway (Zen)" || zenProvider.BaseURL != DefaultZenGatewayURL || zenProvider.WireAPI != "responses" || zenProvider.SupportsWebsockets || zenProvider.RequestMaxRetries != 0 || zenProvider.StreamMaxRetries != 0 {
+	if zenProvider.Name != "OpenCode Gateway (Zen)" || zenProvider.BaseURL != DefaultGoGatewayURL || zenProvider.WireAPI != "responses" || zenProvider.SupportsWebsockets || zenProvider.RequestMaxRetries != 0 || zenProvider.StreamMaxRetries != 0 {
 		t.Fatalf("managed Zen provider values = %+v", zenProvider)
 	}
 	if strings.Contains(string(configData), "model_provider =") {

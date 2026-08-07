@@ -131,10 +131,9 @@ func TestRealGatewaySetupDoctorAndResponseFlow(t *testing.T) {
 				return "", false
 			}
 		}},
-		CodexHome:     home,
-		GatewayURL:    gatewayURL,
-		ZenGatewayURL: gatewayURL,
-		HTTPClient:    provider.Client(),
+		CodexHome:  home,
+		GatewayURL: gatewayURL,
+		HTTPClient: provider.Client(),
 	})
 	if report.Failures() != 0 {
 		t.Fatalf("doctor found failures against the real gateway: %+v", report.Checks)
@@ -152,9 +151,10 @@ func TestRealGatewaySetupDoctorAndResponseFlow(t *testing.T) {
 		}
 	}
 
-	// One real Responses request through the live gateway listener.
+	// One real Responses request through the live gateway listener. The
+	// tagged model routes through the Go backend.
 	request, err := http.NewRequest(http.MethodPost, gatewayURL+"/responses", strings.NewReader(
-		`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}`,
+		`{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}`,
 	))
 	if err != nil {
 		t.Fatal(err)

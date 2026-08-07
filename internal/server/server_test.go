@@ -164,7 +164,7 @@ func TestLogsContainRequestMetadataButNoSensitiveValues(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	server := newTestServer(t, logger)
-	secretBody := `{"model":"gpt-5.3-codex","instructions":"private prompt","input":[{"type":"message","role":"user","content":"private prompt"}],"stream":true}`
+	secretBody := `{"model":"deepseek-v4-flash (go)","instructions":"private prompt","input":[{"type":"message","role":"user","content":"private prompt"}],"stream":true}`
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/responses?secret=query", strings.NewReader(secretBody))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer header-secret")
@@ -188,7 +188,7 @@ func TestLogsContainRequestMetadataButNoSensitiveValues(t *testing.T) {
 }
 
 func textRequestBodyForServerTest() string {
-	return `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"stream":true}`
+	return `{"model":"deepseek-v4-flash (go)","input":[{"type":"message","role":"user","content":"hello"}],"stream":true}`
 }
 
 func TestLogsClassifyUnknownRoutesWithoutLoggingTheRawPath(t *testing.T) {

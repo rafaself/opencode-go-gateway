@@ -1,9 +1,12 @@
 # OpenCode Gateway
 
 OpenCode Gateway lets Codex CLI use models available through an OpenCode Go
-subscription. The v0.1.0 path translates Codex Responses traffic to OpenCode
-Go Chat Completions for `deepseek-v4-flash`, then translates the streamed
-provider response back to Codex Responses events.
+subscription and the OpenCode Zen endpoint. One local gateway serves both
+backends: each Responses request names a tagged model such as
+`deepseek-v4-flash (go)` or `deepseek-v4-flash (zen)`, and the gateway
+translates the Codex Responses traffic to the selected backend's Chat
+Completions stream and translates the streamed provider response back to
+Codex Responses events.
 
 This is an independent local gateway, not OpenCode CLI. It does not replace,
 invoke, or claim to be produced by OpenCode CLI, OpenAI, DeepSeek, or the Codex
@@ -13,10 +16,10 @@ apply patches to a user's filesystem.
 ## Architecture
 
 ```text
-┌──────────────┐  Codex Responses/SSE  ┌─────────────────────┐  Chat Completions/SSE  ┌────────────────┐
-│ Codex CLI    │ ────────────────────> │ OpenCode Gateway    │ ─────────────────────> │ OpenCode Go   │
-│ user config  │ <──────────────────── │ decode → bridge    │ <───────────────────── │ deepseek-v4   │
-└──────────────┘   Responses events   └──────────┬──────────┘   provider stream      └────────────────┘
+┌──────────────┐  Codex Responses/SSE  ┌─────────────────────┐  Chat Completions/SSE  ┌────────────────────┐
+│ Codex CLI    │ ────────────────────> │ OpenCode Gateway    │ ─────────────────────> │ OpenCode Go (go)  │
+│ user config  │ <──────────────────── │ decode → bridge →   │ <───────────────────── │ OpenCode Zen (zen)│
+└──────────────┘   Responses events   └──────────┬──────────┘   provider stream      └────────────────────┘
                                                  │
                                       loopback health and safe logs
 ```
@@ -165,24 +168,37 @@ behavior are in [docs/codex-setup.md](docs/codex-setup.md).
 ### Manual configuration
 
 If automation is unsuitable, add the equivalent managed values to the
-user-level Codex configuration, adjusting the catalog path for the platform:
+user-level Codex configuration, adjusting the catalog path for the platform.
+The tagged model selects the backend and must match a catalog entry:
 
 ```toml
-model = "deepseek-v4-flash"
-model_provider = "opencode-gateway"
+model = "deepseek-v4-flash (go)"
+model_provider = "opencode-gateway-go"
 model_catalog_json = "/absolute/path/to/.codex/models.json"
 model_reasoning_effort = "high"
 model_supports_reasoning_summaries = false
 model_reasoning_summary = "none"
 
-[model_providers.opencode-gateway]
-name = "OpenCode Gateway"
+[model_providers.opencode-gateway-go]
+name = "OpenCode Gateway (Go)"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.opencode-gateway-zen]
+name = "OpenCode Gateway (Zen)"
 base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
 supports_websockets = false
 request_max_retries = 0
 stream_max_retries = 0
 ```
+
+The same gateway URL serves both providers; `setup codex` writes these
+tables and the `codex --profile opencode-gateway-go` and `codex --profile
+opencode-gateway-zen-free` session profiles.
 
 Do not add `OPENCODE_GO_API_KEY` or another bearer credential to this file.
 The current Codex provider keys and profile rules are documented in

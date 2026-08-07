@@ -16,14 +16,15 @@ never become the destination accidentally. Tests and isolated environments can
 pass `--codex-home /absolute/path`.
 
 The command manages two provider tables in `config.toml`:
-`[model_providers.opencode-gateway-go]`, which routes Codex to the local
-gateway instance bound to the OpenCode Go endpoint, and
-`[model_providers.opencode-gateway-zen]`, which routes to the second gateway
-instance bound to the OpenCode Zen endpoint. The Zen backend serves both paid
-and free Zen models; free models are not a separate backend, they are model
-IDs selected by profile. The two gateway session profiles activate the
-backends: `codex --profile opencode-gateway-go` runs the paid DeepSeek V4
-Flash model, and `codex --profile opencode-gateway-zen-free` runs
+`[model_providers.opencode-gateway-go]` and
+`[model_providers.opencode-gateway-zen]`. Both point at the same local
+gateway instance (`http://127.0.0.1:8787/v1`); the gateway routes each
+request to the OpenCode Go endpoint or the OpenCode Zen endpoint based on the
+tag in the request model. The Zen backend serves both paid and free Zen
+models; free models are not a separate backend, they are model IDs selected
+by profile. The two gateway session profiles select the tagged models:
+`codex --profile opencode-gateway-go` runs the paid DeepSeek V4 Flash model
+through the Go backend, and `codex --profile opencode-gateway-zen-free` runs
 `deepseek-v4-flash-free` through the Zen backend. Existing tables, unknown
 settings, and comments remain in place where the TOML shape permits safe
 editing. The superseded `[model_providers.opencode-gateway]` table from
@@ -31,12 +32,13 @@ earlier setup revisions is removed so orphaned credentials and dead routing
 paths are not retained.
 
 The generated `models.json` is written next to the Codex config and contains
-the catalog metadata used by Codex for both models: text-only input, a
-1,048,576-token context window, low/high/max reasoning, parallel function
-tools, freeform `apply_patch`, no WebSocket transport, and the required
-`base_instructions` and `experimental_supported_tools` fields. The
-`deepseek-v4-flash-free` entry is the free Zen model; free models are
-time-limited and their data may be used to improve the model.
+the catalog metadata used by Codex for both tagged models — `deepseek-v4-flash
+(go)` and `deepseek-v4-flash (zen)` — text-only input, a 1,048,576-token
+context window, low/high/max reasoning, parallel function tools, freeform
+`apply_patch`, no WebSocket transport, and the required `base_instructions`
+and `experimental_supported_tools` fields. The tagged `(zen)` model is the
+free Zen model; free models are time-limited and their data may be used to
+improve the model.
 
 Before a change, setup creates a timestamped `backup-opencode-gateway-*`
 directory containing the previous managed files and a manifest. Both target

@@ -58,12 +58,26 @@ func RunWithBuildMetadata(ctx context.Context, settings config.Config, logger *s
 	if err != nil {
 		return fmt.Errorf("configure upstream client: %w", err)
 	}
+	zenUpstreamClient, err := opencodego.NewClient(opencodego.ClientConfig{
+		APIKey:                settings.APIKey(),
+		BaseURL:               settings.ZenBaseURL,
+		Model:                 settings.ZenModel,
+		UserAgent:             buildUserAgent(metadata),
+		DialTimeout:           settings.UpstreamConnectTimeout,
+		TLSHandshakeTimeout:   settings.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: settings.ResponseHeaderTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("configure zen upstream client: %w", err)
+	}
 
 	runtimeServer, err := server.New(server.Config{
 		ListenAddr:               settings.ListenAddr(),
 		AllowNonLoopback:         settings.AllowNonLoopback,
 		Model:                    settings.Model,
+		ZenModel:                 settings.ZenModel,
 		Upstream:                 server.NewOpenCodeUpstreamClient(upstreamClient),
+		ZenUpstream:              server.NewOpenCodeUpstreamClient(zenUpstreamClient),
 		ReadHeaderTimeout:        settings.ReadHeaderTimeout,
 		IdleTimeout:              settings.IdleTimeout,
 		RequestBodyReadTimeout:   settings.RequestBodyReadTimeout,

@@ -3,7 +3,7 @@
   "codex_version": "0.146.0",
   "unknown_fields": "reject",
   "top_level": {
-    "model": {"policy": "translate", "observed": true, "notes": "Selects the upstream model."},
+    "model": {"policy": "translate", "observed": true, "notes": "Fixture model is normalized to a tagged gateway model (\"deepseek-v4-flash (go)\" or \"deepseek-v4-flash (zen)\") that selects the backend; the untagged label is never forwarded upstream."},
     "instructions": {"policy": "translate", "observed": true, "notes": "Developer/system instruction block; prompt content is always redacted in fixtures."},
     "input": {"policy": "translate", "observed": true, "notes": "Conversation and tool-result items."},
     "tools": {"policy": "translate", "observed": true, "notes": "Function, custom, namespace, and web-search tool declarations."},

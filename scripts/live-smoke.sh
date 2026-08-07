@@ -125,7 +125,7 @@ reader_pid=$!
 		--ignore-user-config \
 		--ephemeral \
 		--skip-git-repo-check \
-		--model deepseek-v4-flash \
+		--model 'deepseek-v4-flash (go)' \
 		--sandbox read-only \
 		--color never \
 		--json \
