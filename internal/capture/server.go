@@ -288,6 +288,21 @@ func (s *Server) nextSequence() (int, error) {
 		lockPath := s.fixtureLockPath(sequence)
 		lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err == nil {
+			if _, statErr := os.Stat(s.fixturePath(sequence)); statErr == nil {
+				if closeErr := lock.Close(); closeErr != nil {
+					_ = os.Remove(lockPath)
+					return 0, closeErr
+				}
+				if removeErr := os.Remove(lockPath); removeErr != nil {
+					return 0, removeErr
+				}
+				sequence++
+				continue
+			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				_ = lock.Close()
+				_ = os.Remove(lockPath)
+				return 0, fmt.Errorf("check fixture sequence %d: %w", sequence, statErr)
+			}
 			if closeErr := lock.Close(); closeErr != nil {
 				_ = os.Remove(lockPath)
 				return 0, closeErr
