@@ -61,47 +61,93 @@ type ReasoningLevel struct {
 }
 
 func generatedCatalog() Catalog {
-	return Catalog{Models: []CatalogModel{{
-		Slug:                           ModelID,
-		PreferWebsockets:               false,
-		SupportVerbosity:               true,
-		DefaultVerbosity:               "low",
-		ApplyPatchToolType:             "freeform",
-		WebSearchToolType:              "text",
-		InputModalities:                []string{"text"},
-		SupportsImageDetailOriginal:    false,
-		TruncationPolicy:               TruncationPolicy{Mode: "tokens", Limit: 10000},
-		SupportsParallelToolCalls:      true,
-		ToolMode:                       nil,
-		MultiAgentVersion:              "v2",
-		UseResponsesLite:               false,
-		IncludeSkillsUsageInstructions: false,
-		AutoReviewModelOverride:        nil,
-		ContextWindow:                  1048576,
-		MaxContextWindow:               1048576,
-		EffectiveContextWindowPercent:  95,
-		AutoCompactTokenLimit:          nil,
-		CompHash:                       "3000",
-		ReasoningSummaryFormat:         "experimental",
-		DefaultReasoningSummary:        "none",
-		DisplayName:                    "DeepSeek-V4-Flash",
-		Description:                    "Latest frontier agentic coding model.",
-		DefaultReasoningLevel:          "high",
-		SupportedReasoningLevels: []ReasoningLevel{
-			{Effort: "low", Description: "Fast responses with lighter reasoning"},
-			{Effort: "high", Description: "Extra high reasoning depth for complex problems"},
-			{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
+	return Catalog{Models: []CatalogModel{
+		{
+			Slug:                           GoModelID,
+			PreferWebsockets:               false,
+			SupportVerbosity:               true,
+			DefaultVerbosity:               "low",
+			ApplyPatchToolType:             "freeform",
+			WebSearchToolType:              "text",
+			InputModalities:                []string{"text"},
+			SupportsImageDetailOriginal:    false,
+			TruncationPolicy:               TruncationPolicy{Mode: "tokens", Limit: 10000},
+			SupportsParallelToolCalls:      true,
+			ToolMode:                       nil,
+			MultiAgentVersion:              "v2",
+			UseResponsesLite:               false,
+			IncludeSkillsUsageInstructions: false,
+			AutoReviewModelOverride:        nil,
+			ContextWindow:                  1048576,
+			MaxContextWindow:               1048576,
+			EffectiveContextWindowPercent:  95,
+			AutoCompactTokenLimit:          nil,
+			CompHash:                       "3000",
+			ReasoningSummaryFormat:         "experimental",
+			DefaultReasoningSummary:        "none",
+			DisplayName:                    "DeepSeek-V4-Flash",
+			Description:                    "Latest frontier agentic coding model.",
+			DefaultReasoningLevel:          "high",
+			SupportedReasoningLevels: []ReasoningLevel{
+				{Effort: "low", Description: "Fast responses with lighter reasoning"},
+				{Effort: "high", Description: "Extra high reasoning depth for complex problems"},
+				{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
+			},
+			ShellType:                  "shell_command",
+			Visibility:                 "list",
+			MinimalClientVersion:       "0.144.0",
+			SupportedInAPI:             true,
+			AvailabilityNUX:            nil,
+			Upgrade:                    nil,
+			Priority:                   1,
+			BaseInstructions:           baseInstructions,
+			ExperimentalSupportedTools: []string{},
 		},
-		ShellType:                  "shell_command",
-		Visibility:                 "list",
-		MinimalClientVersion:       "0.144.0",
-		SupportedInAPI:             true,
-		AvailabilityNUX:            nil,
-		Upgrade:                    nil,
-		Priority:                   1,
-		BaseInstructions:           baseInstructions,
-		ExperimentalSupportedTools: []string{},
-	}}}
+		{
+			Slug:                           ZenFreeModelID,
+			PreferWebsockets:               false,
+			SupportVerbosity:               true,
+			DefaultVerbosity:               "low",
+			ApplyPatchToolType:             "freeform",
+			WebSearchToolType:              "text",
+			InputModalities:                []string{"text"},
+			SupportsImageDetailOriginal:    false,
+			TruncationPolicy:               TruncationPolicy{Mode: "tokens", Limit: 10000},
+			SupportsParallelToolCalls:      true,
+			ToolMode:                       nil,
+			MultiAgentVersion:              "v2",
+			UseResponsesLite:               false,
+			IncludeSkillsUsageInstructions: false,
+			AutoReviewModelOverride:        nil,
+			// The Zen free alias serves the same DeepSeek model with a reduced
+			// free-tier context window; Codex compacts conservatively when the
+			// declared window is smaller than the upstream capability.
+			ContextWindow:                 200000,
+			MaxContextWindow:              200000,
+			EffectiveContextWindowPercent: 95,
+			AutoCompactTokenLimit:         nil,
+			CompHash:                      "3000",
+			ReasoningSummaryFormat:        "experimental",
+			DefaultReasoningSummary:       "none",
+			DisplayName:                   "DeepSeek-V4-Flash-Free",
+			Description:                   "Free DeepSeek V4 Flash served by OpenCode Zen while the free tier is available.",
+			DefaultReasoningLevel:         "high",
+			SupportedReasoningLevels: []ReasoningLevel{
+				{Effort: "low", Description: "Fast responses with lighter reasoning"},
+				{Effort: "high", Description: "Extra high reasoning depth for complex problems"},
+				{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
+			},
+			ShellType:                  "shell_command",
+			Visibility:                 "list",
+			MinimalClientVersion:       "0.144.0",
+			SupportedInAPI:             true,
+			AvailabilityNUX:            nil,
+			Upgrade:                    nil,
+			Priority:                   2,
+			BaseInstructions:           baseInstructions,
+			ExperimentalSupportedTools: []string{},
+		},
+	}}
 }
 
 // baseInstructions is the fixed model-role instruction Codex requires in the
@@ -120,8 +166,9 @@ func GenerateCatalog() ([]byte, error) {
 }
 
 // ValidateCatalog verifies JSON syntax and the fields Codex needs for this
-// provider. Unknown fields remain accepted so a future Codex catalog can be
-// inspected without being rejected by this gateway.
+// provider. It requires both managed models with the full supported metadata.
+// Unknown fields remain accepted so a future Codex catalog can be inspected
+// without being rejected by this gateway.
 func ValidateCatalog(data []byte) (Catalog, error) {
 	var catalog Catalog
 	if err := json.Unmarshal(data, &catalog); err != nil {
@@ -130,6 +177,7 @@ func ValidateCatalog(data []byte) (Catalog, error) {
 	if len(catalog.Models) == 0 {
 		return Catalog{}, fmt.Errorf("model catalog has no models")
 	}
+	seen := make(map[string]bool, len(catalog.Models))
 	for _, model := range catalog.Models {
 		if model.Slug == "" || model.DisplayName == "" {
 			return Catalog{}, fmt.Errorf("model catalog contains a model without slug or display name")
@@ -137,26 +185,26 @@ func ValidateCatalog(data []byte) (Catalog, error) {
 		if model.BaseInstructions == "" {
 			return Catalog{}, fmt.Errorf("model catalog contains a model without base instructions")
 		}
-		if model.Slug != ModelID {
+		if model.Slug != GoModelID && model.Slug != ZenFreeModelID {
 			continue
 		}
 		if model.ContextWindow <= 0 || model.MaxContextWindow < model.ContextWindow {
-			return Catalog{}, fmt.Errorf("model %q has invalid context window", ModelID)
+			return Catalog{}, fmt.Errorf("model %q has invalid context window", model.Slug)
 		}
 		if model.EffectiveContextWindowPercent <= 0 || model.EffectiveContextWindowPercent > 100 || model.TruncationPolicy.Mode != "tokens" || model.TruncationPolicy.Limit <= 0 {
-			return Catalog{}, fmt.Errorf("model %q has invalid compaction metadata", ModelID)
+			return Catalog{}, fmt.Errorf("model %q has invalid compaction metadata", model.Slug)
 		}
 		if len(model.InputModalities) != 1 || model.InputModalities[0] != "text" {
-			return Catalog{}, fmt.Errorf("model %q must declare text-only input", ModelID)
+			return Catalog{}, fmt.Errorf("model %q must declare text-only input", model.Slug)
 		}
 		if model.PreferWebsockets || model.ApplyPatchToolType != "freeform" || model.WebSearchToolType != "text" || !model.SupportsParallelToolCalls {
-			return Catalog{}, fmt.Errorf("model %q has incompatible tool or transport capabilities", ModelID)
+			return Catalog{}, fmt.Errorf("model %q has incompatible tool or transport capabilities", model.Slug)
 		}
 		if !model.SupportedInAPI || model.DefaultReasoningSummary != "none" || model.ReasoningSummaryFormat == "" {
-			return Catalog{}, fmt.Errorf("model %q has incompatible reasoning or availability metadata", ModelID)
+			return Catalog{}, fmt.Errorf("model %q has incompatible reasoning or availability metadata", model.Slug)
 		}
 		if model.DefaultReasoningLevel == "" || len(model.SupportedReasoningLevels) == 0 {
-			return Catalog{}, fmt.Errorf("model %q has no reasoning levels", ModelID)
+			return Catalog{}, fmt.Errorf("model %q has no reasoning levels", model.Slug)
 		}
 		foundDefault := false
 		for _, effort := range model.SupportedReasoningLevels {
@@ -165,9 +213,14 @@ func ValidateCatalog(data []byte) (Catalog, error) {
 			}
 		}
 		if !foundDefault {
-			return Catalog{}, fmt.Errorf("model %q default reasoning level is unsupported", ModelID)
+			return Catalog{}, fmt.Errorf("model %q default reasoning level is unsupported", model.Slug)
 		}
-		return catalog, nil
+		seen[model.Slug] = true
 	}
-	return Catalog{}, fmt.Errorf("model catalog does not include %q", ModelID)
+	for _, slug := range []string{GoModelID, ZenFreeModelID} {
+		if !seen[slug] {
+			return Catalog{}, fmt.Errorf("model catalog does not include %q", slug)
+		}
+	}
+	return catalog, nil
 }

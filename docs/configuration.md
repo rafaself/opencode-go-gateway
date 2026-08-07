@@ -19,6 +19,7 @@ embedding.
 | --- | ---: | --- | --- |
 | `OPENCODE_GO_API_KEY` | optional when stored | string | OpenCode Go credential; environment value takes precedence and is never printed |
 | `OPENCODE_GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | URL | OpenCode Go Chat Completions base URL |
+| `OPENCODE_GO_MODEL` | `deepseek-v4-flash` | enum | Upstream model; also accepts the free `deepseek-v4-flash-free` for a Zen backend instance (`OPENCODE_GO_BASE_URL=https://opencode.ai/zen/v1`) |
 | `OPENCODE_GATEWAY_HOST` | `127.0.0.1` | host | Local bind host |
 | `OPENCODE_GATEWAY_PORT` | `8787` | port | Local bind port; `0` selects an ephemeral port |
 | `OPENCODE_GATEWAY_ALLOW_NON_LOOPBACK` | `false` | boolean | Explicitly permits a non-loopback bind; use only with a separately secured network boundary |

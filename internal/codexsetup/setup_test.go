@@ -54,7 +54,7 @@ func TestSetupCodexCreatesSecureIdempotentFilesAndBackup(t *testing.T) {
 	if !result.Changed || result.BackupPath == "" {
 		t.Fatalf("setup result = %+v, want changed setup with backup", result)
 	}
-	for _, path := range []string{result.ConfigPath, result.CatalogPath} {
+	for _, path := range []string{result.ConfigPath, result.CatalogPath, result.ProfilePath, result.ZenFreeProfilePath, result.AgentPath} {
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)
@@ -67,12 +67,54 @@ func TestSetupCodexCreatesSecureIdempotentFilesAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	values, err := InspectConfig(configData)
+	provider, err := InspectProvider(configData)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if values.Model != ModelID || values.ModelProvider != ProviderID || values.ProviderBaseURL != DefaultGatewayURL || values.ProviderWireAPI != "responses" || values.RequestMaxRetries != 0 || values.StreamMaxRetries != 0 {
-		t.Fatalf("managed config values = %+v", values)
+	if provider.Name != "OpenCode Gateway (Go)" || provider.BaseURL != DefaultGoGatewayURL || provider.WireAPI != "responses" || provider.SupportsWebsockets || provider.RequestMaxRetries != 0 || provider.StreamMaxRetries != 0 {
+		t.Fatalf("managed Go provider values = %+v", provider)
+	}
+	zenProvider, err := InspectProviderFor(configData, ZenProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zenProvider.Name != "OpenCode Gateway (Zen)" || zenProvider.BaseURL != DefaultZenGatewayURL || zenProvider.WireAPI != "responses" || zenProvider.SupportsWebsockets || zenProvider.RequestMaxRetries != 0 || zenProvider.StreamMaxRetries != 0 {
+		t.Fatalf("managed Zen provider values = %+v", zenProvider)
+	}
+	if strings.Contains(string(configData), "model_provider =") {
+		t.Fatalf("default config still routes a root model_provider:\n%s", configData)
+	}
+	profileData, err := os.ReadFile(result.ProfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := InspectProfile(profileData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.Model != GoModelID || values.ModelProvider != GoProviderID || values.ModelCatalogJSON != filepath.Join(home, CatalogFileName) {
+		t.Fatalf("profile values = %+v", values)
+	}
+	zenFreeProfileData, err := os.ReadFile(result.ZenFreeProfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zenFreeValues, err := InspectProfile(zenFreeProfileData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zenFreeValues.Model != ZenFreeModelID || zenFreeValues.ModelProvider != ZenProviderID || zenFreeValues.ModelCatalogJSON != filepath.Join(home, CatalogFileName) {
+		t.Fatalf("Zen Free profile values = %+v", zenFreeValues)
+	}
+	agentData, err := os.ReadFile(result.AgentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateSubagentData(agentData); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(agentData), subagentName) == false {
+		t.Fatalf("subagent file does not define %s:\n%s", subagentName, agentData)
 	}
 	catalogData, err := os.ReadFile(result.CatalogPath)
 	if err != nil {
@@ -81,8 +123,10 @@ func TestSetupCodexCreatesSecureIdempotentFilesAndBackup(t *testing.T) {
 	if _, err := ValidateCatalog(catalogData); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(configData), "OPENCODE_GO_API_KEY") || strings.Contains(string(catalogData), "OPENCODE_GO_API_KEY") {
-		t.Fatal("generated Codex files mention the gateway credential")
+	for _, content := range []string{string(configData), string(catalogData), string(profileData), string(agentData)} {
+		if strings.Contains(content, "OPENCODE_GO_API_KEY") {
+			t.Fatal("generated Codex files mention the gateway credential")
+		}
 	}
 
 	repeated, err := SetupCodex(SetupOptions{CodexHome: home, Now: func() time.Time { return fixedTime }})
@@ -92,8 +136,10 @@ func TestSetupCodexCreatesSecureIdempotentFilesAndBackup(t *testing.T) {
 	if repeated.Changed || repeated.BackupPath != "" || repeated.Diff != "no changes" {
 		t.Fatalf("repeated setup = %+v, want no changes", repeated)
 	}
-	if got := strings.Count(string(configData), "[model_providers."+ProviderID+"]"); got != 1 {
-		t.Fatalf("provider table count = %d, want 1", got)
+	for _, providerID := range []string{GoProviderID, ZenProviderID} {
+		if got := strings.Count(string(configData), "[model_providers."+providerID+"]"); got != 1 {
+			t.Fatalf("provider table %s count = %d, want 1", providerID, got)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(result.BackupPath, "manifest.json")); err != nil {
 		t.Fatalf("backup manifest: %v", err)
@@ -112,7 +158,7 @@ name = "array table remains"
 [model_providers.openai]
 name = "built-in remains untouched"
 
-[model_providers.opencode-gateway]
+[model_providers.opencode-gateway-go]
 # retain this provider comment
 name = "old name" # retain inline comment
 base_url = "http://127.0.0.1:9999/v1"
@@ -139,11 +185,113 @@ custom_setting = "preserve"
 	if strings.Contains(content, "do-not-copy") || strings.Contains(content, "experimental_bearer_token") {
 		t.Fatalf("gateway credential field survived setup:\n%s", content)
 	}
-	if got := strings.Count(content, "[model_providers."+ProviderID+"]"); got != 1 {
-		t.Fatalf("provider table count = %d", got)
+	for _, providerID := range []string{GoProviderID, ZenProviderID} {
+		if got := strings.Count(content, "[model_providers."+providerID+"]"); got != 1 {
+			t.Fatalf("provider table %s count = %d, want 1", providerID, got)
+		}
 	}
-	if got := strings.Count(content, "model_provider ="); got != 1 {
-		t.Fatalf("model_provider assignment count = %d", got)
+	if got := strings.Count(content, "model_provider ="); got != 0 {
+		t.Fatalf("gateway routing was introduced into the default config: %d assignment(s)", got)
+	}
+}
+
+func TestSetupCodexRemovesLegacySingleProviderTable(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ConfigFileName)
+	legacy := `[model_providers.opencode-gateway]
+name = "old name"
+base_url = "http://127.0.0.1:8787/v1"
+experimental_bearer_token = "do-not-copy"
+custom_setting = "preserve"
+
+[model_providers.openai]
+name = "built-in remains untouched"
+`
+	if err := os.WriteFile(configPath, []byte(legacy), managedFileMode); err != nil {
+		t.Fatal(err)
+	}
+	result, err := SetupCodex(SetupOptions{CodexHome: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if strings.Contains(content, "[model_providers."+LegacyProviderID+"]") || strings.Contains(content, "do-not-copy") || strings.Contains(content, "experimental_bearer_token") {
+		t.Fatalf("legacy provider table or credential survived setup:\n%s", content)
+	}
+	if !strings.Contains(content, "name = \"built-in remains untouched\"") {
+		t.Fatalf("unrelated provider table was lost:\n%s", content)
+	}
+}
+
+func TestSetupCodexStripsStaleDefaultGatewayRouting(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ConfigFileName)
+	stale := `unrelated = "keep me"
+
+model = "deepseek-v4-flash"
+model_provider = "opencode-gateway"
+model_catalog_json = "` + filepath.Join(home, CatalogFileName) + `"
+model_reasoning_effort = "high"
+model_supports_reasoning_summaries = false
+model_reasoning_summary = "none"
+
+[model_providers.opencode-gateway]
+name = "old"
+base_url = "http://127.0.0.1:9999/v1"
+`
+	if err := os.WriteFile(configPath, []byte(stale), managedFileMode); err != nil {
+		t.Fatal(err)
+	}
+	result, err := SetupCodex(SetupOptions{CodexHome: home, GatewayURL: "http://127.0.0.1:9998/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "unrelated = \"keep me\"") {
+		t.Fatalf("stale config lost unrelated source:\n%s", content)
+	}
+	for _, staleKey := range []string{"model =", "model_provider =", "model_catalog_json =", "model_reasoning_effort =", "model_supports_reasoning_summaries =", "model_reasoning_summary ="} {
+		if strings.Contains(content, staleKey) {
+			t.Fatalf("stale gateway routing key %q survived setup:\n%s", staleKey, content)
+		}
+	}
+	if strings.Contains(content, "[model_providers."+LegacyProviderID+"]") {
+		t.Fatalf("legacy provider table survived setup:\n%s", content)
+	}
+	profileData, err := os.ReadFile(result.ProfilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectProfile(profileData); err != nil {
+		t.Fatalf("profile did not receive the migrated gateway routing: %v", err)
+	}
+}
+
+func TestSetupCodexPreservesCustomizedDefaultRouting(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ConfigFileName)
+	custom := "model = \"gpt-5.5\"\nmodel_provider = \"openai\"\n"
+	if err := os.WriteFile(configPath, []byte(custom), managedFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetupCodex(SetupOptions{CodexHome: home}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "model = \"gpt-5.5\"") || !strings.Contains(content, "model_provider = \"openai\"") {
+		t.Fatalf("user-customized default routing was overwritten:\n%s", content)
 	}
 }
 
@@ -219,8 +367,10 @@ func TestSetupCodexDryRunDoesNotWriteOrRevealSecrets(t *testing.T) {
 	if got, err := os.ReadFile(configPath); err != nil || string(got) != original {
 		t.Fatalf("dry-run changed config: %q, err=%v", got, err)
 	}
-	if _, err := os.Stat(filepath.Join(home, CatalogFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("dry-run catalog state error = %v", err)
+	for _, absent := range []string{CatalogFileName, GoProfileFileName, ZenFreeProfileFileName, filepath.Join(AgentsDirName, SubagentFileName)} {
+		if _, err := os.Stat(filepath.Join(home, absent)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dry-run created %s: %v", absent, err)
+		}
 	}
 	entries, err := os.ReadDir(home)
 	if err != nil {
@@ -333,6 +483,11 @@ func TestSetupCodexSupportsUnicodeHomeAndRestore(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, CatalogFileName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("restore retained generated catalog: %v", err)
 	}
+	for _, absent := range []string{GoProfileFileName, ZenFreeProfileFileName, filepath.Join(AgentsDirName, SubagentFileName)} {
+		if _, err := os.Stat(filepath.Join(home, absent)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("restore retained generated %s: %v", absent, err)
+		}
+	}
 }
 
 func TestValidateCatalogRejectsMissingModelAndAcceptsGeneratedCatalog(t *testing.T) {
@@ -344,7 +499,7 @@ func TestValidateCatalogRejectsMissingModelAndAcceptsGeneratedCatalog(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.Models) != 1 || catalog.Models[0].BaseInstructions == "" || catalog.Models[0].ExperimentalSupportedTools == nil {
+	if len(catalog.Models) != 2 || catalog.Models[0].BaseInstructions == "" || catalog.Models[0].ExperimentalSupportedTools == nil {
 		t.Fatal("generated catalog is missing the base instructions or experimental tools field")
 	}
 	if _, err := ValidateCatalog([]byte(`{"models":[{"slug":"other","display_name":"Other"}]}`)); err == nil {

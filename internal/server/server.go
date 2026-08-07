@@ -45,6 +45,7 @@ const (
 type Config struct {
 	ListenAddr               string
 	AllowNonLoopback         bool
+	Model                    string
 	Upstream                 UpstreamClient
 	ReadHeaderTimeout        time.Duration
 	IdleTimeout              time.Duration
@@ -190,6 +191,9 @@ func New(config Config, logger *slog.Logger) (*Server, error) {
 func withDefaults(config Config) Config {
 	if config.ListenAddr == "" {
 		config.ListenAddr = "127.0.0.1:0"
+	}
+	if config.Model == "" {
+		config.Model = opencodego.DefaultModel
 	}
 	if config.ReadHeaderTimeout == 0 {
 		config.ReadHeaderTimeout = defaultReadHeaderTimeout

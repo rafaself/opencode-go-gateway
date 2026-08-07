@@ -119,10 +119,10 @@ func TestSetupCodexCommandWritesUserConfigWithoutGatewayKey(t *testing.T) {
 	if err := execute([]string{"setup", "codex", "--codex-home", home}, &stdout, &stderr); err != nil {
 		t.Fatalf("setup codex error = %v; stderr=%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Backup:") || strings.Contains(stdout.String(), "OPENCODE_GO_API_KEY") {
+	if !strings.Contains(stdout.String(), "Backup:") || !strings.Contains(stdout.String(), "--profile opencode-gateway") || strings.Contains(stdout.String(), "OPENCODE_GO_API_KEY") {
 		t.Fatalf("setup output = %s", stdout.String())
 	}
-	for _, name := range []string{"config.toml", "models.json"} {
+	for _, name := range []string{"config.toml", "models.json", "opencode-gateway-go.config.toml", "opencode-gateway-zen-free.config.toml", filepath.Join("agents", "deepseek-worker.toml")} {
 		if _, err := os.Stat(filepath.Join(home, name)); err != nil {
 			t.Fatalf("setup did not create %s: %v", name, err)
 		}

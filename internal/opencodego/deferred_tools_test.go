@@ -6,10 +6,15 @@ import (
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
 )
 
-func TestMapRequestAcceptsOnlyCapturedDeferredToolIdentities(t *testing.T) {
+func TestMapRequestAcceptsDeferredNamespaceAndWebSearchDeclarations(t *testing.T) {
 	for _, tool := range []bridge.DeferredTool{
 		{ToolKind: bridge.ToolNamespace, Name: "mcp"},
+		{ToolKind: bridge.ToolNamespace, Name: "collaboration"},
+		{ToolKind: bridge.ToolNamespace, Name: "followup_task"},
+		{ToolKind: bridge.ToolNamespace, Name: "mcp__codex_apps__github"},
+		{ToolKind: bridge.ToolNamespace, Name: "secret_namespace"},
 		{ToolKind: bridge.ToolWebSearch},
+		{ToolKind: bridge.ToolWebSearch, Name: "secret_search"},
 	} {
 		t.Run(string(tool.ToolKind)+"/"+tool.Name, func(t *testing.T) {
 			request := minimalRequest()
@@ -21,17 +26,16 @@ func TestMapRequestAcceptsOnlyCapturedDeferredToolIdentities(t *testing.T) {
 			request.ToolRegistry = registry
 
 			if _, err := MapRequest(request, DefaultModel); err != nil {
-				t.Fatalf("captured deferred tool was rejected: %v", err)
+				t.Fatalf("deferred namespace or web-search declaration was rejected: %v", err)
 			}
 		})
 	}
 }
 
-func TestMapRequestRejectsArbitraryDeferredToolIdentities(t *testing.T) {
+func TestMapRequestRejectsUnknownDeferredToolKinds(t *testing.T) {
 	for _, tool := range []bridge.DeferredTool{
-		{ToolKind: bridge.ToolNamespace, Name: "secret_namespace"},
-		{ToolKind: bridge.ToolWebSearch, Name: "secret_search"},
 		{ToolKind: bridge.ToolCustom, Name: "mcp"},
+		{ToolKind: bridge.ToolFunction, Name: "apply_patch"},
 	} {
 		t.Run(string(tool.ToolKind)+"/"+tool.Name, func(t *testing.T) {
 			request := minimalRequest()

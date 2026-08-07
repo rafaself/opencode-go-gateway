@@ -70,15 +70,16 @@ func (report DoctorReport) ExitCode() int {
 }
 
 type DoctorOptions struct {
-	Environment Environment
-	CodexHome   string
-	GatewayURL  string
-	HTTPClient  HTTPDoer
-	LookupPath  func(string) (string, error)
-	RunCommand  func(context.Context, string, ...string) ([]byte, error)
-	Dial        func(context.Context, string, string) (net.Conn, error)
-	Listen      func(string, string) (net.Listener, error)
-	Timeout     time.Duration
+	Environment   Environment
+	CodexHome     string
+	GatewayURL    string
+	ZenGatewayURL string
+	HTTPClient    HTTPDoer
+	LookupPath    func(string) (string, error)
+	RunCommand    func(context.Context, string, ...string) ([]byte, error)
+	Dial          func(context.Context, string, string) (net.Conn, error)
+	Listen        func(string, string) (net.Listener, error)
+	Timeout       time.Duration
 }
 
 type HTTPDoer interface {
@@ -151,9 +152,7 @@ func Diagnose(ctx context.Context, options DoctorOptions) DoctorReport {
 		report.add(SeverityPass, "OpenCode Go API key", "credential is present (value hidden)")
 	}
 
-	configPath := filepath.Join(home, ConfigFileName)
-	catalogPath := filepath.Join(home, CatalogFileName)
-	configValues, configValuesOK := diagnoseCodexFiles(&report, home, configPath, catalogPath)
+	goProviderValues, zenProviderValues, providerOK := diagnoseCodexSetup(&report, home)
 
 	gatewayURL := options.GatewayURL
 	if gatewayURL == "" {
@@ -165,39 +164,17 @@ func Diagnose(ctx context.Context, options DoctorOptions) DoctorReport {
 	} else {
 		report.add(SeverityPass, "Gateway provider URL", "provider URL is valid")
 	}
-	if configValuesOK {
-		if configValues.ProviderName != "OpenCode Gateway" {
-			report.add(SeverityFailure, "Codex provider name", "managed provider name is not OpenCode Gateway")
-		} else {
-			report.add(SeverityPass, "Codex provider name", "managed provider name is correct")
-		}
-		if err := validateGatewayURL(configValues.ProviderBaseURL); err != nil {
+	if providerOK {
+		if err := validateGatewayURL(goProviderValues.BaseURL); err != nil {
 			report.add(SeverityFailure, "Codex provider URL", "configured provider URL is not safe")
-		} else if options.GatewayURL == "" && configValues.ProviderBaseURL != gatewayURL {
+		} else if options.GatewayURL == "" && goProviderValues.BaseURL != gatewayURL {
 			report.add(SeverityFailure, "Codex provider URL", "provider URL differs from the local gateway address")
 		}
-		if configValues.Model != ModelID || configValues.ModelProvider != ProviderID {
-			report.add(SeverityFailure, "Codex model selection", "Codex is not selecting the gateway provider and deepseek-v4-flash")
-		} else {
-			report.add(SeverityPass, "Codex model selection", "deepseek-v4-flash is selected through opencode-gateway")
-		}
-		if configValues.ModelSupportsReasoningSummary || configValues.ModelReasoningEffort != "high" || configValues.ModelReasoningSummary != "none" {
-			report.add(SeverityFailure, "Codex reasoning policy", "gateway v0.1 requires high effort without reasoning summaries")
-		} else {
-			report.add(SeverityPass, "Codex reasoning policy", "reasoning summaries are disabled")
-		}
-		if options.GatewayURL != "" && configValues.ProviderBaseURL != options.GatewayURL {
+		if options.GatewayURL != "" && goProviderValues.BaseURL != options.GatewayURL {
 			report.add(SeverityFailure, "Gateway provider URL", "Codex provider URL does not match the requested gateway URL")
 		}
-		if configValues.ProviderWireAPI != "responses" {
-			report.add(SeverityFailure, "Codex wire API", "gateway provider must use the Responses wire API")
-		} else {
-			report.add(SeverityPass, "Codex wire API", "Responses wire API is configured")
-		}
-		if configValues.ProviderSupportsWebsockets || configValues.RequestMaxRetries != 0 || configValues.StreamMaxRetries != 0 {
-			report.add(SeverityFailure, "Codex transport policy", "WebSockets and provider retries must be disabled for gateway v0.1")
-		} else {
-			report.add(SeverityPass, "Codex transport policy", "WebSockets and provider retries are disabled")
+		if options.ZenGatewayURL != "" && zenProviderValues.BaseURL != options.ZenGatewayURL {
+			report.add(SeverityFailure, "Gateway Zen provider URL", "Codex provider URL does not match the requested Zen gateway URL")
 		}
 	}
 
@@ -219,32 +196,123 @@ func doctorHome(options DoctorOptions) (string, error) {
 	return ResolveCodexHome(options.Environment)
 }
 
-func diagnoseCodexFiles(report *DoctorReport, home, configPath, defaultCatalogPath string) (ConfigValues, bool) {
+func diagnoseCodexSetup(report *DoctorReport, home string) (goProvider ProviderValues, zenProvider ProviderValues, ok bool) {
+	configPath := filepath.Join(home, ConfigFileName)
 	configInfo, err := os.Stat(configPath)
 	if errors.Is(err, os.ErrNotExist) {
 		report.add(SeverityFailure, "Codex config", "config.toml does not exist")
-		return ConfigValues{}, false
+		return ProviderValues{}, ProviderValues{}, false
 	}
 	if err != nil || !configInfo.Mode().IsRegular() {
 		report.add(SeverityFailure, "Codex config", "config.toml is not a readable regular file")
-		return ConfigValues{}, false
+		return ProviderValues{}, ProviderValues{}, false
 	}
 	diagnosePermissions(report, "Codex config permissions", configInfo.Mode())
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		report.add(SeverityFailure, "Codex config", "config.toml could not be read")
-		return ConfigValues{}, false
+		return ProviderValues{}, ProviderValues{}, false
 	}
-	values, err := InspectConfig(configData)
+	values, err := InspectProvider(configData)
 	if err != nil {
-		report.add(SeverityFailure, "Codex config", "config.toml failed validation")
-		return ConfigValues{}, false
+		report.add(SeverityFailure, "Codex config", "config.toml does not declare the managed "+GoProviderID+" provider")
+		return ProviderValues{}, ProviderValues{}, false
 	}
-	report.add(SeverityPass, "Codex config", "config.toml parses and contains the managed provider")
+	report.add(SeverityPass, "Codex config", "config.toml parses and declares the managed gateway providers")
+	if configForcesDefaultGateway(configData) {
+		report.add(SeverityWarning, "Codex default routing", "config.toml still routes the default session through opencode-gateway; re-run setup codex to restore built-in models")
+	}
+	diagnoseProviderTable(report, configData, GoProviderID, "OpenCode Gateway (Go)", "Gateway Go provider")
+	diagnoseProviderTable(report, configData, ZenProviderID, "OpenCode Gateway (Zen)", "Gateway Zen provider")
+	zenValues, err := InspectProviderFor(configData, ZenProviderID)
+	if err != nil {
+		report.add(SeverityFailure, "Gateway Zen provider", "config.toml does not declare the managed "+ZenProviderID+" provider")
+	} else {
+		if err := validateGatewayURL(zenValues.BaseURL); err != nil {
+			report.add(SeverityFailure, "Gateway Zen provider URL", "configured provider URL is not safe")
+		} else {
+			report.add(SeverityPass, "Gateway Zen provider URL", "provider URL is a safe local HTTP or HTTPS URL")
+		}
+	}
+
+	diagnoseProfile(report, home, filepath.Join(home, CatalogFileName), GoProfileFileName, GoProviderID, GoModelID)
+	diagnoseProfile(report, home, filepath.Join(home, CatalogFileName), ZenFreeProfileFileName, ZenProviderID, ZenFreeModelID)
+	diagnoseSubagent(report, home)
+	return values, zenValues, true
+}
+
+// diagnoseProviderTable runs the shared managed-provider policy checks for one
+// provider table.
+func diagnoseProviderTable(report *DoctorReport, configData []byte, providerID, wantName, checkPrefix string) {
+	values, err := InspectProviderFor(configData, providerID)
+	if err != nil {
+		report.add(SeverityFailure, checkPrefix, "config.toml does not declare the managed "+providerID+" provider")
+		return
+	}
+	if values.Name != wantName {
+		report.add(SeverityFailure, checkPrefix+" name", "managed provider name is not "+wantName)
+	} else {
+		report.add(SeverityPass, checkPrefix+" name", "managed provider name is correct")
+	}
+	if values.WireAPI != "responses" {
+		report.add(SeverityFailure, checkPrefix+" wire API", "gateway provider must use the Responses wire API")
+	} else {
+		report.add(SeverityPass, checkPrefix+" wire API", "Responses wire API is configured")
+	}
+	if values.SupportsWebsockets || values.RequestMaxRetries != 0 || values.StreamMaxRetries != 0 {
+		report.add(SeverityFailure, checkPrefix+" transport policy", "WebSockets and provider retries must be disabled for gateway v0.1")
+	} else {
+		report.add(SeverityPass, checkPrefix+" transport policy", "WebSockets and provider retries are disabled")
+	}
+}
+
+// configForcesDefaultGateway reports whether the default Codex session still
+// routes through the gateway, which is no longer the managed layout.
+func configForcesDefaultGateway(data []byte) bool {
+	document, err := parseTOML(string(data))
+	if err != nil {
+		return false
+	}
+	model, err := documentString(document, "", "model")
+	if err != nil || model != GoModelID {
+		return false
+	}
+	provider, err := documentString(document, "", "model_provider")
+	return err == nil && provider == GoProviderID
+}
+
+func diagnoseProfile(report *DoctorReport, home, defaultCatalogPath, profileFileName, providerID, modelID string) {
+	profilePath := filepath.Join(home, profileFileName)
+	info, err := os.Stat(profilePath)
+	if errors.Is(err, os.ErrNotExist) {
+		report.add(SeverityFailure, "Gateway profile", profileFileName+" does not exist; run setup codex")
+		return
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		report.add(SeverityFailure, "Gateway profile", profileFileName+" is not a readable regular file")
+		return
+	}
+	diagnosePermissions(report, "Gateway profile permissions", info.Mode())
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		report.add(SeverityFailure, "Gateway profile", profileFileName+" could not be read")
+		return
+	}
+	values, err := InspectProfile(data)
+	if err != nil {
+		report.add(SeverityFailure, "Gateway profile", profileFileName+" failed validation")
+		return
+	}
+	report.add(SeverityPass, "Gateway profile", "profile activates with `codex --profile "+strings.TrimSuffix(profileFileName, ".config.toml")+"`")
+	if values.Model != modelID || values.ModelProvider != providerID {
+		report.add(SeverityFailure, "Codex model selection", "profile is not selecting "+providerID+" and "+modelID)
+	} else {
+		report.add(SeverityPass, "Codex model selection", modelID+" is selected through "+providerID)
+	}
 	catalogPath, err := resolveCatalogPath(home, values.ModelCatalogJSON)
 	if err != nil {
 		report.add(SeverityFailure, "Model catalog path", "model_catalog_json is not a safe path")
-		return values, true
+		return
 	}
 	if catalogPath == "" {
 		catalogPath = defaultCatalogPath
@@ -252,24 +320,61 @@ func diagnoseCodexFiles(report *DoctorReport, home, configPath, defaultCatalogPa
 	catalogInfo, err := os.Stat(catalogPath)
 	if errors.Is(err, os.ErrNotExist) {
 		report.add(SeverityFailure, "Model catalog", "models.json does not exist")
-		return values, true
+		return
 	}
 	if err != nil || !catalogInfo.Mode().IsRegular() {
 		report.add(SeverityFailure, "Model catalog", "models.json is not a readable regular file")
-		return values, true
+		return
 	}
 	diagnosePermissions(report, "Model catalog permissions", catalogInfo.Mode())
 	catalogData, err := os.ReadFile(catalogPath)
 	if err != nil {
 		report.add(SeverityFailure, "Model catalog", "models.json could not be read")
-		return values, true
+		return
 	}
-	if _, err := ValidateCatalog(catalogData); err != nil {
-		report.add(SeverityFailure, "Model catalog", "models.json failed validation or does not contain deepseek-v4-flash")
+	catalog, err := ValidateCatalog(catalogData)
+	if err != nil {
+		report.add(SeverityFailure, "Model catalog", "models.json failed validation or does not contain the gateway models")
+		return
+	}
+	if catalogContains(catalog, modelID) {
+		report.add(SeverityPass, "Model catalog", "models.json contains "+modelID+" metadata")
 	} else {
-		report.add(SeverityPass, "Model catalog", "models.json contains deepseek-v4-flash metadata")
+		report.add(SeverityFailure, "Model catalog", "models.json does not contain "+modelID)
 	}
-	return values, true
+}
+
+func catalogContains(catalog Catalog, slug string) bool {
+	for _, model := range catalog.Models {
+		if model.Slug == slug {
+			return true
+		}
+	}
+	return false
+}
+
+func diagnoseSubagent(report *DoctorReport, home string) {
+	agentPath := filepath.Join(home, AgentsDirName, SubagentFileName)
+	info, err := os.Stat(agentPath)
+	if errors.Is(err, os.ErrNotExist) {
+		report.add(SeverityFailure, "Gateway subagent", "agents/"+SubagentFileName+" does not exist; run setup codex")
+		return
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		report.add(SeverityFailure, "Gateway subagent", "agents/"+SubagentFileName+" is not a readable regular file")
+		return
+	}
+	diagnosePermissions(report, "Gateway subagent permissions", info.Mode())
+	data, err := os.ReadFile(agentPath)
+	if err != nil {
+		report.add(SeverityFailure, "Gateway subagent", "agents/"+SubagentFileName+" could not be read")
+		return
+	}
+	if _, err := validateSubagentData(data); err != nil {
+		report.add(SeverityFailure, "Gateway subagent", "agents/"+SubagentFileName+" failed validation or is not routed to "+GoProviderID)
+		return
+	}
+	report.add(SeverityPass, "Gateway subagent", "deepseek_worker subagent is spawnable from any Codex session")
 }
 
 func resolveCatalogPath(home, value string) (string, error) {
@@ -428,10 +533,15 @@ func diagnoseProvider(ctx context.Context, report *DoctorReport, options DoctorO
 		return
 	}
 	report.add(SeverityPass, "OpenCode Go authentication", "provider accepted the credential for a models check")
-	if providerModelsContain(body, ModelID) {
+	if providerModelsContain(body, GoModelID) {
 		report.add(SeverityPass, "OpenCode Go model", "deepseek-v4-flash is available")
 	} else {
 		report.add(SeverityFailure, "OpenCode Go model", "deepseek-v4-flash was not returned by the provider")
+	}
+	if providerModelsContain(body, ZenFreeModelID) {
+		report.add(SeverityPass, "OpenCode Go model", "deepseek-v4-flash-free is available")
+	} else {
+		report.add(SeverityWarning, "OpenCode Go model", "deepseek-v4-flash-free was not returned by the provider")
 	}
 }
 

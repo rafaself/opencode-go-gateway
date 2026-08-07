@@ -395,7 +395,8 @@ func runCodexSetup(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("setup codex", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
-	gatewayURL := flags.String("gateway-url", codexsetup.DefaultGatewayURL, "gateway Responses base URL")
+	gatewayURL := flags.String("gateway-url", codexsetup.DefaultGoGatewayURL, "gateway Responses base URL for the opencode-gateway-go profile")
+	zenGatewayURL := flags.String("zen-gateway-url", codexsetup.DefaultZenGatewayURL, "gateway Responses base URL for the opencode-gateway-zen provider and the opencode-gateway-zen-free profile")
 	dryRun := flags.Bool("dry-run", false, "show redacted changes without writing files")
 	restore := flags.String("restore", "", "restore a setup backup directory")
 	if err := flags.Parse(args); err != nil {
@@ -417,9 +418,10 @@ func runCodexSetup(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	result, err := codexsetup.SetupCodex(codexsetup.SetupOptions{
-		CodexHome:  *codexHome,
-		GatewayURL: *gatewayURL,
-		DryRun:     *dryRun,
+		CodexHome:     *codexHome,
+		GatewayURL:    *gatewayURL,
+		ZenGatewayURL: *zenGatewayURL,
+		DryRun:        *dryRun,
 	})
 	if err != nil {
 		return err
@@ -434,9 +436,10 @@ func runCodexSetup(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "Codex setup is already current for %s\n", result.ConfigPath)
 		return nil
 	}
-	fmt.Fprintf(stdout, "Codex setup updated %s and %s\n", result.ConfigPath, result.CatalogPath)
+	fmt.Fprintf(stdout, "Codex setup updated %s, %s, %s, %s, and %s\n", result.ConfigPath, result.CatalogPath, result.ProfilePath, result.ZenFreeProfilePath, result.AgentPath)
 	fmt.Fprintf(stdout, "Backup: %s\n", result.BackupPath)
 	fmt.Fprintf(stdout, "Rollback: opencode-gateway setup codex --restore %s\n", result.BackupPath)
+	fmt.Fprintln(stdout, "The default codex session keeps its built-in models; run `codex --profile opencode-gateway-go` or `codex --profile opencode-gateway-zen-free` to use the gateway")
 	return nil
 }
 
@@ -445,6 +448,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	codexHome := flags.String("codex-home", "", "Codex home directory; defaults to CODEX_HOME or the user home")
 	gatewayURL := flags.String("gateway-url", "", "gateway Responses base URL; defaults to the configured provider")
+	zenGatewayURL := flags.String("zen-gateway-url", "", "Zen gateway Responses base URL to verify against the configured provider")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -460,9 +464,10 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	report := codexsetup.Diagnose(context.Background(), codexsetup.DoctorOptions{
-		Environment: codexsetup.Environment{LookupEnv: lookup},
-		CodexHome:   *codexHome,
-		GatewayURL:  *gatewayURL,
+		Environment:   codexsetup.Environment{LookupEnv: lookup},
+		CodexHome:     *codexHome,
+		GatewayURL:    *gatewayURL,
+		ZenGatewayURL: *zenGatewayURL,
 	})
 	for _, check := range report.Checks {
 		fmt.Fprintf(stdout, "[%s] %s: %s\n", check.Severity, check.Name, check.Message)

@@ -139,7 +139,7 @@ func (s *Server) handleResponses(w *statusWriter, r *http.Request) {
 		// context is canceled independently by the watcher; inbound client and
 		// shutdown cancellation still cancel this request context immediately.
 		Context:                  r.Context(),
-		Model:                    opencodego.DefaultModel,
+		Model:                    s.config.Model,
 		MaxAggregateBytes:        s.config.MaxSSEBufferedBytes,
 		MaxToolCallArgumentBytes: s.config.MaxToolCallArgumentBytes,
 		MaxOutputBytes:           s.config.MaxOutputBytes,

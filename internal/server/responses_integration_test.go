@@ -1031,7 +1031,6 @@ func TestResponsesRejectsToolBearingRequestsBeforeCallingUpstream(t *testing.T) 
 		name string
 		body string
 	}{
-		{name: "deferred tool definition", body: `{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":"hello"}],"tools":[{"type":"namespace","name":"secret_tool"}],"stream":true}`},
 		{name: "prior tool call", body: `{"model":"gpt-5.3-codex","input":[{"type":"function_call","call_id":"secret-call","name":"secret_tool","arguments":"{}"}],"stream":true}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {

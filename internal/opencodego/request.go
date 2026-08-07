@@ -505,6 +505,12 @@ func validateProviderModel(model string) error {
 	return nil
 }
 
+// ValidateModel is the exported validation boundary used by the runtime
+// configuration before a client is constructed.
+func ValidateModel(model string) error {
+	return validateProviderModel(model)
+}
+
 func validFunctionName(name string) bool {
 	if name == "" || len(name) > 64 || !utf8.ValidString(name) {
 		return false
@@ -520,7 +526,7 @@ func validFunctionName(name string) bool {
 
 func isSupportedProviderModel(model string) bool {
 	switch model {
-	case DefaultModel, DeepSeekV4ProModel:
+	case DefaultModel, DeepSeekV4ProModel, DeepSeekV4FlashFreeModel:
 		return true
 	default:
 		return false

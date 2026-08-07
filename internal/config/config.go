@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rafaself/opencode-go-gateway/internal/bridge"
+	"github.com/rafaself/opencode-go-gateway/internal/opencodego"
 )
 
 const (
@@ -57,6 +58,7 @@ type LookupEnv func(string) (string, bool)
 type Config struct {
 	apiKey                   string
 	BaseURL                  string
+	Model                    string
 	Host                     string
 	Port                     int
 	AllowNonLoopback         bool
@@ -95,6 +97,7 @@ type Config struct {
 func Defaults() Config {
 	return Config{
 		BaseURL:                  DefaultBaseURL,
+		Model:                    opencodego.DefaultModel,
 		Host:                     DefaultHost,
 		Port:                     DefaultPort,
 		LogLevel:                 slog.LevelInfo,
@@ -142,6 +145,9 @@ func Load(lookup LookupEnv) (Config, error) {
 
 	if value, present := lookup("OPENCODE_GO_BASE_URL"); present {
 		config.BaseURL = value
+	}
+	if value, present := lookup("OPENCODE_GO_MODEL"); present {
+		config.Model = value
 	}
 	if value, present := lookup("OPENCODE_GATEWAY_HOST"); present {
 		config.Host = value
@@ -265,6 +271,9 @@ func (c Config) Validate() error {
 	if !validBaseURL(c.BaseURL) {
 		return fmt.Errorf("OPENCODE_GO_BASE_URL must be an absolute HTTPS URL")
 	}
+	if err := opencodego.ValidateModel(c.Model); err != nil {
+		return fmt.Errorf("OPENCODE_GO_MODEL is unsupported")
+	}
 	if strings.TrimSpace(c.Host) == "" {
 		return fmt.Errorf("OPENCODE_GATEWAY_HOST must not be empty")
 	}
@@ -366,8 +375,9 @@ func (c Config) WithAPIKey(value string) Config {
 
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"api_key=<redacted> base_url=%q host=%q port=%d allow_non_loopback=%t log_level=%s shutdown_timeout=%s read_header_timeout=%s request_body_read_timeout=%s upstream_connect_timeout=%s tls_handshake_timeout=%s response_header_timeout=%s stream_idle_timeout=%s downstream_write_timeout=%s idle_timeout=%s max_body_bytes=%d max_header_bytes=%d max_input_items=%d max_collection_items=%d max_tools=%d max_schema_bytes=%d max_sse_line_bytes=%d max_sse_event_bytes=%d max_sse_buffered_bytes=%d max_sse_read_buffer_bytes=%d max_output_bytes=%d max_text_bytes=%d max_reasoning_bytes=%d max_tool_call_argument_bytes=%d max_pending_turn_bytes=%d max_pending_records=%d max_pending_aggregate_bytes=%d max_active_requests=%d",
+		"api_key=<redacted> base_url=%q model=%q host=%q port=%d allow_non_loopback=%t log_level=%s shutdown_timeout=%s read_header_timeout=%s request_body_read_timeout=%s upstream_connect_timeout=%s tls_handshake_timeout=%s response_header_timeout=%s stream_idle_timeout=%s downstream_write_timeout=%s idle_timeout=%s max_body_bytes=%d max_header_bytes=%d max_input_items=%d max_collection_items=%d max_tools=%d max_schema_bytes=%d max_sse_line_bytes=%d max_sse_event_bytes=%d max_sse_buffered_bytes=%d max_sse_read_buffer_bytes=%d max_output_bytes=%d max_text_bytes=%d max_reasoning_bytes=%d max_tool_call_argument_bytes=%d max_pending_turn_bytes=%d max_pending_records=%d max_pending_aggregate_bytes=%d max_active_requests=%d",
 		c.BaseURL,
+		c.Model,
 		c.Host,
 		c.Port,
 		c.AllowNonLoopback,
@@ -409,6 +419,7 @@ func (c Config) Format(state fmt.State, _ rune) {
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("base_url", c.BaseURL),
+		slog.String("model", c.Model),
 		slog.String("host", c.Host),
 		slog.Int("port", c.Port),
 		slog.Bool("allow_non_loopback", c.AllowNonLoopback),

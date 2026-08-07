@@ -49,7 +49,7 @@ func RunWithBuildMetadata(ctx context.Context, settings config.Config, logger *s
 	upstreamClient, err := opencodego.NewClient(opencodego.ClientConfig{
 		APIKey:                settings.APIKey(),
 		BaseURL:               settings.BaseURL,
-		Model:                 opencodego.DefaultModel,
+		Model:                 settings.Model,
 		UserAgent:             buildUserAgent(metadata),
 		DialTimeout:           settings.UpstreamConnectTimeout,
 		TLSHandshakeTimeout:   settings.TLSHandshakeTimeout,
@@ -62,6 +62,7 @@ func RunWithBuildMetadata(ctx context.Context, settings config.Config, logger *s
 	runtimeServer, err := server.New(server.Config{
 		ListenAddr:               settings.ListenAddr(),
 		AllowNonLoopback:         settings.AllowNonLoopback,
+		Model:                    settings.Model,
 		Upstream:                 server.NewOpenCodeUpstreamClient(upstreamClient),
 		ReadHeaderTimeout:        settings.ReadHeaderTimeout,
 		IdleTimeout:              settings.IdleTimeout,
