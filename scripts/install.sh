@@ -17,8 +17,10 @@ CHECKSUMS_VALUE=""
 SOURCE_MODE=0
 RELEASE_MODE=0
 DRY_RUN=0
+FORCE=0
 WORK_DIR=""
 INSTALL_STAGE=""
+MANIFEST_NAME=".opencode-gateway.manifest"
 
 die() {
 	echo "opencode-gateway install: $*" >&2
@@ -42,11 +44,17 @@ Options:
   --release                Require a published GitHub release
   --archive FILE           Install a local release archive
   --checksums FILE         Checksum manifest for --archive (default: sibling SHA256SUMS)
+  --force                  Replace files even when they differ from the install manifest
   --dry-run                Verify and prepare the install without writing binaries
   -h, --help               Show this help
 
 The downloaded or local archive must have a matching SHA-256 entry in
-SHA256SUMS. There is no option to bypass checksum verification.
+SHA256SUMS. There is no option to bypass checksum verification. After a
+successful install, a manifest listing the installed files and their SHA-256
+hashes is written next to the binaries; re-installs refuse to overwrite files
+that differ from the manifest unless --force is used. Use
+scripts/update.sh (or make update) to update to a newer version, and
+scripts/uninstall.sh (or make uninstall) to remove the install deterministically.
 EOF
 }
 
@@ -129,6 +137,64 @@ verify_checksum() {
 		die "checksum verification failed for $archive_name"
 }
 
+manifest_path() {
+	printf '%s/%s\n' "$INSTALL_DIR_VALUE" "$MANIFEST_NAME"
+}
+
+# verify_existing_install refuses to overwrite an install recorded by the
+# manifest when its files no longer match the recorded hashes, unless --force
+# is used. Files that were never installed are left untouched.
+verify_existing_install() {
+	local manifest="$1" name entry actual recorded_name recorded_hash
+	[ -f "$manifest" ] && [ ! -L "$manifest" ] || return 0
+	((FORCE)) && return 0
+	while IFS= read -r entry; do
+		[ -n "$entry" ] && [ "${entry#\#}" = "$entry" ] || continue
+		case "$entry" in
+			file\ *) ;;
+			*) continue ;;
+		esac
+		set -- $entry
+		recorded_name="$3"
+		recorded_hash="$4"
+		[ -n "$recorded_name" ] && [ -n "$recorded_hash" ] || continue
+		name="$INSTALL_DIR_VALUE/$recorded_name"
+		if [ -e "$name" ] || [ -L "$name" ]; then
+			if [ ! -f "$name" ] || [ -L "$name" ]; then
+				die "existing $recorded_name is not a regular file; use --force to replace it"
+			fi
+			actual="$(sha256_file "$name")"
+			[ "$actual" = "$recorded_hash" ] ||
+				die "existing $recorded_name differs from the install manifest; use --force to replace it"
+		fi
+	done < "$manifest"
+}
+
+# write_manifest records the installed files, their modes, SHA-256 hashes,
+# version, and install directory next to the binaries. The manifest is
+# replaced atomically, so an interrupted install never leaves a half-written
+# record behind.
+write_manifest() {
+	local installed_dir="$1" version_output version_value commit_value stage name hash
+	version_output="$("$installed_dir/opencode-gateway" version 2>&1)" ||
+		die "could not read version from the installed binary"
+	version_value="$(printf '%s\n' "$version_output" | sed -n 's/.*version=\([^ ]*\).*/\1/p')"
+	commit_value="$(printf '%s\n' "$version_output" | sed -n 's/.*commit=\([^ ]*\).*/\1/p')"
+	[ -n "$version_value" ] && [ -n "$commit_value" ] || die "installed binary reported an unparsable version"
+	stage="$(mktemp "$installed_dir/.opencode-gateway-manifest.XXXXXX")"
+	{
+		echo "# opencode-gateway install manifest (managed; do not edit)"
+		echo "version=$version_value"
+		echo "commit=$commit_value"
+		echo "install_dir=$installed_dir"
+		for name in opencode-gateway ocgtw; do
+			hash="$(sha256_file "$installed_dir/$name")" || { rm -f -- "$stage"; return 1; }
+			echo "file 0755 $name $hash"
+		done
+	} > "$stage"
+	mv -f "$stage" "$installed_dir/$MANIFEST_NAME"
+}
+
 validate_archive_entries() {
 	local archive="$1"
 	local archive_stem="$2"
@@ -176,6 +242,8 @@ install_binaries() {
 	[ -f "$source_alias" ] && [ ! -L "$source_alias" ] ||
 		die "ocgtw binary is missing or is a symlink"
 
+	verify_existing_install "$(manifest_path)"
+
 	if ((DRY_RUN)); then
 		echo "Would install opencode-gateway and ocgtw into $INSTALL_DIR_VALUE"
 		return
@@ -193,7 +261,13 @@ install_binaries() {
 	mv -f "$INSTALL_STAGE/ocgtw" "$INSTALL_DIR_VALUE/ocgtw"
 	rmdir "$INSTALL_STAGE"
 	INSTALL_STAGE=""
+	write_manifest "$INSTALL_DIR_VALUE"
 	echo "Installed opencode-gateway and ocgtw into $INSTALL_DIR_VALUE"
+	if ! version_output="$("$INSTALL_DIR_VALUE/opencode-gateway" version 2>&1)"; then
+		echo "opencode-gateway install: warning: the installed binary could not report its version: $version_output" >&2
+	else
+		echo "$version_output"
+	fi
 }
 
 build_from_source() {
@@ -337,6 +411,10 @@ while (($# > 0)); do
 			DRY_RUN=1
 			shift
 			;;
+		--force)
+			FORCE=1
+			shift
+			;;
 		-h|--help)
 			usage
 			exit 0
@@ -370,5 +448,9 @@ elif ((RELEASE_MODE)); then
 elif command -v "$GO_BIN" >/dev/null 2>&1 && [ -f "$ROOT_DIR/go.mod" ]; then
 	build_from_source
 else
+	if [ -f "$ROOT_DIR/go.mod" ]; then
+		echo "opencode-gateway install: Go is not on PATH; installing the latest published release instead of this checkout." >&2
+		echo "opencode-gateway install: install Go and re-run, or use --source, to build the current working tree." >&2
+	fi
 	install_release_archive
 fi

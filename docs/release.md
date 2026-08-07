@@ -46,6 +46,34 @@ The installer has no checksum bypass option. Its Bash release path supports
 Linux and macOS amd64/arm64; Windows users should download and verify the zip
 archive manually.
 
+After a successful install, a manifest (`.opencode-gateway.manifest` next to
+the binaries) records the installed version and the SHA-256 hash of each
+binary. A re-install refuses to overwrite files that no longer match the
+manifest — for example binaries modified after install — unless `--force` is
+used; an uninstall needs the same `--force` before it deletes modified files.
+
+To update an existing install, use the matching updater:
+
+```bash
+make update
+# or, with the same defaults: ./scripts/update.sh
+```
+
+Like install, update defaults to the latest published release, or a rebuild
+from the checkout when Go is available. It requires the install manifest and
+the unmodified binaries recorded there (override with `--force`), refuses to
+downgrade unless `--force` is given, and is a no-op when the requested version
+is already installed:
+
+```bash
+./scripts/update.sh --version v0.2.0 --dry-run
+./scripts/update.sh --version v0.2.0
+```
+
+The actual replacement is delegated to `scripts/install.sh`, so every update
+passes the same checksum verification, staging, and manifest rewrite as a
+fresh install.
+
 The package script uses the tagged commit time as its default
 `SOURCE_DATE_EPOCH`. To reproduce an artifact exactly, provide the same
 version, commit, build date, source epoch, Go toolchain, and source tree:
@@ -167,8 +195,35 @@ For a Codex configuration change, use the backup path printed by setup:
   "/absolute/path/to/backup-opencode-gateway-..."
 ```
 
-To uninstall the gateway, stop the local process and remove the extracted
-binary/archive. Remove the managed `opencode-gateway` provider and catalog
+To uninstall the binaries, use the matching uninstaller:
+
+```bash
+make uninstall
+# or, with the same defaults: ./scripts/uninstall.sh
+```
+
+The uninstaller removes exactly the files recorded in the install manifest,
+after verifying each file still matches its recorded hash; a file modified
+since install is left in place unless `--force` is given. Without a manifest
+it refuses to guess what to remove and exits with an error. `--dry-run` lists
+the removals without changing anything. The uninstaller never needs Go.
+
+```bash
+./scripts/uninstall.sh --install-dir "$HOME/.local/bin" --dry-run
+./scripts/uninstall.sh --force   # remove modified files, or canonical names without a manifest
+```
+
+Codex configuration is left untouched by the uninstaller. To also roll back
+the Codex setup, pass the Codex home: the latest
+`backup-opencode-gateway-*` directory there is restored through the installed
+binary before the binaries are removed.
+
+```bash
+./scripts/uninstall.sh --codex-home "$HOME/.codex"
+```
+
+Without `--codex-home`, remove the managed `opencode-gateway-go` and
+`opencode-gateway-zen` providers, the two session profiles, and the catalog
 from the Codex home only after taking a backup, or use the setup backup to
 restore the exact pre-setup files. The gateway does not install a service or
 write outside the selected Codex home and release directory.
